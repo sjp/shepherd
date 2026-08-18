@@ -93,3 +93,29 @@ warning meaningful; individual lints can be raised later if they earn it.
 
 **Committed.** This workspace ships a binary, and reproducing a reported version
 means building from the same dependency graph it was built from.
+
+## 2026-08-18 — daemon core
+
+### No datetime dependency anywhere
+
+**The daemon converts the system clock to a protocol timestamp itself.** The
+protocol's timestamps are one fixed shape — RFC 3339, UTC, milliseconds — chosen
+so that the crate defining them needs no calendar. Producing one is then about
+fifteen lines of civil-calendar arithmetic, exhaustively testable, against a
+datetime library's build time, API churn and time-zone database. If a later
+requirement needs real calendar handling — local time, zones, parsing what a user
+typed — that is the point to reconsider, and only in the crate that needs it.
+
+### Reading the process's identity
+
+**`libc`, for `geteuid` and nothing else so far.** The socket directory is
+per-user, so resolving it needs the effective uid, and there is no way to ask for
+that in `std`. `libc` is the smallest thing that answers the question and is
+already in the dependency graph beneath `tokio`.
+
+### Diagnostics are off unless asked for
+
+**`RUST_LOG` sets the verbosity; unset means nothing is logged at all.** The
+daemon is a background process whose output nobody reads when things are working,
+and the events it is there to carry go over a socket rather than through its log.
+Anyone debugging one sets the variable.

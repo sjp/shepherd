@@ -5,5 +5,17 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[dependencies]
+agentbus-protocol = { workspace = true }
+libc = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
 [lints]
 workspace = true

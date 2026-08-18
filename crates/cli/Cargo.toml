@@ -14,7 +14,13 @@ name = "agentbus"
 path = "src/main.rs"
 
 [dependencies]
+agentbus-daemon = { workspace = true }
 clap = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
