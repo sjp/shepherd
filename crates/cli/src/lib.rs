@@ -15,6 +15,7 @@
 //! whatever supervises the process, which often cannot choose the argument
 //! vector but can always choose the environment.
 
+pub mod adapters;
 pub mod status;
 pub mod stream;
 

@@ -1,0 +1,7 @@
+{
+  "session_id": "9f2c1b7a-4d5e-4a91-8c33-1e6b0d7f2a48",
+  "transcript_path": "/home/dev/.claude/projects/-srv-project/9f2c1b7a.jsonl",
+  "cwd": "/srv/project",
+  "permission_mode": "default",
+  "hook_event_name": "SessionStart"
+}

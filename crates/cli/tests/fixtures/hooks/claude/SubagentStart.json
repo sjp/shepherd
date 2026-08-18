@@ -1,0 +1,10 @@
+{
+  "session_id": "9f2c1b7a-4d5e-4a91-8c33-1e6b0d7f2a48",
+  "prompt_id": "0c4a19e3-77b2-4f60-9a1d-5b8e2f0c6d11",
+  "transcript_path": "/home/dev/.claude/projects/-srv-project/9f2c1b7a.jsonl",
+  "cwd": "/srv/project",
+  "permission_mode": "default",
+  "hook_event_name": "SubagentStart",
+  "agent_id": "1a7d33c9-58f0-4b2e-9d64-c0a7e5b41f22",
+  "agent_type": "general-purpose"
+}
