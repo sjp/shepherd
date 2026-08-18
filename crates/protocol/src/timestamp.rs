@@ -20,10 +20,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// The shape is fixed and fixed-width, so the derived ordering on the inner
 /// string is also the chronological ordering.
 ///
-/// Only the *shape* is checked, plus the range of each component. This type does
-/// no calendar arithmetic and will accept the 31st of February; that is the price
-/// of not depending on a datetime library, and it costs nothing here because the
-/// values are produced by machines and only ever compared and displayed.
+/// Only the *shape* is checked, plus the range of each component. Nothing
+/// validates the calendar, so the 31st of February parses; that is the price of
+/// not depending on a datetime library, and it costs nothing here because the
+/// values are produced by machines and are only ever compared, differenced and
+/// displayed.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Timestamp(String);
 
@@ -106,6 +107,54 @@ impl Timestamp {
     pub fn into_string(self) -> String {
         self.0
     }
+
+    /// How many milliseconds passed between `earlier` and `self`. Negative when
+    /// `self` is the earlier of the two.
+    ///
+    /// This is the one piece of arithmetic the type does, and it exists because
+    /// deciding that something has gone quiet for too long is a comparison of
+    /// two timestamps and nothing more — asking a caller to convert first would
+    /// only push the same integer arithmetic somewhere less well tested.
+    ///
+    /// The calendar is proleptic Gregorian, extended without limit in both
+    /// directions, which is what makes this total: a value that parsed but names
+    /// no real instant, such as the 31st of February or a leap second, still
+    /// yields an answer, and the answer is consistent with every other value.
+    /// Two timestamps a leap second apart are therefore one second apart here,
+    /// which no consumer of this protocol can tell from an ordinary second.
+    pub fn millis_since(&self, earlier: &Self) -> i64 {
+        self.epoch_millis() - earlier.epoch_millis()
+    }
+
+    /// Milliseconds since 1970-01-01T00:00:00.000Z, on the calendar described by
+    /// [`Timestamp::millis_since`]. Private because a difference is the only
+    /// meaning this crate needs and the only one that survives a nonsense date.
+    fn epoch_millis(&self) -> i64 {
+        let digits = self.0.as_bytes();
+        let number = |start: usize, len: usize| -> i64 {
+            digits[start..start + len]
+                .iter()
+                .fold(0, |value, digit| value * 10 + i64::from(digit - b'0'))
+        };
+        let days = days_from_civil(number(0, 4), number(5, 2), number(8, 2));
+        let seconds = days * 86_400 + number(11, 2) * 3_600 + number(14, 2) * 60 + number(17, 2);
+        seconds * 1_000 + number(20, 3)
+    }
+}
+
+/// Days between 1970-01-01 and `year-month-day` on the proleptic Gregorian
+/// calendar, by Howard Hinnant's `days_from_civil`, whose derivation is at
+/// <https://howardhinnant.github.io/date_algorithms.html>. It is shifted so that
+/// the era begins on the 1st of March, which is what removes February's special
+/// case and leaves an expression with no tables and no branches.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let shifted_month = (month + 9) % 12;
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 fn validate(text: &str) -> Result<(), TimestampError> {
@@ -256,6 +305,96 @@ mod tests {
         let earlier = Timestamp::parse("2026-08-17T10:32:01.412Z").unwrap();
         let later = Timestamp::parse("2026-08-17T10:32:01.413Z").unwrap();
         assert!(earlier < later);
+    }
+
+    #[test]
+    fn differences_are_signed_milliseconds() {
+        let parse = |text: &str| Timestamp::parse(text).unwrap();
+        let earlier = parse("2026-08-17T10:32:01.412Z");
+        let later = parse("2026-08-17T10:34:01.412Z");
+        assert_eq!(later.millis_since(&earlier), 120_000);
+        assert_eq!(earlier.millis_since(&later), -120_000);
+        assert_eq!(earlier.millis_since(&earlier), 0);
+
+        // Across a millisecond, a second, a minute, an hour, a day, a month, a
+        // leap day, and a year, in that order.
+        for (from, to, millis) in [
+            ("2026-08-17T10:32:01.412Z", "2026-08-17T10:32:01.413Z", 1),
+            (
+                "2026-08-17T10:32:01.412Z",
+                "2026-08-17T10:32:02.412Z",
+                1_000,
+            ),
+            (
+                "2026-08-17T10:32:01.412Z",
+                "2026-08-17T10:33:01.412Z",
+                60_000,
+            ),
+            (
+                "2026-08-17T10:32:01.412Z",
+                "2026-08-17T11:32:01.412Z",
+                3_600_000,
+            ),
+            (
+                "2026-08-17T10:32:01.412Z",
+                "2026-08-18T10:32:01.412Z",
+                86_400_000,
+            ),
+            (
+                "2026-08-31T00:00:00.000Z",
+                "2026-09-01T00:00:00.000Z",
+                86_400_000,
+            ),
+            (
+                "2028-02-28T00:00:00.000Z",
+                "2028-03-01T00:00:00.000Z",
+                2 * 86_400_000,
+            ),
+            ("2026-12-31T23:59:59.999Z", "2027-01-01T00:00:00.000Z", 1),
+        ] {
+            assert_eq!(
+                parse(to).millis_since(&parse(from)),
+                millis,
+                "{from} to {to}"
+            );
+        }
+
+        // 2100 is not a leap year, 2000 was: the century rules are exercised.
+        assert_eq!(
+            parse("2100-03-01T00:00:00.000Z").millis_since(&parse("2100-02-28T00:00:00.000Z")),
+            86_400_000
+        );
+        assert_eq!(
+            parse("2000-03-01T00:00:00.000Z").millis_since(&parse("2000-02-28T00:00:00.000Z")),
+            2 * 86_400_000
+        );
+    }
+
+    #[test]
+    fn the_epoch_is_where_it_should_be() {
+        let epoch = Timestamp::parse("1970-01-01T00:00:00.000Z").unwrap();
+        assert_eq!(
+            Timestamp::parse("2026-08-17T10:32:01.412Z")
+                .unwrap()
+                .millis_since(&epoch),
+            1_786_962_721_412
+        );
+    }
+
+    #[test]
+    fn a_difference_of_impossible_dates_is_an_answer_rather_than_a_panic() {
+        // Both of these parse, because only the shape is checked. Neither names
+        // a real instant, and the only promise is that asking does not panic and
+        // that ordering is respected.
+        let earlier = Timestamp::parse("2026-02-30T25:61:61.999Z").unwrap();
+        let later = Timestamp::parse("2026-02-31T25:61:61.999Z").unwrap();
+        assert_eq!(later.millis_since(&earlier), 86_400_000);
+        assert!(
+            Timestamp::parse("9999-99-99T99:99:99.999Z")
+                .unwrap()
+                .millis_since(&Timestamp::parse("0000-00-00T00:00:00.000Z").unwrap())
+                > 0
+        );
     }
 
     #[test]

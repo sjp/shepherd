@@ -36,11 +36,13 @@
 #![warn(missing_docs)]
 
 pub mod event;
+pub mod fold;
 pub mod status;
 pub mod stream;
 pub mod timestamp;
 
 pub use event::{Agent, Event, Kind, OriginHop, Source, UnstampedEvent};
+pub use fold::{DEFAULT_STALE_AFTER, Fold, Input, SessionState, is_activity};
 pub use status::SessionStatus;
 pub use stream::{
     DaemonIdentity, ForegroundChange, ForegroundEntry, ForegroundState, Heartbeat, SessionEntry,
