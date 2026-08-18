@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use agentbus_daemon::bus::Bus;
 use agentbus_daemon::emit::MAX_LINE;
-use agentbus_daemon::{Daemon, SocketPaths};
+use agentbus_daemon::{Daemon, Error, Settings, SocketPaths};
 use agentbus_protocol::SessionStatus;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -29,8 +29,11 @@ struct Running {
 /// Starts a daemon on a temporary directory.
 fn start() -> Running {
     let dir = tempfile::tempdir().expect("cannot make a temporary directory");
-    let daemon = Daemon::bind(SocketPaths::in_dir(dir.path().join("agentbus")))
-        .expect("cannot start the daemon");
+    let daemon = Daemon::bind(
+        SocketPaths::in_dir(dir.path().join("agentbus")),
+        Settings::default(),
+    )
+    .expect("cannot start the daemon");
     let bus = Arc::clone(daemon.bus());
     let paths = daemon.paths().clone();
     tokio::spawn(daemon.run());
@@ -207,13 +210,15 @@ async fn the_socket_and_its_directory_are_the_owner_s_alone() {
 }
 
 #[tokio::test]
-async fn a_second_daemon_cannot_take_over_a_bound_socket() {
+async fn a_second_daemon_is_turned_away_from_a_directory_that_is_already_served() {
     let running = start();
 
-    let error = Daemon::bind(running.paths.clone()).expect_err("two daemons bound one socket");
+    let error = Daemon::bind(running.paths.clone(), Settings::default())
+        .expect_err("two daemons took one directory");
 
-    assert!(
-        error.to_string().contains("emit.sock"),
-        "unhelpful error: {error}"
-    );
+    assert!(matches!(error, Error::AlreadyRunning { .. }), "{error}");
+    // The one that was turned away must have cost the one that is serving
+    // nothing: not its socket, and not the events arriving on it.
+    emit(running.paths.emit(), &event("undisturbed")).await;
+    wait_for_seq(&running.bus, 1).await;
 }

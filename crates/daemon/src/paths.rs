@@ -32,6 +32,9 @@ pub const EMIT_SOCKET: &str = "emit.sock";
 /// The file name of the socket subscribers read the stream from.
 pub const SUB_SOCKET: &str = "sub.sock";
 
+/// The file name of the lock that grants a daemon the directory.
+pub const LOCK_FILE: &str = "daemon.lock";
+
 /// The mode the bus directory is kept at: nobody but its owner has any business
 /// listing it, and its contents are enough to drive someone's coding agent.
 pub const DIR_MODE: u32 = 0o700;
@@ -39,12 +42,14 @@ pub const DIR_MODE: u32 = 0o700;
 /// The mode both sockets are kept at, for the same reason.
 pub const SOCKET_MODE: u32 = 0o600;
 
-/// The directory the bus uses and the two sockets inside it.
+/// The directory the bus uses and the files inside it: the two sockets and
+/// the lock a daemon holds while it is serving them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SocketPaths {
     dir: PathBuf,
     emit: PathBuf,
     sub: PathBuf,
+    lock: PathBuf,
 }
 
 impl SocketPaths {
@@ -63,6 +68,7 @@ impl SocketPaths {
         Self {
             emit: dir.join(EMIT_SOCKET),
             sub: dir.join(SUB_SOCKET),
+            lock: dir.join(LOCK_FILE),
             dir,
         }
     }
@@ -80,6 +86,21 @@ impl SocketPaths {
     /// The socket subscribers read the stream from.
     pub fn sub(&self) -> &Path {
         &self.sub
+    }
+
+    /// The lock file whose holder is the daemon serving this directory.
+    pub fn lock(&self) -> &Path {
+        &self.lock
+    }
+
+    /// Both sockets, in no particular order.
+    ///
+    /// Every operation that treats the sockets as a set rather than as two
+    /// named things — clearing what an earlier run left behind, taking them
+    /// away on the way out — walks this, so adding a socket to the bus later
+    /// cannot leave one of those half-done.
+    pub fn sockets(&self) -> [&Path; 2] {
+        [&self.emit, &self.sub]
     }
 
     /// Creates the directory if it is absent, and puts it at [`DIR_MODE`] either
@@ -174,7 +195,12 @@ mod tests {
         let paths = SocketPaths::in_dir("/run/user/1000/agentbus");
         assert_eq!(paths.emit(), Path::new("/run/user/1000/agentbus/emit.sock"));
         assert_eq!(paths.sub(), Path::new("/run/user/1000/agentbus/sub.sock"));
+        assert_eq!(
+            paths.lock(),
+            Path::new("/run/user/1000/agentbus/daemon.lock")
+        );
         assert_eq!(paths.dir(), Path::new("/run/user/1000/agentbus"));
+        assert_eq!(paths.sockets(), [paths.emit(), paths.sub()]);
     }
 
     #[test]

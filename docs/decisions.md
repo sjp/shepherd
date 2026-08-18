@@ -119,3 +119,52 @@ already in the dependency graph beneath `tokio`.
 daemon is a background process whose output nobody reads when things are working,
 and the events it is there to carry go over a socket rather than through its log.
 Anyone debugging one sets the variable.
+
+## 2026-08-18 — daemon lifecycle
+
+### The daemon says what it is, and `AGENTBUS_LOG` replaces `RUST_LOG`
+
+**`agentbus daemon` logs at `info` by default; `--log-level`, or `AGENTBUS_LOG`
+behind it, changes that.** This replaces "Diagnostics are off unless asked for"
+above, for this command only. A daemon is a process somebody starts and then has
+to reason about hours later — which build is this, which directory is it serving,
+what timings was it given, why did it stop — and the two lines that answer those
+questions are worth more than the silence they cost. Two lines per run is not
+noise. The variable is named for this project rather than for the logging crate
+because it is part of the daemon's documented interface, alongside `AGENTBUS_DIR`,
+and because a supervisor that sets `RUST_LOG` for its own reasons should not
+thereby reconfigure the bus.
+
+Everything else in the workspace keeps the earlier rule, and `agentbus emit` keeps
+it absolutely: that path runs inside somebody's coding agent, prints nothing
+anywhere, and has no logging to configure. Colour is off unconditionally — a
+daemon's stderr is nearly always captured into a file or a journal, where escape
+codes sit in the middle of every field.
+
+### Configuration is flags, with an environment variable behind each
+
+**No config file for the daemon.** `--dir`, `--stale-secs`,
+`--done-retention-secs` and `--log-level` are the whole of it, and each reads from
+`AGENTBUS_DIR`, `AGENTBUS_STALE_SECS`, `AGENTBUS_DONE_RETENTION_SECS` and
+`AGENTBUS_LOG` respectively when the flag is absent. Flags are for people;
+variables are for whatever supervises the process, which often cannot choose the
+argument vector but can always choose the environment. A file would be a third
+place for the same answer to live, and a file per machine is the opposite of what
+a bus that gets provisioned onto other machines wants.
+
+### One daemon per directory, decided by `flock`
+
+**An exclusive `flock` on `<dir>/daemon.lock`, not on the sockets.** The kernel
+drops it when the holder dies however it dies, including `SIGKILL` and including a
+machine losing power, which is what makes the recovery unambiguous: a daemon that
+holds the lock knows no other daemon is alive in that directory, and can therefore
+remove the socket files it finds there and rebind them. Locking a socket instead
+would confuse "a file exists" with "somebody is listening", which is exactly the
+distinction that has to be made. The pid written into the file is for humans;
+nothing reads it back to make a decision, because a pid read from a file is a
+guess about a process that may already have been replaced.
+
+**A daemon that finds the directory taken exits 3.** Distinct from the general
+failure code because it is usually not a failure: a caller whose goal is "a daemon
+is running here" has got what it wanted, and can treat that one code as success
+without having to parse a message.
