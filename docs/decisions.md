@@ -332,3 +332,74 @@ be worse than none. It exists for the one question the files cannot answer: with
 our entries taken out and nothing left, is the empty file litter this program
 made, or is it the user's own file that they asked us to add to? The first is
 deleted and the second is kept.
+
+## 2026-08-18 — installing into Claude Code
+
+### Claude's plugin is offered through a generated marketplace of one
+
+**`agentbus install --agent claude` writes a marketplace directory under the
+data directory and then runs `claude plugin marketplace add` and `claude plugin
+install agentbus@agentbus -s user`.** Claude installs plugins from marketplaces
+and only from marketplaces: `claude plugin install` takes a plugin name, not a
+directory, and refuses a path with *not found in any configured marketplace*. A
+marketplace is itself only a directory with a manifest listing the plugins in
+it, so wrapping the one plugin in one is a few lines of generated JSON and no
+change to how the plugin itself is built.
+
+The consequence has to be stated plainly, because it is the one thing this
+arrangement cannot deliver: **Claude writes `~/.claude/settings.json` itself**,
+recording the marketplace and the enabled plugin there, and leaves the two keys
+behind as empty objects after an uninstall. This program never opens that file
+— an integration test pins that — but a user comparing it before and after will
+find it changed. The alternative is to write it ourselves, which is worse in
+every way: it is the file the user maintains by hand, and doing Claude's
+bookkeeping for it would mean guessing at a format that is Claude's to change.
+
+Rejected alongside: dropping the plugin into `~/.claude/skills/<name>/`, which
+Claude auto-loads with no settings file written at all. It is the tidier
+mechanism and it works, but it is not what `claude plugin install` manages —
+such a plugin cannot be updated or uninstalled through the plugin commands, only
+by deleting the directory — so an installation made that way is invisible to the
+tooling a user would reach for.
+
+### An installation step can be a command, not only a file
+
+**`Change` covers running somebody else's tool alongside writing, rewriting and
+removing files.** The rule that a run is worked out in full before any of it
+happens — so that `--dry-run` and a real run are the same code stopped at
+different points — only holds if a step can stand for everything an installation
+does. An agent whose plugins are registered by its own command line cannot be
+installed for by writing files alone, and modelling that as something outside
+the plan would mean the plan no longer described the run.
+
+Two ways of running are kept apart. A command that changes something is part of
+the installation and its failure is the installation's failure, reported with
+the command line in it so a user can finish the job by hand — which is exactly
+what happens when an agent's configuration directory is on the machine but its
+command is not on the `PATH`: the files are written, the record is saved, and
+the message says what to run. A command that only asks something decides whether
+a step is needed, and an unanswered question means taking the step, because
+every step asked about is safe to take again.
+
+### A stale copy is detected by comparing it, and refreshed by removing it first
+
+**Claude takes its own copy of a plugin when it installs one and refreshes that
+copy only when the version changes.** So a reinstall at the same version is a
+no-op even when what would be generated now differs — which is precisely the
+case that matters, because the hooks name this program's binary by an absolute
+path and a binary that moved leaves an installation pointing at nothing. The
+installer therefore reads Claude's copy back, from the `installPath` Claude's
+own `plugin list --json` reports, and compares it with what it would generate;
+when they differ it uninstalls and installs again, which is the only sequence
+that makes Claude take a new copy.
+
+### Generated files live in the data directory, the record in the state directory
+
+**`~/.local/share/agentbus/` (`XDG_DATA_HOME` honoured) holds what is generated
+for the agents to read; `~/.local/state/agentbus/` keeps the record of what has
+been installed.** They are different kinds of thing: one is the installation
+itself, read by another program long after the installer exited, and the other
+is bookkeeping nobody but this program reads. An uninstall removes its own
+generated directory and then removes the data directory too if nothing else is
+left in it — not reported as a change, because an empty directory held nothing,
+but the difference between having uninstalled and looking like it.

@@ -78,6 +78,46 @@ pub fn write(path: &Path, contents: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Reads a file that may not be there.
+///
+/// A file that is absent is not a failure anywhere in this crate: it is the
+/// ordinary state of a config file before anything has been installed, and of
+/// one after everything has been uninstalled.
+pub fn read(path: &Path) -> io::Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Removes `root` and every directory below it that is empty, deepest first.
+///
+/// A directory holding anything at all is left where it is, and so is
+/// everything above it. This runs at the end of an uninstall, over a tree this
+/// program made and filled entirely by itself, so anything found in it is
+/// something somebody else put there — and an uninstaller that deleted it would
+/// be removing what it never installed. A `root` that is not there at all has
+/// nothing to do.
+pub fn remove_empty_dirs(root: &Path) -> io::Result<()> {
+    let entries = match fs::read_dir(root) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        entries => entries?,
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            remove_empty_dirs(&entry.path())?;
+        }
+    }
+    match fs::remove_dir(root) {
+        // Left behind because something that is not this program's is in it,
+        // which is the whole point of removing them one at a time.
+        Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => Ok(()),
+        result => result,
+    }
+}
+
 /// Removes `path` and every backup of it this program made.
 ///
 /// Only ever called for a file this program created, where the backups are

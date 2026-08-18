@@ -1,0 +1,12 @@
+{
+  "name": "agentbus",
+  "owner": {
+    "name": "agentbus"
+  },
+  "plugins": [
+    {
+      "name": "agentbus",
+      "source": "./agentbus"
+    }
+  ]
+}

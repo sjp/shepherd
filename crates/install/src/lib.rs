@@ -28,6 +28,9 @@
 
 pub mod agent;
 pub mod assets;
+pub mod change;
+pub mod claude;
+pub mod command;
 pub mod file;
 pub mod json;
 pub mod merge;
@@ -39,7 +42,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 pub use agent::{Agent, DetectedAgent, UnknownAgent, detect};
-pub use merge::{Change, Placement};
+pub use change::Change;
+pub use command::Invocation;
+pub use merge::Placement;
 pub use paths::Environment;
 pub use state::State;
 
@@ -88,6 +93,25 @@ pub enum Error {
     Binary {
         #[source]
         source: io::Error,
+    },
+    /// A path cannot be written into a configuration file at all.
+    #[error("{path} cannot be written into a configuration file, because it is not text")]
+    Unwritable { path: PathBuf },
+    /// A command one of the agents provides could not be run.
+    #[error("cannot run `{command}`; run it by hand to finish the job")]
+    CannotRun {
+        command: String,
+        #[source]
+        source: io::Error,
+    },
+    /// A command one of the agents provides refused to do what it was asked.
+    #[error("`{command}` failed{}", match status {
+        Some(code) => format!(" and exited {code}"),
+        None => String::from(", killed by a signal"),
+    })]
+    CommandFailed {
+        command: String,
+        status: Option<i32>,
     },
 }
 
@@ -139,7 +163,15 @@ pub trait Installer {
 /// command line, the report and the uninstall all agree on the same list
 /// without any of them naming an agent.
 pub fn installers() -> Vec<&'static dyn Installer> {
-    Vec::new()
+    vec![&claude::Claude]
+}
+
+/// Every agent this build can install for.
+pub fn supported() -> Vec<Agent> {
+    installers()
+        .iter()
+        .map(|installer| installer.agent())
+        .collect()
 }
 
 /// Installs the hooks for `agents`.
@@ -160,9 +192,19 @@ pub fn uninstall(env: &Environment, agents: &[Agent], mode: Mode) -> Result<Vec<
     if chosen.is_empty() {
         return Ok(Vec::new());
     }
-    carry_out(env, mode, chosen, |installer, state| {
+    let outcomes = carry_out(env, mode, chosen, |installer, state| {
         installer.plan_uninstall(env, state)
-    })
+    })?;
+    // The directory the installers generate into is this program's own, and one
+    // left standing empty is a trace of something that is supposed to be gone.
+    // Not reported as a change, because it is not one: an empty directory held
+    // nothing, and removing it is the difference between having uninstalled and
+    // looking like it. It goes only when it is empty, so an agent this run was
+    // not asked about keeps everything of its own.
+    if mode == Mode::Apply {
+        let _ = file::remove_empty_dirs(env.data_dir());
+    }
+    Ok(outcomes)
 }
 
 /// Plans every agent's changes, then makes them unless this is a dry run.
@@ -181,11 +223,21 @@ fn carry_out(
     let mut state = State::load(&record)?;
     let mut outcomes = Vec::new();
     let mut changed = false;
+    let mut stopped = None;
     for installer in installers {
-        let changes = plan(installer, &state)?;
+        let changes = match plan(installer, &state) {
+            Ok(changes) => changes,
+            Err(error) => {
+                stopped = Some(error);
+                break;
+            }
+        };
         if mode == Mode::Apply {
             for change in &changes {
-                change.apply(installer.agent(), &mut state)?;
+                if let Err(error) = change.apply(installer.agent(), &mut state) {
+                    stopped = Some(error);
+                    break;
+                }
                 changed |= change.is_change();
             }
         }
@@ -193,11 +245,21 @@ fn carry_out(
             agent: installer.agent(),
             changes,
         });
+        if stopped.is_some() {
+            break;
+        }
     }
+    // Written before anything is reported, including before a failure is
+    // reported. A run that got as far as writing a file and then stopped has
+    // changed the machine, and a record that forgot the part that succeeded
+    // would leave the next uninstall unable to find it.
     if changed {
         state.save(&record)?;
     }
-    Ok(outcomes)
+    match stopped {
+        Some(error) => Err(error),
+        None => Ok(outcomes),
+    }
 }
 
 /// The installers for `agents`, in the order they are registered.
@@ -225,8 +287,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn this_build_has_no_installers_to_choose_from() {
-        assert!(chosen(&agent::AGENTS).is_empty());
+    fn an_installer_is_only_chosen_when_its_agent_is_asked_for() {
+        let all: Vec<Agent> = installers().iter().map(|one| one.agent()).collect();
+
+        assert_eq!(
+            chosen(&all).len(),
+            all.len(),
+            "asking for every agent should choose every installer"
+        );
+        assert!(chosen(&[]).is_empty());
+    }
+
+    #[test]
+    fn no_two_installers_claim_the_same_agent() {
+        let mut agents: Vec<Agent> = installers().iter().map(|one| one.agent()).collect();
+        let registered = agents.len();
+        agents.sort_unstable();
+        agents.dedup();
+
+        assert_eq!(agents.len(), registered);
     }
 
     #[test]

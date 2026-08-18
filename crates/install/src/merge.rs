@@ -1,23 +1,20 @@
 //! Putting this program's entries into a JSON file, and taking them out again.
 //!
-//! Both directions are split in two: working out what would change, and then
-//! changing it. Nothing here touches the disk until a [`Change`] is applied,
-//! which is what lets the same code answer "what would this do?" and "do it"
-//! without the first answer being a description of the second rather than the
-//! thing itself.
+//! Both directions only work out what would change; changing it is a
+//! [`Change`], applied later. Nothing here touches the disk, which is what lets
+//! the same code answer "what would this do?" and "do it" without the first
+//! answer being a description of the second rather than the thing itself.
 //!
 //! Working it out is also where a file gets refused. A document that cannot be
 //! rewritten safely stops the plan before anything has been written, so a run
 //! that fails against one agent's config file has not half-installed itself into
 //! another's.
 
-use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde_json::{Map, Value};
 
-use crate::agent::Agent;
+use crate::change::Change;
 use crate::state::{Ownership, State};
 use crate::{Error, file, json, sentinel};
 
@@ -50,67 +47,6 @@ fn address(path: &[String]) -> String {
     match path.is_empty() {
         true => "the top level".to_owned(),
         false => path.join("."),
-    }
-}
-
-/// Something that would happen to one file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Change {
-    /// There is no file, and this would write one.
-    Create { path: PathBuf, contents: String },
-    /// There is a file, and this would write it back with different contents.
-    Rewrite { path: PathBuf, contents: String },
-    /// There is a file this program created and no longer needs.
-    Delete { path: PathBuf },
-    /// The file is already as it should be.
-    Keep { path: PathBuf },
-}
-
-impl Change {
-    /// The file this is about.
-    pub fn path(&self) -> &Path {
-        match self {
-            Self::Create { path, .. }
-            | Self::Rewrite { path, .. }
-            | Self::Delete { path }
-            | Self::Keep { path } => path,
-        }
-    }
-
-    /// Whether carrying this out would change anything on disk.
-    pub fn is_change(&self) -> bool {
-        !matches!(self, Self::Keep { .. })
-    }
-
-    /// Carries it out, recording what became of the file in `state`.
-    ///
-    /// A file that existed is copied first, whichever direction this is going
-    /// in: an uninstall rewrites a file that holds the user's own entries too,
-    /// and that is exactly as worth protecting as anything an install touches.
-    pub fn apply(&self, agent: Agent, state: &mut State) -> Result<(), Error> {
-        match self {
-            Self::Create { path, contents } => {
-                write(path, contents)?;
-                state.record(path, agent, Ownership::Created);
-            }
-            Self::Rewrite { path, contents } => {
-                file::back_up(path).map_err(|source| Error::Write {
-                    path: path.to_owned(),
-                    source,
-                })?;
-                write(path, contents)?;
-                state.record(path, agent, Ownership::Merged);
-            }
-            Self::Delete { path } => {
-                file::remove_with_backups(path).map_err(|source| Error::Write {
-                    path: path.to_owned(),
-                    source,
-                })?;
-                state.forget(path);
-            }
-            Self::Keep { .. } => {}
-        }
-        Ok(())
     }
 }
 
@@ -230,21 +166,9 @@ fn place(document: &mut Value, placement: &Placement, path: &Path) -> Result<(),
     Ok(())
 }
 
-/// Reads a file that may not be there.
+/// Reads a file that may not be there, naming it if that fails.
 fn read(path: &Path) -> Result<Option<String>, Error> {
-    match fs::read_to_string(path) {
-        Ok(text) => Ok(Some(text)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(Error::Read {
-            path: path.to_owned(),
-            source,
-        }),
-    }
-}
-
-/// Writes a file, naming it if that fails.
-fn write(path: &Path, contents: &str) -> Result<(), Error> {
-    file::write(path, contents).map_err(|source| Error::Write {
+    file::read(path).map_err(|source| Error::Read {
         path: path.to_owned(),
         source,
     })

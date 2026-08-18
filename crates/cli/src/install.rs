@@ -1,11 +1,12 @@
 //! What `agentbus install` and `agentbus uninstall` print.
 //!
-//! Installing edits files somebody else maintains, and the least an installer
-//! owes them is a full account of which files it touched and what it did to
-//! each. So every file involved is named, including the ones nothing happened
-//! to: "unchanged" is the line that tells a user running the command twice that
-//! the second run really did nothing, which is otherwise indistinguishable from
-//! a command that failed quietly.
+//! Installing edits files somebody else maintains and runs commands somebody
+//! else wrote, and the least an installer owes them is a full account of both.
+//! So every file involved is named and every command is printed the way it would
+//! be typed, including the ones nothing happened to: "unchanged" and "already
+//! run" are the lines that tell a user running the command twice that the second
+//! run really did nothing, which is otherwise indistinguishable from a command
+//! that failed quietly.
 //!
 //! A dry run prints the same lines in the conditional, from the same values, so
 //! that what it says would happen is what the real run has been asked to do
@@ -13,7 +14,7 @@
 
 use std::fmt::Write;
 
-use agentbus_install::{Change, DetectedAgent, Mode, Outcome};
+use agentbus_install::{Agent, Change, DetectedAgent, Mode, Outcome};
 
 /// Which way an installation is going.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,8 +70,9 @@ pub fn render(
     if outcomes.is_empty() {
         let _ = writeln!(
             out,
-            "nothing to {}: this build has no installer for any agent",
-            direction.verb()
+            "nothing to {}: this build only handles {}",
+            direction.verb(),
+            supported()
         );
         return out;
     }
@@ -86,25 +88,51 @@ pub fn render(
     out
 }
 
-/// One file, and what became of it.
+/// The agents this build can act on, listed the way they would be said aloud.
+///
+/// Named rather than counted, because the user this line is for has just been
+/// told that nothing happened, and what they need to know next is whether their
+/// agent is one this build has heard of.
+fn supported() -> String {
+    let agents: Vec<String> = agentbus_install::supported()
+        .iter()
+        .map(Agent::to_string)
+        .collect();
+    match agents.split_last() {
+        None => "no agent at all".to_owned(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// One step, and what became of it.
+///
+/// A directory cleared away and a file removed are reported with the same word.
+/// The distinction is one this program makes because removing a directory needs
+/// more care than removing a file; to a user reading what happened to their
+/// machine, both are something that is no longer there.
 fn describe(change: &Change, mode: Mode) -> String {
-    let path = change.path().display();
     match (mode, change) {
-        (Mode::Apply, Change::Create { .. }) => format!("created {path}"),
-        (Mode::Apply, Change::Rewrite { .. }) => format!("updated {path}"),
-        (Mode::Apply, Change::Delete { .. }) => format!("removed {path}"),
-        (Mode::DryRun, Change::Create { .. }) => format!("would create {path}"),
-        (Mode::DryRun, Change::Rewrite { .. }) => format!("would update {path}"),
-        (Mode::DryRun, Change::Delete { .. }) => format!("would remove {path}"),
-        (_, Change::Keep { .. }) => format!("unchanged {path}"),
+        (Mode::Apply, Change::Create { path, .. }) => format!("created {}", path.display()),
+        (Mode::Apply, Change::Rewrite { path, .. }) => format!("updated {}", path.display()),
+        (Mode::Apply, Change::Delete { path } | Change::Clear { path }) => {
+            format!("removed {}", path.display())
+        }
+        (Mode::DryRun, Change::Create { path, .. }) => format!("would create {}", path.display()),
+        (Mode::DryRun, Change::Rewrite { path, .. }) => format!("would update {}", path.display()),
+        (Mode::DryRun, Change::Delete { path } | Change::Clear { path }) => {
+            format!("would remove {}", path.display())
+        }
+        (_, Change::Keep { path }) => format!("unchanged {}", path.display()),
+        (Mode::Apply, Change::Run { command }) => format!("ran {command}"),
+        (Mode::DryRun, Change::Run { command }) => format!("would run {command}"),
+        (_, Change::Ran { command }) => format!("already run {command}"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-
-    use agentbus_install::Agent;
 
     use super::*;
 
@@ -124,8 +152,11 @@ mod tests {
         let rendered = render(&[], &[], Direction::Install, Mode::Apply);
         assert_eq!(
             rendered,
-            "no coding agent found on this machine\n\
-             nothing to install: this build has no installer for any agent\n"
+            format!(
+                "no coding agent found on this machine\n\
+                 nothing to install: this build only handles {}\n",
+                supported()
+            )
         );
     }
 
@@ -181,6 +212,64 @@ mod tests {
 
         assert!(
             rendered.contains("  would update /home/u/.codex/hooks.json\n"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn every_agent_this_build_handles_is_named_when_none_of_them_was_asked_for() {
+        let listed = supported();
+
+        for agent in agentbus_install::supported() {
+            assert!(listed.contains(agent.name()), "{listed} omits {agent}");
+        }
+    }
+
+    #[test]
+    fn a_command_the_agent_had_to_run_is_reported_as_one() {
+        let command = agentbus_install::Invocation::new(
+            "/usr/local/bin/claude",
+            ["plugin", "install", "agentbus@agentbus"],
+        );
+        let changes = vec![
+            Change::Run {
+                command: command.clone(),
+            },
+            Change::Ran { command },
+        ];
+
+        let done = render(
+            &[],
+            &outcome(changes.clone()),
+            Direction::Install,
+            Mode::Apply,
+        );
+        let would = render(&[], &outcome(changes), Direction::Install, Mode::DryRun);
+
+        assert!(
+            done.contains("  ran claude plugin install agentbus@agentbus\n"),
+            "{done}"
+        );
+        assert!(
+            done.contains("  already run claude plugin install agentbus@agentbus\n"),
+            "{done}"
+        );
+        assert!(
+            would.contains("  would run claude plugin install agentbus@agentbus\n"),
+            "{would}"
+        );
+    }
+
+    #[test]
+    fn a_directory_cleared_away_is_reported_like_a_file_removed() {
+        let changes = vec![Change::Clear {
+            path: PathBuf::from("/home/u/.local/share/agentbus/claude-marketplace"),
+        }];
+
+        let rendered = render(&[], &outcome(changes), Direction::Uninstall, Mode::Apply);
+
+        assert!(
+            rendered.contains("  removed /home/u/.local/share/agentbus/claude-marketplace\n"),
             "{rendered}"
         );
     }

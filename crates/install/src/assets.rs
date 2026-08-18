@@ -7,4 +7,16 @@
 //! be a hook installation that fails on exactly the machines it is hardest to
 //! debug on.
 //!
-//! One constant per agent, added by the code that installs for it.
+//! One constant per file, grouped by the agent that installs it.
+
+/// The manifest of the marketplace Claude Code installs the plugin from.
+pub const CLAUDE_MARKETPLACE: &str =
+    include_str!("../assets/claude-marketplace/.claude-plugin/marketplace.json");
+
+/// The manifest of the plugin that marketplace offers.
+pub const CLAUDE_PLUGIN: &str =
+    include_str!("../assets/claude-marketplace/agentbus/.claude-plugin/plugin.json");
+
+/// The hooks that plugin registers.
+pub const CLAUDE_HOOKS: &str =
+    include_str!("../assets/claude-marketplace/agentbus/hooks/hooks.json");
