@@ -1,0 +1,10 @@
+# One session from beginning to end, and what the bus says about it after each
+# payload: a file to send, and the status it leaves the session in. `?` where a
+# recording is not yet sure what to expect.
+SessionStart.json      starting
+UserPromptSubmit.json  working
+PreToolUse.json        working
+Notification.json      blocked
+PostToolUse.json       working
+Stop.json              idle
+SessionEnd.json        done
