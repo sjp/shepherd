@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 agentbus-protocol = { workspace = true }
 libc = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }

@@ -90,6 +90,7 @@ async fn the_settings_a_daemon_was_started_with_are_readable_from_it() {
     let settings = Settings {
         stale_after: Duration::from_secs(7),
         done_retention: Duration::from_secs(11),
+        heartbeat: Duration::from_secs(13),
     };
 
     let started = start(settings);
@@ -111,8 +112,17 @@ async fn sockets_left_behind_by_an_earlier_run_are_cleared_away() {
     let daemon = Daemon::bind(paths.clone(), Settings::default())
         .expect("a directory left in a mess could not be reused");
 
-    assert!(daemon.paths().emit().exists());
-    assert!(!paths.sub().exists(), "the stale subscribe socket survived");
+    // Both are sockets this daemon bound rather than the files that were in the
+    // way: nothing of what was there survived being bound over.
+    for socket in daemon.paths().sockets() {
+        assert!(socket.exists(), "{} was not rebound", socket.display());
+        assert_ne!(
+            std::fs::read(socket).ok(),
+            Some(b"debris".to_vec()),
+            "{} is still the file that was in the way",
+            socket.display()
+        );
+    }
 }
 
 #[tokio::test]

@@ -233,6 +233,13 @@ pub enum ForegroundState {
 }
 
 /// Proof that the stream is alive rather than merely quiet.
+///
+/// One arrives every ten seconds whatever else is happening, so silence is
+/// measurable: a subscriber that has heard nothing for about thirty seconds
+/// should reconnect rather than keep waiting. Reconnecting is cheap and always
+/// correct — the next stream begins with a [`Snapshot`] of the current state —
+/// which is also what makes it the right response to being disconnected for any
+/// other reason, including having been too slow to keep up.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename = "heartbeat")]
 pub struct Heartbeat {

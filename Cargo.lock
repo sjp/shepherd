@@ -7,9 +7,12 @@ name = "agentbus-cli"
 version = "0.1.0"
 dependencies = [
  "agentbus-daemon",
+ "agentbus-protocol",
  "clap",
  "libc",
+ "serde_json",
  "tempfile",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -21,6 +24,7 @@ version = "0.1.0"
 dependencies = [
  "agentbus-protocol",
  "libc",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",

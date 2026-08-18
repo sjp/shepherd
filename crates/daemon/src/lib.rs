@@ -47,6 +47,7 @@ pub mod clock;
 pub mod emit;
 pub mod lock;
 pub mod paths;
+pub mod subscribe;
 
 use std::fmt;
 use std::io;
@@ -55,6 +56,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentbus_protocol::{DEFAULT_DONE_RETENTION, DEFAULT_STALE_AFTER, Fold, SessionTable};
+use subscribe::DEFAULT_HEARTBEAT;
 use thiserror::Error;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{debug, error, info};
@@ -63,6 +65,7 @@ pub use bus::Bus;
 pub use emit::EmitListener;
 pub use lock::InstanceLock;
 pub use paths::SocketPaths;
+pub use subscribe::SubscribeListener;
 
 /// How often every session's clock is moved forward.
 ///
@@ -74,17 +77,26 @@ pub const TICK_INTERVAL: Duration = Duration::from_secs(1);
 /// The version this daemon reports when it starts.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// The two timings a daemon can be started with.
+/// How long to wait after a failed `accept` before trying again, so that a
+/// listener in a state that cannot be accepted on spins slowly rather than
+/// burning a core.
+pub(crate) const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// The timings a daemon can be started with.
 ///
-/// Both are properties of the bus rather than of any client, which is why they
-/// are settled once here and not negotiated per connection: every subscriber has
-/// to be told the same thing about the same session.
+/// All of them are properties of the bus rather than of any client, which is why
+/// they are settled once here and not negotiated per connection: every
+/// subscriber has to be told the same thing about the same session, and a
+/// subscriber deciding for itself how often it wants to hear from the daemon
+/// would make one slow client's preference everyone else's cost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Settings {
     /// How long a session may go without activity before it is reported stale.
     pub stale_after: Duration,
     /// How long a session that has finished is kept before it is forgotten.
     pub done_retention: Duration,
+    /// How often each subscriber is sent a heartbeat.
+    pub heartbeat: Duration,
 }
 
 impl Default for Settings {
@@ -92,6 +104,7 @@ impl Default for Settings {
         Self {
             stale_after: DEFAULT_STALE_AFTER,
             done_retention: DEFAULT_DONE_RETENTION,
+            heartbeat: DEFAULT_HEARTBEAT,
         }
     }
 }
@@ -181,6 +194,7 @@ pub struct Daemon {
     settings: Settings,
     bus: Arc<Bus>,
     emit: EmitListener,
+    subscribe: SubscribeListener,
     lock: InstanceLock,
 }
 
@@ -211,11 +225,16 @@ impl Daemon {
             path: paths.emit().to_owned(),
             source,
         })?;
+        let subscribe = SubscribeListener::bind(paths.sub()).map_err(|source| Error::Bind {
+            path: paths.sub().to_owned(),
+            source,
+        })?;
         Ok(Self {
             paths,
             settings,
             bus: Arc::new(Bus::with_table(settings.table())),
             emit,
+            subscribe,
             lock,
         })
     }
@@ -246,18 +265,22 @@ impl Daemon {
     pub async fn run(self) -> Stopped {
         let Self {
             paths,
+            settings,
             bus,
             emit,
+            subscribe,
             lock,
-            ..
         } = self;
         info!(socket = %emit.path().display(), "listening for events");
+        info!(socket = %subscribe.path().display(), "publishing the stream");
 
         let stopped = tokio::select! {
             stopped = terminated() => stopped,
             // Serving never finishes on its own; it is here to be run, and to be
             // dropped the moment the signal arrives.
-            () = serve(bus, emit) => unreachable!("the bus stops only when it is told to"),
+            () = serve(bus, emit, subscribe, settings) => {
+                unreachable!("the bus stops only when it is told to")
+            }
         };
 
         for socket in paths.sockets() {
@@ -268,11 +291,17 @@ impl Daemon {
     }
 }
 
-/// Accepts events and moves the clock forward, forever.
-async fn serve(bus: Arc<Bus>, emit: EmitListener) {
+/// Accepts events, publishes them, and moves the clock forward, forever.
+async fn serve(
+    bus: Arc<Bus>,
+    emit: EmitListener,
+    subscribe: SubscribeListener,
+    settings: Settings,
+) {
     let ticking = tick(Arc::clone(&bus));
-    let serving = emit.serve(bus);
-    tokio::join!(ticking, serving);
+    let receiving = emit.serve(Arc::clone(&bus));
+    let publishing = subscribe.serve(bus, settings.heartbeat);
+    tokio::join!(ticking, receiving, publishing);
 }
 
 /// Moves every session's clock forward, forever.

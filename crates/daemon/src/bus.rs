@@ -9,14 +9,19 @@
 //! definition crossed no boundary to get here; and `ts` when the emitter did not
 //! supply a usable one.
 //!
-//! The lock is held for the fold and the buffer write and nothing else. Reading
-//! from a socket happens outside it, so a client that connects and stalls holds
-//! up nothing but itself.
+//! The lock is held for stamping, the fold, the buffer write and the publish,
+//! and for nothing else. Those four are one step: an event's sequence number is
+//! the order subscribers are promised, so the moment it is numbered is the
+//! moment it has to be handed to them, or two ingests racing could publish 41
+//! after 42. Reading from a socket happens outside the lock, so a client that
+//! connects and stalls holds up nothing but itself, and publishing under it
+//! costs nothing that could block: a full subscriber is dropped rather than
+//! waited for.
 
 use std::collections::VecDeque;
 use std::sync::{Mutex, PoisonError};
 
-use agentbus_protocol::{Event, SessionEntry, SessionTable, Timestamp, UnstampedEvent};
+use agentbus_protocol::{Event, SessionEntry, SessionTable, Snapshot, Timestamp, UnstampedEvent};
 use serde_json::Value;
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
@@ -105,12 +110,15 @@ impl Bus {
                 state.recent.pop_front();
             }
             state.recent.push_back(event.clone());
+            // Published while the number is still being handed out, because
+            // subscribers are promised the stream in `seq` order and two
+            // connections ingesting at once would otherwise be free to reach the
+            // publisher in the opposite order to the one they were numbered in.
+            // Nobody may be listening, and that is not a failure: the bus exists
+            // whether or not anything is watching it.
+            let _ = self.events.send(event.clone());
             event
         };
-
-        // Nobody may be listening, and that is not a failure: the bus exists
-        // whether or not anything is watching it.
-        let _ = self.events.send(event.clone());
         Some(event)
     }
 
@@ -123,6 +131,20 @@ impl Bus {
     /// A receiver of every event ingested from now on.
     pub fn events(&self) -> broadcast::Receiver<Event> {
         self.events.subscribe()
+    }
+
+    /// Everything the bus knows now, and a receiver of everything it learns
+    /// afterwards.
+    ///
+    /// The two are taken together under the lock that ingest also stamps and
+    /// publishes under, so an event is on exactly one side of the join: either
+    /// it is in the snapshot, or it arrives on the receiver. A reader that
+    /// ignores what the snapshot already covers is therefore reading a
+    /// continuation of it, and stays right whatever the bus does with its own
+    /// ordering later.
+    pub fn subscribe(&self) -> (Snapshot, broadcast::Receiver<Event>) {
+        let state = self.lock();
+        (state.table.snapshot(state.seq), self.events.subscribe())
     }
 
     /// The sequence number of the most recently ingested event; zero before the

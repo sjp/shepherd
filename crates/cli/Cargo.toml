@@ -15,13 +15,17 @@ path = "src/main.rs"
 
 [dependencies]
 agentbus-daemon = { workspace = true }
+agentbus-protocol = { workspace = true }
 clap = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 libc = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

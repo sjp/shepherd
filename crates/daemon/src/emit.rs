@@ -25,6 +25,7 @@ use tokio::io::AsyncReadExt;
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, trace, warn};
 
+use crate::ACCEPT_RETRY_DELAY;
 use crate::bus::Bus;
 use crate::paths::SOCKET_MODE;
 
@@ -42,11 +43,6 @@ pub const MAX_LINE: usize = 1024 * 1024;
 /// that arrives and then says nothing something the daemon forgets about
 /// promptly rather than a task it holds open indefinitely.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(1);
-
-/// How long to wait after a failed `accept` before trying again, so that a
-/// listener in a state that cannot be accepted on spins slowly rather than
-/// burning a core.
-const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// The listening half of the emit socket.
 #[derive(Debug)]

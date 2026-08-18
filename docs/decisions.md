@@ -168,3 +168,43 @@ guess about a process that may already have been replaced.
 failure code because it is usually not a failure: a caller whose goal is "a daemon
 is running here" has got what it wanted, and can treat that one code as success
 without having to parse a message.
+
+## 2026-08-18 — publishing the stream
+
+### The clients that read the stream use blocking sockets
+
+**`subscribe` and `status` use `std`'s blocking `UnixStream` and never start an
+async runtime.** Following a stream is one connection read one line at a time,
+which a runtime makes no faster and makes slower to start, and `subscribe` exists
+to be a pipe that anything can put in front of `jq`. The runtime stays where the
+concurrency is, which is the daemon. `--recent` bounds its wait with
+`set_read_timeout` rather than with a timer task.
+
+### Fan-out is per subscriber, and drops rather than waits
+
+**Each subscriber gets a bounded queue and a task that drains it into the socket;
+a line that arrives for a full queue disconnects that subscriber.** The
+alternative — waiting for a slow reader — would let anything watching the bus
+stall an emit, and an emit that stalls is a coding agent that hangs. The cost is
+that a subscriber occasionally reconnects, and reconnecting is already correct by
+construction because every stream begins with a snapshot.
+
+**Events are published under the same lock that stamps them.** Sequence order is
+what a subscriber is promised, and two connections ingesting at once would
+otherwise be free to reach the publisher in the opposite order to the one they
+were numbered in. The publish cannot block, so holding the lock across it costs
+nothing.
+
+### `serde` in the daemon
+
+**The daemon takes `serde` directly, for the `Serialize` bound on the one
+function that turns any stream line into bytes.** It was already in the graph
+beneath `agentbus-protocol`; naming it is what lets the daemon serialize a
+snapshot, an event and a heartbeat through one function instead of three.
+
+### `thiserror` in the command-line crate
+
+**`agentbus-cli` is a library with a three-line binary in front of it, so its
+error types follow the library rule.** The one enum it defines says why a stream
+could not be read, and the binary's reporter walks its source chain the same way
+it walks the daemon's.
