@@ -30,7 +30,7 @@
 use agentbus_protocol::{Agent, Kind, UnstampedEvent};
 use serde_json::{Map, Value};
 
-use super::string;
+use super::{field, string};
 
 /// The `notification_type` values that mean "this session is waiting on a
 /// person", and so are the ones reported as `blocked`.
@@ -102,14 +102,12 @@ const SUBAGENT_FIELDS: &[&str] = &["agent_id", "agent_type"];
 
 /// The detail for a tool event: which tool, and whether it failed.
 ///
-/// Nothing else about the call travels here. Three agents' notions of a tool
-/// call diverge in every direction, and the whole payload is already carried
-/// verbatim for anyone who needs more than the name.
+/// The failure is an extra on top of the name every adapter reports, rather
+/// than something of its own: Claude is the one agent here that says whether a
+/// call went wrong, and a field only it can fill belongs beside the name rather
+/// than in place of it.
 fn tool(payload: &Map<String, Value>, failed: bool) -> Option<Map<String, Value>> {
-    let mut detail = Map::new();
-    if let Some(name) = string(payload, "tool_name") {
-        detail.insert("tool".to_owned(), Value::from(name));
-    }
+    let mut detail = super::tool(payload).unwrap_or_default();
     if failed {
         detail.insert("error".to_owned(), Value::Bool(true));
     }
@@ -142,11 +140,4 @@ fn copied(payload: &Map<String, Value>, keys: &[&str]) -> Option<Map<String, Val
         })
         .collect();
     (!detail.is_empty()).then_some(detail)
-}
-
-/// A detail map holding one field.
-fn field(key: &str, value: &str) -> Map<String, Value> {
-    let mut detail = Map::new();
-    detail.insert(key.to_owned(), Value::from(value));
-    detail
 }

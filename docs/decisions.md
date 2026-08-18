@@ -403,3 +403,37 @@ is bookkeeping nobody but this program reads. An uninstall removes its own
 generated directory and then removes the data directory too if nothing else is
 left in it — not reported as a change, because an empty directory held nothing,
 but the difference between having uninstalled and looking like it.
+
+## 2026-08-18 — the second agent: Codex CLI
+
+### Codex is installed by dropping into `hooks.json`, never into `config.toml`
+
+**`agentbus install --agent codex` writes `~/.codex/hooks.json` and nothing
+else.** Codex documents two places hooks may be configured: that file, and a
+`[hooks]` table inside the `config.toml` a user keeps their own settings in. The
+JSON file wins on both counts that matter. It is often absent, and a file that
+is not there is written from nothing — no merge, no user content, nothing that
+can go wrong. And where it does exist it is JSON, so the round-trip guard and the
+marked merge already built for that shape apply unchanged, whereas rewriting
+TOML would mean losing a user's comments to prove a point about tidiness.
+
+This is the first installation that goes through the merge rather than
+generating a directory of its own, and it needed nothing added to it: the
+entries are the agent's own documented shape, marked, appended to the array a
+path names.
+
+### The envelope did not move to accept a second agent
+
+**Adding Codex changed no public type in `crates/protocol`.** That was the test
+being run, not a happy accident: an envelope that needed widening for the second
+agent would have been an envelope shaped around the first. What it did take is
+one adapter module of about seventy lines and one entry in the emit client's
+dispatch.
+
+Two mappings are worth recording because Codex offers something Claude does not.
+`PermissionRequest` means exactly "waiting on a person" and becomes `blocked`
+outright, with none of the discrimination Claude's general-purpose
+`Notification` needs. And Codex reports compaction from both sides: `PreCompact`
+and `PostCompact` are one `compact` kind told apart by `detail.phase`, rather
+than two kinds, because what happened is the same thing and a subscriber that
+only cares that it happened should not have to know there are two spellings.

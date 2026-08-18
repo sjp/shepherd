@@ -16,6 +16,7 @@
 //! the ordinary case, not a failure.
 
 pub mod claude;
+pub mod codex;
 pub mod observed;
 
 use serde_json::{Map, Value};
@@ -28,4 +29,22 @@ use serde_json::{Map, Value};
 /// rather than lose it.
 fn string<'a>(payload: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     payload.get(key)?.as_str()
+}
+
+/// The detail naming which tool a tool event is about, if the payload says.
+///
+/// Nothing else about the call travels here. Three agents' notions of a tool
+/// call diverge in every direction, and the whole payload is already carried
+/// verbatim for anyone who needs more than the name — so the one field they can
+/// all be trusted to agree on is the one field that is normalized.
+fn tool(payload: &Map<String, Value>) -> Option<Map<String, Value>> {
+    let name = string(payload, "tool_name")?;
+    Some(field("tool", name))
+}
+
+/// A detail map holding one field.
+fn field(key: &str, value: &str) -> Map<String, Value> {
+    let mut detail = Map::new();
+    detail.insert(key.to_owned(), Value::from(value));
+    detail
 }

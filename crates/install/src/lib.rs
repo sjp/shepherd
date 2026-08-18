@@ -30,6 +30,7 @@ pub mod agent;
 pub mod assets;
 pub mod change;
 pub mod claude;
+pub mod codex;
 pub mod command;
 pub mod file;
 pub mod json;
@@ -163,7 +164,7 @@ pub trait Installer {
 /// command line, the report and the uninstall all agree on the same list
 /// without any of them naming an agent.
 pub fn installers() -> Vec<&'static dyn Installer> {
-    vec![&claude::Claude]
+    vec![&claude::Claude, &codex::Codex]
 }
 
 /// Every agent this build can install for.

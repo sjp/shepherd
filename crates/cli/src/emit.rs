@@ -194,6 +194,7 @@ fn normalize(request: &Request<'_>, raw: &Value) -> Option<UnstampedEvent> {
         (Source::Hook, Some(agent)) => {
             let event = match agent {
                 "claude" => adapters::claude::normalize(raw)?,
+                "codex" => adapters::codex::normalize(raw)?,
                 // Debug builds carry one agent that is not an agent: it panics,
                 // so that the guarantee this module exists for can be tested
                 // against a real process rather than against a closure standing
