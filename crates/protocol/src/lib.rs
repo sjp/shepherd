@@ -1,11 +1,11 @@
 //! The published wire format of the agent event bus: the event envelope, the
-//! closed set of normalized event kinds, and the fold that turns a stream of
-//! events into the current status of each agent session. Everything here is
-//! pure data and pure functions — no sockets, no files, no clock — so the fold,
-//! which is the correctness-critical part of the system, can be exercised
-//! exhaustively by unit tests. Emitters, the daemon and subscribers all agree on
-//! this crate and nothing else, which is what lets them be written, versioned
-//! and debugged independently.
+//! closed set of normalized event kinds, the fold that turns a stream of events
+//! into the current status of each agent session, and the table of sessions a
+//! snapshot is built from. Everything here is pure data and pure functions — no
+//! sockets, no files, no clock — so the fold, which is the correctness-critical
+//! part of the system, can be exercised exhaustively by unit tests. Emitters, the
+//! daemon and subscribers all agree on this crate and nothing else, which is what
+//! lets them be written, versioned and debugged independently.
 //!
 //! # The wire format
 //!
@@ -13,10 +13,11 @@
 //! daemon's job; this crate deals only in whole values.
 //!
 //! An emitter builds an [`UnstampedEvent`] and sends it. The daemon stamps it
-//! with a sequence number and a timestamp, producing an [`Event`], folds it, and
-//! publishes it. A subscriber reads [`StreamLine`]s: a [`Snapshot`] first, so
-//! that it starts up rendering *current state* rather than merely future events,
-//! then events, [`Heartbeat`]s and [`ForegroundChange`]s as they happen.
+//! with a sequence number and a timestamp, producing an [`Event`], folds it into
+//! its [`SessionTable`], and publishes it. A subscriber reads [`StreamLine`]s: a
+//! [`Snapshot`] first, so that it starts up rendering *current state* rather than
+//! merely future events, then events, [`Heartbeat`]s and [`ForegroundChange`]s as
+//! they happen.
 //!
 //! # Two rules that keep this stable
 //!
@@ -39,6 +40,7 @@ pub mod event;
 pub mod fold;
 pub mod status;
 pub mod stream;
+pub mod table;
 pub mod timestamp;
 
 pub use event::{Agent, Event, Kind, OriginHop, Source, UnstampedEvent};
@@ -47,6 +49,10 @@ pub use status::SessionStatus;
 pub use stream::{
     DaemonIdentity, ForegroundChange, ForegroundEntry, ForegroundState, Heartbeat, SessionEntry,
     Snapshot, StreamLine,
+};
+pub use table::{
+    DEFAULT_DONE_RETENTION, OBSERVED_SESSION_PREFIX, OriginConflict, SessionKey, SessionTable,
+    TrackedSession, is_observed_session_id, observed_session_id,
 };
 pub use timestamp::{Timestamp, TimestampError};
 
