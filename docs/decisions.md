@@ -208,3 +208,68 @@ snapshot, an event and a heartbeat through one function instead of three.
 error types follow the library rule.** The one enum it defines says why a stream
 could not be read, and the binary's reporter walks its source chain the same way
 it walks the daemon's.
+
+## 2026-08-18 — the emit client
+
+### The emit path cannot produce a non-zero exit code, whatever it is given
+
+**Every invocation naming `emit` exits 0, including one the argument parser
+refuses.** The rest of the binary reports a bad command line the way every
+command-line program does: usage on stderr, a non-zero status. That is exactly
+what a coding agent reads as *deny the tool call the user just asked for*, so
+this one command is exempt — a misconfigured hook is precisely the case where
+the guarantee has to hold, and it is also the case where the argument parser is
+the thing objecting. The values of `--agent` and `--source` are therefore plain
+strings rather than closed sets: a value nobody has heard of is one more payload
+that means nothing, which is already this command's ordinary outcome, rather
+than a usage error. Whether a command line names `emit` is decided by looking at
+the words rather than by asking the parser, because by then the parser has
+already refused to understand them.
+
+### The three things that could wait are each given a deadline
+
+**100 ms for the whole invocation, of which at most 40 ms may be spent waiting
+for a payload and at most 50 ms on connecting; what is left bounds the write.**
+The budget is measured from the first moment the process has control rather than
+from the moment the work starts, because it is a promise about how long the
+agent waits and the agent is waiting from `fork` onwards. The split is what is
+left over after the ordinary case: an agent writes its payload and closes, and a
+daemon that is running accepts immediately, so nothing here is approached in
+practice. The deadlines exist for the three ways that stops being true — an
+agent that hands a hook a pipe and forgets about it, a daemon whose backlog has
+filled because it stopped accepting, and a receiver that reads the first few
+bytes and hangs up. Each of those, without a deadline, is a hook that never
+returns.
+
+### `socket2` for the connect, `libc` for the wait
+
+**The emit path takes both, and the daemon's own rule — `std` blocking sockets,
+no async runtime — is unchanged.** `std` cannot connect a unix socket with a
+timeout and cannot make an unconnected non-blocking one, so bounding the connect
+means either `socket2` or forty lines of hand-written `unsafe`. `socket2` is
+already in the dependency graph beneath `tokio`, and having less `unsafe` on the
+one path in this repository that must never break is worth more than having one
+fewer name in the manifest. `libc` earns its place separately, for `poll` on the
+payload's descriptor: the alternative is to read it on another thread, and a
+thread is outside the panic guard that makes this path total.
+
+### Diagnostics here are a switch, and may be sent somewhere they survive
+
+**`AGENTBUS_LOG` turns them on — any value but `off` — and `AGENTBUS_LOG_FILE`
+sends them to a file instead of stderr.** The daemon reads the same variable as
+a filter; this command has nothing to filter, so it reads it as the question it
+can answer. The file exists because of where this runs: an agent commonly
+discards its hooks' stderr, which makes stderr the one place a person debugging
+an installation cannot look. Silence remains the default, and a panic is routed
+through the same switch rather than through the default panic hook, so that an
+agent showing its user its hooks' stderr never shows them a crash report for
+something they did not run.
+
+### A build with debug assertions on carries an agent that panics
+
+**One name in the adapter dispatch, present only when `debug_assertions` is on,
+panics when it is asked to normalize anything.** The guarantee that a panic
+anywhere below still exits 0 with empty stdout is worth very little tested
+against a closure standing in for the real process, and there is otherwise no
+way to make the real process panic on purpose. A released build does not contain
+the arm.

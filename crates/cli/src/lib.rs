@@ -10,12 +10,19 @@
 //! byte-for-byte to decide whether the copy is the build it expects, so any
 //! decoration added here would break provisioning somewhere else.
 //!
+//! One command has a contract stricter than either, because it does not run
+//! where the others do: `emit` is run by somebody else's coding agent, on every
+//! tool call, and that agent reads what its hooks print and what they exit with
+//! as decisions about its user's work. It writes nothing, exits zero whatever
+//! happens to it, and holds itself to a wall-clock budget. See [`emit`].
+//!
 //! Every option a running bus takes is a flag, with an environment variable of
 //! the same meaning behind it. The flags are for people; the variables are for
 //! whatever supervises the process, which often cannot choose the argument
 //! vector but can always choose the environment.
 
 pub mod adapters;
+pub mod emit;
 pub mod status;
 pub mod stream;
 
@@ -30,8 +37,9 @@ use clap::{Args, Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-/// The environment variable that sets how much the daemon says about itself.
-const LOG_VAR: &str = "AGENTBUS_LOG";
+/// The environment variable that sets how much the daemon says about itself,
+/// and the one that turns `emit`'s diagnostics on at all.
+pub const LOG_VAR: &str = "AGENTBUS_LOG";
 
 /// The environment variable behind `--stale-secs`.
 const STALE_SECS_VAR: &str = "AGENTBUS_STALE_SECS";
@@ -49,6 +57,7 @@ const ALREADY_RUNNING: u8 = 3;
 /// How each command names itself in what it prints, so that a message read out
 /// of a supervisor's log or a shell's scrollback says which one produced it.
 const DAEMON: &str = "agentbus daemon";
+const EMIT: &str = "agentbus emit";
 const SUBSCRIBE: &str = "agentbus subscribe";
 const STATUS: &str = "agentbus status";
 
@@ -76,6 +85,8 @@ enum Command {
     Subscribe(SubscribeArgs),
     /// Print what every agent session is doing, once.
     Status(StatusArgs),
+    /// Read a payload on stdin, normalize it, and send it to the bus.
+    Emit(EmitArgs),
 }
 
 /// Which bus a command is about.
@@ -177,6 +188,27 @@ struct StatusArgs {
     recent: Option<u64>,
 }
 
+/// What to send, and what it is.
+///
+/// Both flags take a bare string rather than a closed set of values, because
+/// clap refuses a value it does not recognize by printing usage and exiting
+/// non-zero, and this is the one command in the binary that must do neither.
+/// An unrecognized value is a payload that means nothing instead, which is
+/// already the ordinary outcome here.
+#[derive(Debug, Args)]
+struct EmitArgs {
+    #[command(flatten)]
+    location: Location,
+
+    /// The agent whose hook payload is on stdin
+    #[arg(long, value_name = "NAME")]
+    agent: Option<String>,
+
+    /// Where the claim comes from: hook, the default, or observed
+    #[arg(long, value_name = "SOURCE")]
+    source: Option<String>,
+}
+
 /// Parses `args` (including the program name at position zero) and runs the
 /// requested command, returning the process exit code.
 ///
@@ -187,20 +219,47 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    match Cli::try_parse_from(args) {
+    // Taken before anything else happens, because `emit` is held to a
+    // wall-clock budget and the honest place to start counting is the first
+    // moment this code has control of the process.
+    let started = Instant::now();
+    let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    match Cli::try_parse_from(&args) {
         Ok(cli) => match cli.command {
             Command::Daemon(args) => daemon(&args),
             Command::Subscribe(args) => subscribe(&args),
             Command::Status(args) => status(&args),
+            Command::Emit(args) => emit(&args, started),
         },
         // `--version` and `--help` arrive here too: clap reports them as errors
         // that carry the rendered text, a zero exit code and stdout as their
         // destination. Letting clap print keeps that routing in one place.
         Err(err) => {
             let _ = err.print();
-            ExitCode::from(u8::try_from(err.exit_code()).unwrap_or(2))
+            match err.use_stderr() && names_emit(&args) {
+                // A command line that names `emit` and is then refused is a
+                // misconfigured hook, which is to say: a coding agent that is
+                // about to read this process's exit code as a decision about
+                // its user's work. Usage on stderr is as much as may be said
+                // about it, and zero is the only status that may be returned.
+                true => ExitCode::SUCCESS,
+                false => ExitCode::from(u8::try_from(err.exit_code()).unwrap_or(2)),
+            }
         }
     }
+}
+
+/// Whether a command line asks for the emit command.
+///
+/// Answered by looking at the words rather than by asking the parser, because
+/// the case it exists for is the one where the parser has already refused to
+/// understand them. The rule is the first word that is not a flag, which is
+/// where every subcommand this binary has appears.
+fn names_emit(args: &[OsString]) -> bool {
+    args.iter()
+        .skip(1)
+        .find(|arg| !arg.as_encoded_bytes().starts_with(b"-"))
+        .is_some_and(|arg| arg == "emit")
 }
 
 /// Runs the bus until it is signalled.
@@ -337,6 +396,30 @@ fn tail(stream: &mut stream::Stream, of: Duration, out: &mut impl Write) -> Exit
             Err(error) => return fail(STATUS, &error),
         }
     }
+}
+
+/// Sends one event to the bus, and says nothing whatever about how it went.
+///
+/// This command runs inside somebody else's coding agent, which reads what its
+/// hooks print and what they exit with as instructions about the user's own
+/// session. So there is one exit code here and it is zero, there is no output,
+/// and every decision that could go either way is made inside [`emit::run`],
+/// where it is made silently. The environment is read here and nowhere below:
+/// the correlation is whatever the variable holds, copied without being looked
+/// at, and an empty value is the same as an unset one because a correlation
+/// that says nothing cannot tie anything to anything.
+fn emit(args: &EmitArgs, started: Instant) -> ExitCode {
+    let pane = std::env::var_os(emit::PANE_VAR);
+    let request = emit::Request {
+        agent: args.agent.as_deref(),
+        source: args.source.as_deref(),
+        correlation: pane
+            .as_deref()
+            .and_then(std::ffi::OsStr::to_str)
+            .filter(|value| !value.is_empty()),
+    };
+    emit::run(&request, &args.location.paths(), started, std::io::stdin());
+    ExitCode::SUCCESS
 }
 
 /// Reports a failure on stderr and gives the shell a non-zero status.

@@ -30,6 +30,8 @@
 use agentbus_protocol::{Agent, Kind, UnstampedEvent};
 use serde_json::{Map, Value};
 
+use super::string;
+
 /// The `notification_type` values that mean "this session is waiting on a
 /// person", and so are the ones reported as `blocked`.
 ///
@@ -147,9 +149,4 @@ fn field(key: &str, value: &str) -> Map<String, Value> {
     let mut detail = Map::new();
     detail.insert(key.to_owned(), Value::from(value));
     detail
-}
-
-/// The value of a string field, if it is there and is a string.
-fn string<'a>(payload: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
-    payload.get(key)?.as_str()
 }
