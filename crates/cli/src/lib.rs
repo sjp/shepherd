@@ -23,6 +23,7 @@
 
 pub mod adapters;
 pub mod emit;
+pub mod install;
 pub mod status;
 pub mod stream;
 
@@ -33,6 +34,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use agentbus_daemon::{Daemon, Settings, SocketPaths, clock, paths::DIR_VAR};
+use agentbus_install::{Agent, Environment, Mode, UnknownAgent};
 use clap::{Args, Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -60,6 +62,8 @@ const DAEMON: &str = "agentbus daemon";
 const EMIT: &str = "agentbus emit";
 const SUBSCRIBE: &str = "agentbus subscribe";
 const STATUS: &str = "agentbus status";
+const INSTALL: &str = "agentbus install";
+const UNINSTALL: &str = "agentbus uninstall";
 
 /// How long `--recent` follows the stream when it is given no number.
 ///
@@ -87,6 +91,10 @@ enum Command {
     Status(StatusArgs),
     /// Read a payload on stdin, normalize it, and send it to the bus.
     Emit(EmitArgs),
+    /// Put the hooks that emit events into the coding agents on this machine.
+    Install(InstallArgs),
+    /// Take those hooks back out again.
+    Uninstall(InstallArgs),
 }
 
 /// Which bus a command is about.
@@ -209,6 +217,28 @@ struct EmitArgs {
     source: Option<String>,
 }
 
+/// Which agents to act on, and whether to act at all.
+#[derive(Debug, Args)]
+struct InstallArgs {
+    /// The agent to act on; repeat to name several [default: every one detected]
+    #[arg(long, value_name = "NAME", value_parser = agent)]
+    agent: Vec<Agent>,
+
+    /// Say what would change, and change nothing
+    #[arg(long)]
+    dry_run: bool,
+}
+
+impl InstallArgs {
+    /// Whether this run is allowed to touch anything.
+    fn mode(&self) -> Mode {
+        match self.dry_run {
+            true => Mode::DryRun,
+            false => Mode::Apply,
+        }
+    }
+}
+
 /// Parses `args` (including the program name at position zero) and runs the
 /// requested command, returning the process exit code.
 ///
@@ -230,6 +260,8 @@ where
             Command::Subscribe(args) => subscribe(&args),
             Command::Status(args) => status(&args),
             Command::Emit(args) => emit(&args, started),
+            Command::Install(args) => hooks(&args, install::Direction::Install),
+            Command::Uninstall(args) => hooks(&args, install::Direction::Uninstall),
         },
         // `--version` and `--help` arrive here too: clap reports them as errors
         // that carry the rendered text, a zero exit code and stdout as their
@@ -420,6 +452,50 @@ fn emit(args: &EmitArgs, started: Instant) -> ExitCode {
     };
     emit::run(&request, &args.location.paths(), started, std::io::stdin());
     ExitCode::SUCCESS
+}
+
+/// Puts this program's hooks into the coding agents on this machine, or takes
+/// them out.
+///
+/// What was found is printed whichever way the run goes, and before whatever
+/// happened to it, because a user whose agent was not installed for needs to
+/// know whether this program failed to install or failed to find their agent at
+/// all — and those look identical from a report that only lists what it did.
+///
+/// Naming an agent explicitly acts on it whether or not it was detected. The
+/// detection rules are two guesses about a machine, and somebody who knows their
+/// own machine better than this does should not have to argue with them.
+fn hooks(args: &InstallArgs, direction: install::Direction) -> ExitCode {
+    let context = direction.context();
+    let env = match Environment::from_env() {
+        Ok(env) => env,
+        Err(error) => return fail(context, &error),
+    };
+    let found = agentbus_install::detect(&env);
+    let chosen: Vec<Agent> = match args.agent.is_empty() {
+        true => found.iter().map(|found| found.agent).collect(),
+        false => args.agent.clone(),
+    };
+    let mode = args.mode();
+    let outcomes = match direction {
+        install::Direction::Install => agentbus_install::install(&env, &chosen, mode),
+        install::Direction::Uninstall => agentbus_install::uninstall(&env, &chosen, mode),
+    };
+    let outcomes = match outcomes {
+        Ok(outcomes) => outcomes,
+        Err(error) => return fail(context, &error),
+    };
+
+    let report = install::render(&found, &outcomes, direction, mode);
+    match std::io::stdout().write_all(report.as_bytes()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => fail(context, &error),
+    }
+}
+
+/// Accepts the name of an agent, for the command line.
+fn agent(name: &str) -> Result<Agent, UnknownAgent> {
+    name.parse()
 }
 
 /// Reports a failure on stderr and gives the shell a non-zero status.

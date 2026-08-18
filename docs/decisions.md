@@ -273,3 +273,62 @@ anywhere below still exits 0 with empty stdout is worth very little tested
 against a closure standing in for the real process, and there is otherwise no
 way to make the real process panic on purpose. A released build does not contain
 the arm.
+
+## 2026-08-18 — installing hooks
+
+### Rewriting somebody's config file preserves the order of their keys
+
+**`serde_json` is taken with `preserve_order` on.** The installer's central
+operation is a rewrite of a file a user maintains by hand: their entries are read
+in and written back out around ours. Without this feature `serde_json` holds an
+object in a `BTreeMap` and hands the keys back in alphabetical order, so the
+first install would reorder every object in the file and the diff would be the
+whole document. The cost is one more crate in the graph — `indexmap`, beneath
+`serde_json` — and it is confined to nothing: the feature is global to the
+workspace, which is safe here because nothing in this repository depends on
+object key order, and every equality test on a `Value` is order-independent
+either way.
+
+### A file that repeats an object key is refused rather than rewritten
+
+**The installer reads JSON with a deserializer that rejects duplicate keys,
+where every other reader keeps the last.** Keeping the last is the right
+behaviour for a reader and the wrong one for a rewriter: the losing keys would
+disappear from a file the user wrote, silently, as a side effect of installing a
+hook. Refusing costs about sixty lines of visitor and is the only way to keep the
+promise that everything not ours comes back out unchanged. The round-trip check
+the same function performs — serialize, read again, compare — is a second
+guard, and with the strict reader in front of it there is no input known to
+trigger it; it is cheap and it is the thing that would catch a future change to
+either library.
+
+### Backups are stamped with a count, not a date
+
+**A backup is `<name>.agentbus-backup-<milliseconds since the epoch>`, and the
+newest three are kept.** The only thing anything does with the stamp is put the
+copies in order, and a plain integer needs no calendar to produce and none to
+compare — this crate would otherwise be the second place in the workspace
+carrying civil-calendar arithmetic. The stamp is taken as the greater of the
+clock and one past the newest backup already there, so that several copies taken
+inside one millisecond still order correctly and a stamp freed by rotation is
+never reused.
+
+### `tempfile` is a dependency of the installer, not just of its tests
+
+**Every write is a complete file renamed over the target, and the temporary file
+is made in the target's own directory.** A rename is only atomic within one
+filesystem, so anywhere else would be a guess about how the machine is
+partitioned. `tempfile` was already in the workspace for tests; using it here
+buys cleanup of the temporary file when a write fails partway through, which is
+the case the whole arrangement exists for.
+
+### What has been installed is recorded, and it records exactly one thing
+
+**`~/.local/state/agentbus/installed.json` (`XDG_STATE_HOME` honoured) lists the
+files written to and whether this program created each of them.** It is not a
+manifest of what is installed — the files themselves are that, and they carry the
+mark that says who wrote each entry, so a record that disagreed with them would
+be worse than none. It exists for the one question the files cannot answer: with
+our entries taken out and nothing left, is the empty file litter this program
+made, or is it the user's own file that they asked us to add to? The first is
+deleted and the second is kept.

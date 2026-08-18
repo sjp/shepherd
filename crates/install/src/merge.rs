@@ -1,0 +1,251 @@
+//! Putting this program's entries into a JSON file, and taking them out again.
+//!
+//! Both directions are split in two: working out what would change, and then
+//! changing it. Nothing here touches the disk until a [`Change`] is applied,
+//! which is what lets the same code answer "what would this do?" and "do it"
+//! without the first answer being a description of the second rather than the
+//! thing itself.
+//!
+//! Working it out is also where a file gets refused. A document that cannot be
+//! rewritten safely stops the plan before anything has been written, so a run
+//! that fails against one agent's config file has not half-installed itself into
+//! another's.
+
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+use serde_json::{Map, Value};
+
+use crate::agent::Agent;
+use crate::state::{Ownership, State};
+use crate::{Error, file, json, sentinel};
+
+/// One entry this program wants present in a document, and where it belongs.
+///
+/// The path names the object keys leading to an array — `hooks`, then the name
+/// of a hook event, say — and the entry is appended to it. Which array, and what
+/// goes in it, is each agent's own business; this is the shape they all share.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Placement {
+    path: Vec<String>,
+    entry: Map<String, Value>,
+}
+
+impl Placement {
+    /// An entry to be appended to the array at `path`.
+    pub fn new(
+        path: impl IntoIterator<Item = impl Into<String>>,
+        entry: Map<String, Value>,
+    ) -> Self {
+        Self {
+            path: path.into_iter().map(Into::into).collect(),
+            entry,
+        }
+    }
+}
+
+/// How a place in a document is named in a message about it.
+fn address(path: &[String]) -> String {
+    match path.is_empty() {
+        true => "the top level".to_owned(),
+        false => path.join("."),
+    }
+}
+
+/// Something that would happen to one file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    /// There is no file, and this would write one.
+    Create { path: PathBuf, contents: String },
+    /// There is a file, and this would write it back with different contents.
+    Rewrite { path: PathBuf, contents: String },
+    /// There is a file this program created and no longer needs.
+    Delete { path: PathBuf },
+    /// The file is already as it should be.
+    Keep { path: PathBuf },
+}
+
+impl Change {
+    /// The file this is about.
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Create { path, .. }
+            | Self::Rewrite { path, .. }
+            | Self::Delete { path }
+            | Self::Keep { path } => path,
+        }
+    }
+
+    /// Whether carrying this out would change anything on disk.
+    pub fn is_change(&self) -> bool {
+        !matches!(self, Self::Keep { .. })
+    }
+
+    /// Carries it out, recording what became of the file in `state`.
+    ///
+    /// A file that existed is copied first, whichever direction this is going
+    /// in: an uninstall rewrites a file that holds the user's own entries too,
+    /// and that is exactly as worth protecting as anything an install touches.
+    pub fn apply(&self, agent: Agent, state: &mut State) -> Result<(), Error> {
+        match self {
+            Self::Create { path, contents } => {
+                write(path, contents)?;
+                state.record(path, agent, Ownership::Created);
+            }
+            Self::Rewrite { path, contents } => {
+                file::back_up(path).map_err(|source| Error::Write {
+                    path: path.to_owned(),
+                    source,
+                })?;
+                write(path, contents)?;
+                state.record(path, agent, Ownership::Merged);
+            }
+            Self::Delete { path } => {
+                file::remove_with_backups(path).map_err(|source| Error::Write {
+                    path: path.to_owned(),
+                    source,
+                })?;
+                state.forget(path);
+            }
+            Self::Keep { .. } => {}
+        }
+        Ok(())
+    }
+}
+
+/// Works out what putting `placements` into the document at `path` would do.
+///
+/// A file that is not there is written from nothing, which is the case worth
+/// having: no merge, no user content, nothing that can go wrong. A file that is
+/// there has this program's previous entries taken out and the new ones put in,
+/// so that an upgrade replaces what an older build wrote instead of adding to
+/// it.
+pub fn plan_install(path: &Path, placements: &[Placement]) -> Result<Change, Error> {
+    let existing = read(path)?;
+    let mut document = match &existing {
+        Some(text) => json::parse(text).map_err(|problem| Error::NotRewritable {
+            path: path.to_owned(),
+            problem,
+        })?,
+        // A document made from nothing is an object, unless an entry is to go
+        // at the very top of it, in which case the document is the array.
+        None => match placements.iter().any(|placement| placement.path.is_empty()) {
+            true => Value::Array(Vec::new()),
+            false => Value::Object(Map::new()),
+        },
+    };
+    sentinel::remove_marked(&mut document);
+    for placement in placements {
+        place(&mut document, placement, path)?;
+    }
+
+    let indent = existing
+        .as_deref()
+        .map_or(json::DEFAULT_INDENT, json::indentation);
+    let contents = json::render(&document, indent);
+    Ok(match existing {
+        Some(text) if text == contents => Change::Keep {
+            path: path.to_owned(),
+        },
+        Some(_) => Change::Rewrite {
+            path: path.to_owned(),
+            contents,
+        },
+        None => Change::Create {
+            path: path.to_owned(),
+            contents,
+        },
+    })
+}
+
+/// Works out what taking this program's entries out of the document at `path`
+/// would do.
+///
+/// A file with nothing of ours in it is left alone, including a file that is not
+/// there at all. A file emptied by the removal goes away only if this program
+/// created it; one it merely added to is written back, empty containers and all
+/// removed, and kept.
+pub fn plan_uninstall(path: &Path, state: &State) -> Result<Change, Error> {
+    let Some(text) = read(path)? else {
+        return Ok(Change::Keep {
+            path: path.to_owned(),
+        });
+    };
+    let mut document = json::parse(&text).map_err(|problem| Error::NotRewritable {
+        path: path.to_owned(),
+        problem,
+    })?;
+    if sentinel::remove_marked_and_prune(&mut document) == 0 {
+        return Ok(Change::Keep {
+            path: path.to_owned(),
+        });
+    }
+    let ours = state.ownership(path) == Some(Ownership::Created);
+    if ours && sentinel::is_vacant(&document) {
+        return Ok(Change::Delete {
+            path: path.to_owned(),
+        });
+    }
+    Ok(Change::Rewrite {
+        path: path.to_owned(),
+        contents: json::render(&document, json::indentation(&text)),
+    })
+}
+
+/// Appends one marked entry to the array a placement names, making whatever is
+/// missing on the way to it.
+///
+/// A document that holds something else where an object or an array has to go is
+/// refused rather than overwritten. It is a config file this program does not
+/// understand, and replacing the part it does not understand is how an installer
+/// destroys somebody's afternoon.
+fn place(document: &mut Value, placement: &Placement, path: &Path) -> Result<(), Error> {
+    let conflict = |depth: usize, needed: &'static str| Error::Conflict {
+        path: path.to_owned(),
+        at: address(&placement.path[..depth]),
+        needed,
+    };
+
+    let mut at = document;
+    for (depth, key) in placement.path.iter().enumerate() {
+        let entries = at
+            .as_object_mut()
+            .ok_or_else(|| conflict(depth, "an object"))?;
+        // Everything on the way to the entry is an object; the thing it is
+        // appended to is an array.
+        let leaf = depth + 1 == placement.path.len();
+        at = entries.entry(key.clone()).or_insert_with(|| match leaf {
+            true => Value::Array(Vec::new()),
+            false => Value::Object(Map::new()),
+        });
+    }
+    let items = at
+        .as_array_mut()
+        .ok_or_else(|| conflict(placement.path.len(), "an array"))?;
+
+    let mut entry = placement.entry.clone();
+    sentinel::mark(&mut entry);
+    items.push(Value::Object(entry));
+    Ok(())
+}
+
+/// Reads a file that may not be there.
+fn read(path: &Path) -> Result<Option<String>, Error> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(Error::Read {
+            path: path.to_owned(),
+            source,
+        }),
+    }
+}
+
+/// Writes a file, naming it if that fails.
+fn write(path: &Path, contents: &str) -> Result<(), Error> {
+    file::write(path, contents).map_err(|source| Error::Write {
+        path: path.to_owned(),
+        source,
+    })
+}
