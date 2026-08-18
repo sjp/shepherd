@@ -1,0 +1,20 @@
+[package]
+name = "agentbus-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "agentbus_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agentbus"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+
+[lints]
+workspace = true
