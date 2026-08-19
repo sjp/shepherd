@@ -22,9 +22,11 @@
 //! [`Daemon::bind`] does everything that can fail — claiming the directory,
 //! creating it and binding the sockets — so that a daemon which starts at all is
 //! one that is listening, and a caller finds out about a socket it cannot bind
-//! immediately rather than from a client's silence later. [`Daemon::run`] then
-//! serves until a termination signal arrives, and takes the directory back down
-//! to nothing on its way out.
+//! immediately rather than from a client's silence later. It listens for the
+//! signals that stop a daemon before any of that, so that one which can be
+//! connected to can also be asked to stop. [`Daemon::run`] then serves until a
+//! termination signal arrives, and takes the directory back down to nothing on
+//! its way out.
 //!
 //! # One at a time, and no debris
 //!
@@ -60,7 +62,7 @@ use std::time::Duration;
 use agentbus_protocol::{DEFAULT_DONE_RETENTION, DEFAULT_STALE_AFTER, Fold, SessionTable};
 use subscribe::DEFAULT_HEARTBEAT;
 use thiserror::Error;
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tracing::{debug, error, info};
 
 pub use bus::Bus;
@@ -198,17 +200,26 @@ pub struct Daemon {
     emit: EmitListener,
     subscribe: SubscribeListener,
     lock: InstanceLock,
+    signals: Option<Signals>,
 }
 
 impl Daemon {
-    /// Claims the socket directory, clears what an earlier run left in it, and
-    /// binds every socket.
+    /// Starts listening for the signals that stop a daemon, claims the socket
+    /// directory, clears what an earlier run left in it, and binds every socket.
     ///
-    /// The order is the point. The lock comes first, so that a second daemon is
-    /// turned away before it has removed anything; the cleanup comes next,
-    /// because holding the lock is what proves the files found there are
-    /// nobody's; binding comes last.
+    /// Must be called from inside a Tokio runtime, which is where the signal
+    /// listeners register themselves.
+    ///
+    /// The order is the point. Listening for signals comes first, so that a
+    /// daemon anything can reach is a daemon that can be stopped politely: a
+    /// socket accepts connections from the moment it is bound, and a supervisor
+    /// that starts a daemon and immediately changes its mind would otherwise
+    /// find it dying by default disposition and leaving its directory behind.
+    /// The lock comes next, so that a second daemon is turned away before it has
+    /// removed anything; the cleanup after that, because holding the lock is
+    /// what proves the files found there are nobody's; binding comes last.
     pub fn bind(paths: SocketPaths, settings: Settings) -> Result<Self, Error> {
+        let signals = Signals::install();
         paths.create_dir().map_err(|source| Error::Directory {
             path: paths.dir().to_owned(),
             source,
@@ -238,6 +249,7 @@ impl Daemon {
             emit,
             subscribe,
             lock,
+            signals,
         })
     }
 
@@ -272,12 +284,13 @@ impl Daemon {
             emit,
             subscribe,
             lock,
+            signals,
         } = self;
         info!(socket = %emit.path().display(), "listening for events");
         info!(socket = %subscribe.path().display(), "publishing the stream");
 
         let stopped = tokio::select! {
-            stopped = terminated() => stopped,
+            stopped = terminated(signals) => stopped,
             // Serving never finishes on its own; it is here to be run, and to be
             // dropped the moment the signal arrives.
             () = serve(bus, emit, subscribe, settings) => {
@@ -315,22 +328,49 @@ async fn tick(bus: Arc<Bus>) {
     }
 }
 
-/// Resolves when this process is asked to stop.
+/// The signals that ask a daemon to stop, listened for from before it has
+/// anything to stop.
 ///
-/// If the handlers cannot be installed the daemon carries on serving and the
-/// signals keep their default disposition, which ends the process abruptly. That
-/// is a worse exit than the orderly one, not a broken one: what it leaves behind
-/// is exactly what a `SIGKILL` leaves behind, and the next start clears it.
-async fn terminated() -> Stopped {
-    let (mut term, mut interrupt) = match (
-        signal(SignalKind::terminate()),
-        signal(SignalKind::interrupt()),
-    ) {
-        (Ok(term), Ok(interrupt)) => (term, interrupt),
-        (Err(error), _) | (_, Err(error)) => {
-            error!(%error, "cannot listen for termination signals; shutdown will not be orderly");
-            return std::future::pending().await;
+/// Installing the handlers is what takes the signals away from their default
+/// disposition, which is to end the process where it stands, so it has to happen
+/// before the daemon is visible to anything that might send one.
+#[derive(Debug)]
+struct Signals {
+    term: Signal,
+    interrupt: Signal,
+}
+
+impl Signals {
+    /// Starts listening, or explains why this daemon will not stop politely.
+    ///
+    /// A daemon whose handlers could not be installed carries on serving and the
+    /// signals keep their default disposition, which ends the process abruptly.
+    /// That is a worse exit than the orderly one, not a broken one: what it
+    /// leaves behind is exactly what a `SIGKILL` leaves behind, and the next
+    /// start clears it.
+    fn install() -> Option<Self> {
+        match (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) {
+            (Ok(term), Ok(interrupt)) => Some(Self { term, interrupt }),
+            (Err(error), _) | (_, Err(error)) => {
+                error!(%error, "cannot listen for termination signals; shutdown will not be orderly");
+                None
+            }
         }
+    }
+}
+
+/// Resolves when this process is asked to stop, or never, for a daemon that
+/// could not listen for the asking.
+async fn terminated(signals: Option<Signals>) -> Stopped {
+    let Some(Signals {
+        mut term,
+        mut interrupt,
+    }) = signals
+    else {
+        return std::future::pending().await;
     };
     tokio::select! {
         _ = term.recv() => Stopped::Terminated,

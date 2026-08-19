@@ -112,16 +112,25 @@ impl fmt::Display for Invocation {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::Path;
-
     use super::*;
 
-    /// A script at `path` that does `body`, runnable.
-    fn script(path: &Path, body: &str) {
-        fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    /// A run of the shell that does `body`, with `args` as its arguments.
+    ///
+    /// These tests need programs that exit and print to order, and the shell is
+    /// asked to be them rather than a script being written for the occasion.
+    /// That is not squeamishness about temporary files: a file this process
+    /// holds open for writing cannot be executed, and a *sibling* thread that
+    /// forks in that window inherits the handle and keeps the file unrunnable
+    /// until it execs something of its own. A test suite that writes a program
+    /// and immediately runs it is therefore intermittently unable to run it, for
+    /// reasons that have nothing to do with what is being tested.
+    fn shell(body: &str, args: &[&str]) -> Invocation {
+        // Everything after the command is positional, starting with the name the
+        // shell reports itself by, so the caller's arguments arrive as `$1`
+        // onwards exactly as they would for a script.
+        let mut arguments = vec!["-c".to_owned(), body.to_owned(), "sh".to_owned()];
+        arguments.extend(args.iter().map(|argument| (*argument).to_owned()));
+        Invocation::new("/bin/sh", arguments)
     }
 
     /// A run of `program` with no arguments, spelled so the item type is known.
@@ -151,14 +160,9 @@ mod tests {
 
     #[test]
     fn a_command_that_refuses_is_a_failure_and_one_that_agrees_is_not() {
-        let dir = tempfile::tempdir().unwrap();
-        let (good, bad) = (dir.path().join("good"), dir.path().join("bad"));
-        script(&good, "exit 0");
-        script(&bad, "exit 1");
-
-        assert!(bare(&good).run().is_ok());
+        assert!(shell("exit 0", &[]).run().is_ok());
         assert!(matches!(
-            bare(&bad).run(),
+            shell("exit 1", &[]).run(),
             Err(Error::CommandFailed {
                 status: Some(1),
                 ..
@@ -168,23 +172,15 @@ mod tests {
 
     #[test]
     fn a_question_is_answered_by_what_the_command_printed() {
-        let dir = tempfile::tempdir().unwrap();
-        let command = dir.path().join("say");
-        script(&command, "printf '%s' \"$1\"");
-
         assert_eq!(
-            Invocation::new(&command, ["hello"]).ask(),
+            shell("printf '%s' \"$1\"", &["hello"]).ask(),
             Some("hello".to_owned())
         );
     }
 
     #[test]
     fn a_question_the_command_cannot_answer_is_left_unanswered() {
-        let dir = tempfile::tempdir().unwrap();
-        let command = dir.path().join("refuse");
-        script(&command, "printf 'partial'; exit 2");
-
-        assert_eq!(bare(&command).ask(), None);
+        assert_eq!(shell("printf 'partial'; exit 2", &[]).ask(), None);
         assert_eq!(bare("no-such-command-anywhere").ask(), None);
     }
 }
