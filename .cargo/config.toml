@@ -1,0 +1,25 @@
+# The Linux binaries this project ships are statically linked, because they are
+# copied onto machines that may have no toolchain, no package manager and no
+# matching libc. That is what the musl targets are for, and both of them are
+# linked here with the LLVM linker that comes inside the Rust toolchain rather
+# than with the machine's own `cc`.
+#
+# The reason is cross-compilation: a `cc` built for the host cannot link an
+# object file for another architecture, so `--target aarch64-unknown-linux-musl`
+# on an x86_64 machine fails at the link step with nothing but a rejected
+# `-m64`. Every other way out — a cross-gcc per architecture, `cross`,
+# `cargo-zigbuild` — is something to install first. With this file, adding the
+# target's standard library is the whole of the setup:
+#
+#   rustup target add x86_64-unknown-linux-musl
+#   cargo build --release --target x86_64-unknown-linux-musl
+#
+# and a build on somebody's machine goes through the same linker as a build that
+# produces a release asset. The result is a static PIE: no interpreter, no
+# `NEEDED` entry, `ldd` says "not a dynamic executable".
+
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"

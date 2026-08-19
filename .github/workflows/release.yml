@@ -1,0 +1,113 @@
+name: Release
+
+# A tag is what asks for a release. Pull requests do not: building four targets
+# and publishing them takes far longer than the checks that run on every change,
+# and CI already keeps a musl target compiling.
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: The tag names the workspace version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare the tag with Cargo.toml
+        run: |
+          . scripts/release-lib.sh
+          version=$(workspace_version)
+          tag=${GITHUB_REF_NAME#v}
+          if [ "$tag" != "$version" ]; then
+            printf 'tag %s does not name the workspace version %s\n' "$GITHUB_REF_NAME" "$version" >&2
+            exit 1
+          fi
+          printf 'releasing agentbus %s\n' "$version"
+
+  build:
+    # Nothing is built until the tag and the workspace agree, because every
+    # asset is named after that number and every provisioned copy is recognised
+    # by it.
+    needs: version
+    name: ${{ matrix.triple }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # A broken target should report itself rather than be hidden by whichever
+      # target failed first.
+      fail-fast: false
+      matrix:
+        include:
+          # The two targets the product needs: static Linux binaries that can be
+          # copied onto a machine that has nothing installed.
+          - triple: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - triple: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+            # Built on an x86_64 runner, so answering --version needs an
+            # emulator. Verifying the asset is worth the one package.
+            emulator: qemu-aarch64-static
+          # A convenience for people whose own machine is a Mac. Nothing in the
+          # bus requires them, and they are not static.
+          - triple: x86_64-apple-darwin
+            runner: macos-latest
+          - triple: aarch64-apple-darwin
+            runner: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.triple }}
+      - name: Install the emulator
+        if: matrix.emulator != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+      - name: Build, verify and name the asset
+        env:
+          AGENTBUS_RUN_WRAPPER: ${{ matrix.emulator }}
+        run: scripts/build-release.sh "${{ matrix.triple }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asset-${{ matrix.triple }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: asset-*
+          merge-multiple: true
+      - name: Write the manifest
+        run: |
+          scripts/make-manifest.sh -o dist/manifest.json dist \
+            "${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}"
+          cat dist/manifest.json
+      - name: Upload the assets and the manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" \
+              --verify-tag \
+              --title "$GITHUB_REF_NAME" \
+              --notes "Assets are named agentbus-<version>-<triple>; manifest.json lists each with its sha256."
+          fi
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber
