@@ -12,6 +12,11 @@
 //! earlier one wrote. Ownership is decided by the key alone, never by the
 //! version: a build that only removed the versions it knew about would leave
 //! the entries of a newer one behind for ever.
+//!
+//! Not every agent is configured by a document, though. One that reads a script
+//! gets a whole file to itself rather than a share of somebody else's, and there
+//! is nowhere in it to hang a key — so the same mark goes in a comment on its
+//! first line and answers the same question. See [`is_generated`].
 
 use serde_json::{Map, Value};
 
@@ -38,6 +43,24 @@ pub fn mark(entry: &mut Map<String, Value>) {
 /// Whether `value` is an entry this program wrote.
 pub fn is_marked(value: &Value) -> bool {
     value.get(KEY).is_some_and(Value::is_object)
+}
+
+/// Whether `text` is a file this program generated whole.
+///
+/// The same question [`is_marked`] answers, asked where there are no entries to
+/// ask it of. An agent whose configuration is a script rather than a document
+/// gets a file of its own rather than a share of one, and that file is either
+/// this program's to replace and to remove or somebody else's to leave exactly
+/// where it is. Nothing but a mark can tell those apart: the name is the same
+/// either way, and so is everything a user could have copied out of a
+/// documentation page.
+///
+/// Only the first line is looked at, and it is looked at for the key alone —
+/// whatever comment syntax the file is written in goes around it. A mark further
+/// down would be one somebody could acquire by accident, and the question here
+/// decides whether their file is about to be overwritten.
+pub fn is_generated(text: &str) -> bool {
+    text.lines().next().is_some_and(|line| line.contains(KEY))
 }
 
 /// Takes every entry this program wrote out of `document`, leaving the
@@ -149,6 +172,17 @@ mod tests {
         assert!(is_marked(&ours()));
         assert!(!is_marked(&document(r#"{"command": "something-else"}"#)));
         assert!(!is_marked(&Value::from("a string cannot be marked")));
+    }
+
+    #[test]
+    fn a_generated_file_is_recognized_by_its_first_line_and_only_by_that() {
+        assert!(is_generated("// _agentbus generated\nconst x = 1;\n"));
+        assert!(is_generated(
+            "# _agentbus, in whatever a comment looks like here"
+        ));
+        assert!(!is_generated("const x = 1;\n// _agentbus\n"));
+        assert!(!is_generated("// something a user wrote\n"));
+        assert!(!is_generated(""));
     }
 
     #[test]

@@ -35,6 +35,7 @@ pub mod command;
 pub mod file;
 pub mod json;
 pub mod merge;
+pub mod opencode;
 pub mod paths;
 pub mod sentinel;
 pub mod state;
@@ -95,6 +96,11 @@ pub enum Error {
         #[source]
         source: io::Error,
     },
+    /// A file this program would write is one somebody else wrote.
+    #[error(
+        "{path} was not written by this program, so it is not this program's to replace; move it aside to install here"
+    )]
+    NotOurs { path: PathBuf },
     /// A path cannot be written into a configuration file at all.
     #[error("{path} cannot be written into a configuration file, because it is not text")]
     Unwritable { path: PathBuf },
@@ -164,7 +170,7 @@ pub trait Installer {
 /// command line, the report and the uninstall all agree on the same list
 /// without any of them naming an agent.
 pub fn installers() -> Vec<&'static dyn Installer> {
-    vec![&claude::Claude, &codex::Codex]
+    vec![&claude::Claude, &codex::Codex, &opencode::OpenCode]
 }
 
 /// Every agent this build can install for.

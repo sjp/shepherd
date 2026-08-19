@@ -34,7 +34,7 @@ use crate::change::Change;
 use crate::command::Invocation;
 use crate::paths::Environment;
 use crate::state::State;
-use crate::{Error, Installer, assets, file};
+use crate::{Error, Installer, assets, file, json};
 
 /// What the plugin, and the marketplace offering it, are both called.
 ///
@@ -161,8 +161,7 @@ fn in_json(path: &Path) -> Result<String, Error> {
     let text = path.to_str().ok_or_else(|| Error::Unwritable {
         path: path.to_owned(),
     })?;
-    let quoted = Value::from(text).to_string();
-    Ok(quoted[1..quoted.len() - 1].to_owned())
+    Ok(json::escaped(text))
 }
 
 /// What writing one generated file would do.

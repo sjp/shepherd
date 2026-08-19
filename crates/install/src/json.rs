@@ -53,6 +53,18 @@ pub fn parse(text: &str) -> Result<Value, Problem> {
     }
 }
 
+/// A string as it is written between the quotation marks of a string literal.
+///
+/// A JSON one, and a JavaScript one: JavaScript's escapes are a superset of
+/// JSON's, so what is right here is right there too, and the one function serves
+/// both of the file formats this program generates. Nothing that goes through it
+/// can break out of the literal it is being put into, which is the point — the
+/// strings being escaped are paths from the machine this is running on.
+pub fn escaped(text: &str) -> String {
+    let quoted = Value::from(text).to_string();
+    quoted[1..quoted.len() - 1].to_owned()
+}
+
 /// Writes a document out, indented with `indent` and ending in a newline.
 ///
 /// The newline is unconditional: these files are read by people in editors and

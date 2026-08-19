@@ -1,0 +1,12 @@
+# One session from beginning to end, and what the bus says about it after each
+# payload: a file to send, and the status it leaves the session in. `?` where a
+# recording is not yet sure what to expect.
+session.created.json       starting
+tool.execute.before.json   working
+permission.updated.json    blocked
+permission.replied.json    working
+tool.execute.after.json    working
+session.compacted.json     working
+session.error.json         working
+session.idle.json          idle
+session.deleted.json       done

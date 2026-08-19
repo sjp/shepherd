@@ -1,0 +1,8 @@
+{
+  "type": "permission.updated",
+  "directory": "/srv/project",
+  "sessionID": "018f3c2a-9d41-7b52-a6e8-5c10d7f4b839",
+  "callID": "call_9a03d5",
+  "permissionID": "perm_4c8e12",
+  "tool": "edit"
+}

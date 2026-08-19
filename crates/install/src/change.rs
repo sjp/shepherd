@@ -25,6 +25,13 @@ use crate::{Error, file};
 /// Something that would happen as part of an installation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
+    /// There is no directory to write a file into, and this would make one.
+    ///
+    /// Writing a file makes the directories above it anyway; this exists so that
+    /// the making is *recorded*, which is the one thing an uninstall could not
+    /// otherwise work out. A directory the user already had is theirs and stays,
+    /// however empty this program leaves it.
+    Make { path: PathBuf },
     /// There is no file, and this would write one.
     Create { path: PathBuf, contents: String },
     /// There is a file, and this would write it back with different contents.
@@ -46,7 +53,8 @@ impl Change {
     /// The file or directory this is about, for the steps that are about one.
     pub fn path(&self) -> Option<&Path> {
         match self {
-            Self::Create { path, .. }
+            Self::Make { path }
+            | Self::Create { path, .. }
             | Self::Rewrite { path, .. }
             | Self::Delete { path }
             | Self::Keep { path }
@@ -75,6 +83,13 @@ impl Change {
     /// and that is exactly as worth protecting as anything an install touches.
     pub fn apply(&self, agent: Agent, state: &mut State) -> Result<(), Error> {
         match self {
+            Self::Make { path } => {
+                std::fs::create_dir_all(path).map_err(|source| Error::Write {
+                    path: path.to_owned(),
+                    source,
+                })?;
+                state.record(path, agent, Ownership::Created);
+            }
             Self::Create { path, contents } => {
                 write(path, contents)?;
                 state.record(path, agent, Ownership::Created);
@@ -99,6 +114,12 @@ impl Change {
                     path: path.to_owned(),
                     source,
                 })?;
+                // Only forgotten if it actually went. A directory left standing
+                // because somebody else's file is in it is still this program's
+                // to try again for.
+                if !path.exists() {
+                    state.forget(path);
+                }
             }
             Self::Run { command } => command.run()?,
             Self::Keep { .. } | Self::Ran { .. } => {}
@@ -126,6 +147,7 @@ mod tests {
         let path = PathBuf::from("/home/u/.claude/plugin.json");
         let command = Invocation::new("/usr/bin/claude", ["plugin", "list"]);
 
+        assert!(Change::Make { path: path.clone() }.is_change());
         assert!(
             Change::Create {
                 path: path.clone(),
@@ -155,6 +177,27 @@ mod tests {
 
         assert!(file.path().is_some() && file.command().is_none());
         assert!(ran.command().is_some() && ran.path().is_none());
+    }
+
+    #[test]
+    fn a_directory_this_program_makes_is_remembered_as_its_own_and_forgotten_again() {
+        let root = tempfile::tempdir().unwrap();
+        let made = root.path().join("plugin");
+        let mut state = State::default();
+
+        Change::Make { path: made.clone() }
+            .apply(Agent::OpenCode, &mut state)
+            .unwrap();
+
+        assert!(made.is_dir(), "the directory was not made");
+        assert_eq!(state.ownership(&made), Some(Ownership::Created));
+
+        Change::Clear { path: made.clone() }
+            .apply(Agent::OpenCode, &mut state)
+            .unwrap();
+
+        assert!(!made.exists(), "the directory was left behind");
+        assert_eq!(state.ownership(&made), None);
     }
 
     #[test]

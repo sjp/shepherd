@@ -107,18 +107,23 @@ fn supported() -> String {
 
 /// One step, and what became of it.
 ///
-/// A directory cleared away and a file removed are reported with the same word.
-/// The distinction is one this program makes because removing a directory needs
-/// more care than removing a file; to a user reading what happened to their
-/// machine, both are something that is no longer there.
+/// A directory made and a file written are reported with the same word, and so
+/// are a directory cleared away and a file removed. The distinctions are ones
+/// this program makes because a directory needs more care than a file; to a user
+/// reading what happened to their machine, one of them is now there and the
+/// other is not.
 fn describe(change: &Change, mode: Mode) -> String {
     match (mode, change) {
-        (Mode::Apply, Change::Create { path, .. }) => format!("created {}", path.display()),
+        (Mode::Apply, Change::Make { path } | Change::Create { path, .. }) => {
+            format!("created {}", path.display())
+        }
         (Mode::Apply, Change::Rewrite { path, .. }) => format!("updated {}", path.display()),
         (Mode::Apply, Change::Delete { path } | Change::Clear { path }) => {
             format!("removed {}", path.display())
         }
-        (Mode::DryRun, Change::Create { path, .. }) => format!("would create {}", path.display()),
+        (Mode::DryRun, Change::Make { path } | Change::Create { path, .. }) => {
+            format!("would create {}", path.display())
+        }
         (Mode::DryRun, Change::Rewrite { path, .. }) => format!("would update {}", path.display()),
         (Mode::DryRun, Change::Delete { path } | Change::Clear { path }) => {
             format!("would remove {}", path.display())

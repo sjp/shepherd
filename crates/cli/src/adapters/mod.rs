@@ -18,6 +18,7 @@
 pub mod claude;
 pub mod codex;
 pub mod observed;
+pub mod opencode;
 
 use serde_json::{Map, Value};
 

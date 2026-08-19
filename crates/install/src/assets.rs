@@ -20,3 +20,7 @@ pub const CLAUDE_PLUGIN: &str =
 /// The hooks that plugin registers.
 pub const CLAUDE_HOOKS: &str =
     include_str!("../assets/claude-marketplace/agentbus/hooks/hooks.json");
+
+/// The plugin OpenCode is given, as a single file dropped into its plugin
+/// directory.
+pub const OPENCODE_PLUGIN: &str = include_str!("../assets/opencode/agentbus.js");

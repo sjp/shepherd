@@ -1,0 +1,9 @@
+{
+  "type": "session.error",
+  "directory": "/srv/project",
+  "sessionID": "018f3c2a-9d41-7b52-a6e8-5c10d7f4b839",
+  "error": {
+    "name": "ProviderAuthError",
+    "data": { "message": "the provider refused the request" }
+  }
+}

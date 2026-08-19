@@ -13,9 +13,11 @@
 //! gone stale, which is the failure this is most concerned with catching.
 
 use std::fs;
+use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 /// The variable the stand-in keeps its world under, so that each test gets one
 /// of its own.
@@ -151,15 +153,30 @@ impl Machine {
     /// copy from somewhere else is what a user upgrading, or moving where they
     /// keep it, actually does to an installation.
     fn run_binary(&self, binary: &Path, args: &[&str]) -> Output {
-        Command::new(binary)
-            .args(args)
-            .env_clear()
-            .env("HOME", &self.home)
-            .env("PATH", &self.bin)
-            .env("XDG_STATE_HOME", &self.state)
-            .env(WORLD_VAR, &self.world)
-            .output()
-            .expect("cannot run agentbus")
+        // A binary copied into place a moment ago can still be held open for
+        // writing by another test doing the same thing, and the kernel refuses
+        // to run a file somebody is writing. It clears itself; nothing about the
+        // condition is what any of these tests is about.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let attempt = Command::new(binary)
+                .args(args)
+                .env_clear()
+                .env("HOME", &self.home)
+                .env("PATH", &self.bin)
+                .env("XDG_STATE_HOME", &self.state)
+                .env(WORLD_VAR, &self.world)
+                .output();
+            match attempt {
+                Err(error)
+                    if error.kind() == io::ErrorKind::ExecutableFileBusy
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => return result.expect("cannot run agentbus"),
+            }
+        }
     }
 
     /// Runs the binary and hands back what it printed, having checked that it
@@ -182,6 +199,16 @@ impl Machine {
     /// Where Codex's hooks are dropped in.
     fn codex_hooks(&self) -> PathBuf {
         self.home.join(".codex/hooks.json")
+    }
+
+    /// The directory OpenCode loads plugins from.
+    fn opencode_plugin_dir(&self) -> PathBuf {
+        self.home.join(".config/opencode/plugin")
+    }
+
+    /// Where OpenCode's plugin is dropped in.
+    fn opencode_plugin(&self) -> PathBuf {
+        self.opencode_plugin_dir().join("agentbus.js")
     }
 
     /// What is in a JSON file on this machine now.
@@ -216,7 +243,15 @@ impl Machine {
     /// A copy of the binary somewhere else on this machine, as a user who moved
     /// it would have.
     fn moved_binary(&self) -> PathBuf {
-        let elsewhere = self._root.path().join("elsewhere");
+        self.binary_at("elsewhere")
+    }
+
+    /// A copy of the binary in a directory of this machine called `dir`.
+    ///
+    /// The name is the caller's to choose, because what a generated file has to
+    /// survive is whatever a user called the directory they keep this in.
+    fn binary_at(&self, dir: &str) -> PathBuf {
+        let elsewhere = self._root.path().join(dir);
         fs::create_dir_all(&elsewhere).unwrap();
         let copy = elsewhere.join("agentbus");
         fs::copy(env!("CARGO_BIN_EXE_agentbus"), &copy).unwrap();
@@ -262,7 +297,7 @@ fn a_machine_with_no_agent_on_it_is_told_so() {
     assert_eq!(
         report,
         "no coding agent found on this machine\n\
-         nothing to install: this build only handles claude and codex\n"
+         nothing to install: this build only handles claude, codex and opencode\n"
     );
 }
 
@@ -792,4 +827,217 @@ fn uninstalling_for_codex_when_nothing_was_installed_changes_nothing() {
     assert!(report.contains("  nothing of ours is there\n"), "{report}");
     assert!(!machine.codex_hooks().exists());
     assert!(is_untouched(&machine.state));
+}
+
+/// Whether `script` is JavaScript a parser accepts.
+///
+/// `None` where there is no parser to hand: a machine without one still runs
+/// every other assertion about the file, rather than reporting a check it never
+/// made as having passed.
+fn parses(script: &Path) -> Option<bool> {
+    match Command::new("node").arg("--check").arg(script).output() {
+        Ok(output) => Some(output.status.success()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("cannot run node: {error}"),
+    }
+}
+
+#[test]
+fn installing_for_opencode_drops_a_plugin_in_where_there_was_none() {
+    let machine = Machine::new().installed("opencode");
+
+    let report = machine.report(&["install", "--agent", "opencode"]);
+
+    let path = machine.opencode_plugin();
+    assert!(
+        report.contains(&format!(
+            "created {}",
+            machine.opencode_plugin_dir().display()
+        )),
+        "{report}"
+    );
+    assert!(
+        report.contains(&format!("created {}", path.display())),
+        "{report}"
+    );
+    let script = fs::read_to_string(&path).expect("no plugin was written");
+    // Marked, because that is the whole of how an upgrade and an uninstall later
+    // tell this program's own file from one that merely shares its name.
+    assert!(
+        agentbus_install::sentinel::is_generated(&script),
+        "the plugin was left unmarked: {script}"
+    );
+    let quoted = format!("\"{}\"", env!("CARGO_BIN_EXE_agentbus"));
+    assert!(
+        script.contains(&quoted),
+        "the plugin does not name the binary that wrote it: {script}"
+    );
+    assert!(
+        script.contains("emit --agent opencode"),
+        "the plugin does not emit: {script}"
+    );
+    assert!(!script.contains('@'), "a placeholder was left in: {script}");
+}
+
+#[test]
+fn the_plugin_opencode_is_given_is_javascript_that_parses() {
+    let machine = Machine::new().installed("opencode");
+    machine.report(&["install", "--agent", "opencode"]);
+
+    let path = machine.opencode_plugin();
+
+    match parses(&path) {
+        Some(parsed) => assert!(parsed, "{} is not valid JavaScript", path.display()),
+        // Nothing to run it with here. The assertions above already pin that the
+        // substitution happened and that nothing of the template is left.
+        None => assert!(path.is_file()),
+    }
+}
+
+#[test]
+fn a_path_that_needs_escaping_still_gives_opencode_javascript_that_parses() {
+    let machine = Machine::new().installed("opencode");
+    let awkward = machine.binary_at("a \"quoted\" name");
+    machine.run_binary(&awkward, &["install", "--agent", "opencode"]);
+
+    let script = fs::read_to_string(machine.opencode_plugin()).expect("no plugin was written");
+
+    assert!(
+        script.contains(r#"\"quoted\""#),
+        "the path was not escaped: {script}"
+    );
+    if let Some(parsed) = parses(&machine.opencode_plugin()) {
+        assert!(parsed, "an escaped path did not survive: {script}");
+    }
+}
+
+#[test]
+fn installing_for_opencode_twice_changes_nothing_the_second_time() {
+    let machine = Machine::new().installed("opencode");
+    machine.report(&["install", "--agent", "opencode"]);
+    let path = machine.opencode_plugin();
+    let after_one = fs::read_to_string(&path).unwrap();
+
+    let report = machine.report(&["install", "--agent", "opencode"]);
+
+    assert!(report.contains("  already installed\n"), "{report}");
+    assert!(
+        report.contains(&format!("unchanged {}", path.display())),
+        "{report}"
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), after_one);
+    assert!(
+        machine.backups_of(&path).is_empty(),
+        "a run that changed nothing still copied the file"
+    );
+}
+
+#[test]
+fn a_binary_that_moved_is_written_into_opencodes_plugin_again() {
+    let machine = Machine::new().installed("opencode");
+    machine.report(&["install", "--agent", "opencode"]);
+    let moved = machine.moved_binary();
+
+    let output = machine.run_binary(&moved, &["install", "--agent", "opencode"]);
+    let report = succeeds(&output);
+
+    let path = machine.opencode_plugin();
+    assert!(
+        report.contains(&format!("updated {}", path.display())),
+        "{report}"
+    );
+    let script = fs::read_to_string(&path).unwrap();
+    assert!(
+        script.contains(&moved.display().to_string()),
+        "the plugin does not name the binary that wrote it: {script}"
+    );
+}
+
+#[test]
+fn a_plugin_of_the_users_own_with_the_same_name_is_left_exactly_as_it_was() {
+    let machine = Machine::new().configured("opencode");
+    let path = machine.opencode_plugin();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let theirs = "// a plugin I wrote myself, which happens to share a name\n";
+    fs::write(&path, theirs).unwrap();
+
+    let output = machine.run(&["install", "--agent", "opencode"]);
+
+    assert!(!output.status.success(), "{output:?}");
+    let complaint = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        complaint.contains(&path.display().to_string()),
+        "{complaint}"
+    );
+    assert!(
+        complaint.contains("not written by this program"),
+        "{complaint}"
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), theirs);
+    assert!(machine.backups_of(&path).is_empty());
+}
+
+#[test]
+fn uninstalling_for_opencode_takes_away_the_plugin_and_the_directory_it_made() {
+    let machine = Machine::new().installed("opencode");
+    machine.report(&["install", "--agent", "opencode"]);
+    let path = machine.opencode_plugin();
+
+    let report = machine.report(&["uninstall", "--agent", "opencode"]);
+
+    assert!(
+        report.contains(&format!("removed {}", path.display())),
+        "{report}"
+    );
+    assert!(!path.exists(), "{} was left behind", path.display());
+    // Nothing of this program's is left, down to the directory it made — which
+    // is also why there is nowhere for a copy of the file to have survived.
+    assert!(
+        !machine.opencode_plugin_dir().exists(),
+        "the directory this program made was left behind"
+    );
+    assert!(
+        machine.home.join(".config/opencode").is_dir(),
+        "the agent's own configuration directory was removed"
+    );
+}
+
+#[test]
+fn uninstalling_for_opencode_leaves_a_plugin_directory_that_was_already_there() {
+    let machine = Machine::new().configured("opencode");
+    let dir = machine.opencode_plugin_dir();
+    fs::create_dir_all(&dir).unwrap();
+    machine.report(&["install", "--agent", "opencode"]);
+
+    machine.report(&["uninstall", "--agent", "opencode"]);
+
+    assert!(!machine.opencode_plugin().exists());
+    assert!(
+        dir.is_dir(),
+        "a directory this program did not make was removed"
+    );
+}
+
+#[test]
+fn uninstalling_for_opencode_when_nothing_was_installed_changes_nothing() {
+    let machine = Machine::new().installed("opencode");
+
+    let report = machine.report(&["uninstall", "--agent", "opencode"]);
+
+    assert!(report.contains("  nothing of ours is there\n"), "{report}");
+    assert!(!machine.opencode_plugin().exists());
+    assert!(is_untouched(&machine.state));
+}
+
+#[test]
+fn a_plugin_of_the_users_own_survives_an_uninstall() {
+    let machine = Machine::new().configured("opencode");
+    let path = machine.opencode_plugin();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let theirs = "// mine\n";
+    fs::write(&path, theirs).unwrap();
+
+    machine.report(&["uninstall", "--agent", "opencode"]);
+
+    assert_eq!(fs::read_to_string(&path).unwrap(), theirs);
 }
