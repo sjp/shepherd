@@ -56,6 +56,7 @@ pub mod discover;
 pub mod docker;
 pub mod reconcile;
 pub mod release;
+pub mod ssh;
 pub mod store;
 pub mod targets;
 pub mod transport;
