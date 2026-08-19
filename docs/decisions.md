@@ -437,3 +437,40 @@ outright, with none of the discrimination Claude's general-purpose
 and `PostCompact` are one `compact` kind told apart by `detail.phase`, rather
 than two kinds, because what happened is the same thing and a subscriber that
 only cares that it happened should not have to know there are two spellings.
+
+## 2026-08-19 — reading the process table
+
+### The procfs reader is written here rather than taken from a crate
+
+**`std::fs` over a root path, and no new dependency.** The published crates that
+read `/proc` parse all of it — every field of `stat`, `smaps`, `net`, the cgroup
+tree — behind an error type per file, and the daemon wants six fields, an
+argument vector, an environment block and a link target, each of which it wants
+to be allowed to fail. Taking one would mean adopting a large parse surface and
+then translating its errors back into the "no answer" this code is built around.
+What is written instead is a couple of hundred lines, and is the part that has
+to be got exactly right anyway: the `stat` line is read from its last `)` backwards
+rather than split on whitespace, because a process may legally be called
+`my (weird) proc`, and no amount of dependency avoids having to know that.
+
+### The root of the process table is an argument, never a constant
+
+**A reader is constructed from a path; the daemon passes `/proc` and a test
+passes a directory of files it wrote.** Every case worth testing here — a name
+with parentheses in it, a foreground group that exited between two reads, an
+`environ` the daemon is not allowed to open, a pipeline whose group leader has to
+be picked out of three processes — is a state a machine is in for a few
+milliseconds and cannot be asked to reproduce. Against a directory they are all
+just files. This is also what makes the module compile and pass its own tests on
+macOS, where there is no procfs at all: nothing is conditional on the platform,
+and a root that is not there is a process table with nothing in it.
+
+### Nothing that fails here produces an error
+
+**Every operation answers `Option`, and writes one debug line saying which file
+it was and what the system said.** A caller sampling the process table is reading
+something that changes underneath it: a pid that vanishes between listing the
+table and reading its `stat` is the ordinary case, not a fault, and so is an
+`environ` belonging to another uid, which needs `CAP_SYS_PTRACE` to open. An
+error type would put a decision in front of every call site for a condition that
+has exactly one sensible response, which is to have no observation this time.

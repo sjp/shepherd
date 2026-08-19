@@ -47,6 +47,7 @@ pub mod clock;
 pub mod emit;
 pub mod lock;
 pub mod paths;
+pub mod procfs;
 pub mod subscribe;
 
 use std::fmt;
