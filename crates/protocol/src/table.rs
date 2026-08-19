@@ -285,16 +285,81 @@ impl SessionTable {
         });
     }
 
-    /// Records that the process behind a session is definitively gone. Does
-    /// nothing for a session the table has never heard of: a dead process is not
-    /// evidence that a session existed.
-    pub fn process_gone(&mut self, key: &SessionKey, at: &Timestamp) {
+    /// Records what another daemon says about a session it folded, as the state
+    /// of that session here.
+    ///
+    /// A daemon that has just reached another one is handed its current state,
+    /// not the events it folded to reach it, so a session it reports is *set* to
+    /// the status it reports rather than replayed. The far end has already done
+    /// the folding, and a session it says has been blocked for six minutes is
+    /// blocked, whatever this table would have made of the events had it seen
+    /// them.
+    ///
+    /// The far end's `since` is kept, because that is when the status began and
+    /// is the number a receiver renders. `now` is when this table heard it,
+    /// which is what the quiet timer runs from: hearing it now is the freshest
+    /// evidence there is that the session is still there, and timing it out
+    /// from a `since` that is deliberately old would report a session lost that
+    /// the daemon folding it says is working.
+    ///
+    /// `source` and `origin` are fixed at first sight, exactly as they are for a
+    /// session learned from events. Returns the key it was filed under, so a
+    /// caller merging a whole account can tell which of the sessions it used to
+    /// be told about are no longer in it.
+    pub fn seed(&mut self, entry: &SessionEntry, now: &Timestamp) -> SessionKey {
+        let key = SessionKey::new(entry.agent.clone(), entry.session.clone());
+        let session = self
+            .sessions
+            .entry(key.clone())
+            .or_insert_with(|| TrackedSession {
+                state: SessionState {
+                    status: entry.status,
+                    since: entry.since.clone(),
+                    last_event: now.clone(),
+                    source: entry.source,
+                    last_error: None,
+                },
+                source: entry.source,
+                cwd: entry.cwd.clone(),
+                correlation: entry.correlation.clone(),
+                origin: entry.origin.clone(),
+            });
+        session.state.status = entry.status;
+        session.state.since = entry.since.clone();
+        session.state.source = entry.source;
+        if session.state.last_event < *now {
+            session.state.last_event = now.clone();
+        }
+        if let Some(cwd) = reported(&entry.cwd) {
+            session.cwd = Some(cwd.to_owned());
+        }
+        if let Some(correlation) = reported(&entry.correlation) {
+            session.correlation = Some(correlation.to_owned());
+        }
+        key
+    }
+
+    /// Records that a session is over because nothing can speak for it any
+    /// more. Does nothing for a session the table has never heard of: silence
+    /// about something is not evidence that it existed.
+    ///
+    /// This is the definitive end, not a guess: whatever was running the session
+    /// is beyond reach, so no further claim about it is ever going to arrive. A
+    /// session that is already over keeps the moment it finished.
+    pub fn ended(&mut self, key: &SessionKey, at: &Timestamp) {
         if let Some(session) = self.sessions.get_mut(key) {
             session.state = self
                 .fold
                 .apply(Some(session.state.clone()), Input::ProcessGone { at })
-                .expect("a session that exists still exists after its process dies");
+                .expect("a session that exists still exists after it ends");
         }
+    }
+
+    /// Records that the process behind a session is definitively gone, which is
+    /// one way for it to be [`SessionTable::ended`] and the one a process table
+    /// can prove.
+    pub fn process_gone(&mut self, key: &SessionKey, at: &Timestamp) {
+        self.ended(key, at);
     }
 
     /// The whole table as a snapshot, with no foreground observations reported.
@@ -1013,6 +1078,88 @@ mod tests {
         )));
         assert!(!is_observed_session_id("abc123"));
         assert!(!is_observed_session_id("w9:p3"));
+    }
+
+    /// What another daemon reports about one of its sessions.
+    fn reported_by_another(status: SessionStatus, second: u64) -> SessionEntry {
+        SessionEntry {
+            session: "abc123".to_owned(),
+            agent: Agent::Claude,
+            status,
+            source: Source::Hook,
+            cwd: Some("/srv/project".to_owned()),
+            correlation: Some(SLOT.to_owned()),
+            origin: vec![container("9f3c", "build")],
+            since: at(second),
+        }
+    }
+
+    #[test]
+    fn a_seeded_session_is_set_to_the_status_it_was_reported_with() {
+        let mut table = SessionTable::new();
+
+        let key = table.seed(&reported_by_another(Blocked, 5), &at(100));
+
+        assert_eq!(key, SessionKey::new(Agent::Claude, "abc123"));
+        let session = table.get(&key).expect("the session was not seeded");
+        assert_eq!(session.state.status, Blocked);
+        // The far end's own reckoning of how long it has been blocked survives,
+        // which is the whole reason for seeding rather than replaying.
+        assert_eq!(session.state.since, at(5));
+        assert_eq!(session.source, Source::Hook);
+        assert_eq!(session.cwd.as_deref(), Some("/srv/project"));
+        assert_eq!(session.correlation.as_deref(), Some(SLOT));
+        assert_eq!(session.origin, vec![container("9f3c", "build")]);
+
+        let entry = &table.snapshot_sessions()[0];
+        assert_eq!(entry.status, Blocked);
+        assert_eq!(entry.since, at(5));
+    }
+
+    #[test]
+    fn seeding_again_updates_the_session_rather_than_making_another_one() {
+        let mut table = SessionTable::new();
+        table.seed(&reported_by_another(Blocked, 5), &at(100));
+
+        table.seed(&reported_by_another(Working, 110), &at(120));
+
+        assert_eq!(table.len(), 1);
+        let session = table
+            .get(&SessionKey::new(Agent::Claude, "abc123"))
+            .expect("the session went missing");
+        assert_eq!(session.state.status, Working);
+        assert_eq!(session.state.since, at(110));
+    }
+
+    #[test]
+    fn a_seeded_session_is_not_timed_out_for_the_silence_before_it_was_heard_of() {
+        let mut table =
+            SessionTable::new().with_fold(Fold::with_stale_after(Duration::from_secs(5)));
+
+        // Reported as working since long ago, and reported *now*: the far end is
+        // folding it and has just said so, so this end has no business calling
+        // it lost.
+        table.seed(&reported_by_another(Working, 0), &at(100));
+        table.tick(&at(101));
+
+        assert_eq!(status_of(&table, Agent::Claude, "abc123"), Some(Working));
+        table.tick(&at(106));
+        assert_eq!(status_of(&table, Agent::Claude, "abc123"), Some(Stale));
+    }
+
+    #[test]
+    fn a_session_that_can_no_longer_be_spoken_for_is_over() {
+        let mut table = SessionTable::new();
+        table.seed(&reported_by_another(Blocked, 5), &at(100));
+
+        table.ended(&SessionKey::new(Agent::Codex, "never-heard-of"), &at(101));
+        assert_eq!(table.len(), 1);
+
+        table.ended(&SessionKey::new(Agent::Claude, "abc123"), &at(101));
+        assert_eq!(status_of(&table, Agent::Claude, "abc123"), Some(Done));
+        // And it leaves on the ordinary retention, like any finished session.
+        table.tick(&at(140));
+        assert!(table.is_empty());
     }
 
     #[test]

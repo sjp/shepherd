@@ -28,6 +28,25 @@ pub fn now() -> Timestamp {
     from_unix_millis(unix_millis(SystemTime::now()))
 }
 
+/// A fraction in `0..1` that is different every time it is asked for.
+///
+/// For spreading retries, which is the only thing in this daemon that wants a
+/// number it cannot predict. Taken from the clock rather than from a generator
+/// of random numbers, because what is actually wanted is that two things
+/// retrying after the same outage do not retry in step, and the sub-second part
+/// of the wall clock differs between any two moments that reach it. It also
+/// keeps a crate with no other use for randomness from acquiring a dependency
+/// for three lines of arithmetic.
+pub fn scatter() -> f64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.subsec_nanos());
+    f64::from(nanos) / f64::from(NANOS_PER_SECOND)
+}
+
+/// Nanoseconds in a second, as the divisor that turns one into a fraction.
+const NANOS_PER_SECOND: u32 = 1_000_000_000;
+
 /// The instant `millis` milliseconds after the Unix epoch, as a timestamp.
 ///
 /// Clamped to the range a timestamp can spell. A clock that reads a date outside

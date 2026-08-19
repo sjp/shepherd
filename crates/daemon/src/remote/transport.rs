@@ -319,6 +319,17 @@ impl Running {
         &mut self.stdout
     }
 
+    /// Takes the stream away, leaving the handle able to wait for the far end
+    /// and to stop it, and able to say nothing more about what it said.
+    ///
+    /// Anything reading a stream that lasts does it on a thread of its own, and
+    /// that thread cannot also be the one that has to be able to cut the
+    /// connection — it is blocked on a read only the cutting will finish.
+    /// Separating the two is what lets one thread do each.
+    pub fn take_stdout(&mut self) -> Box<dyn BufRead + Send> {
+        std::mem::replace(&mut self.stdout, Box::new(io::empty()))
+    }
+
     /// Puts bytes already taken from stdout back in front of it.
     ///
     /// A caller sometimes has to read a line to find out what it is holding, and
@@ -406,6 +417,18 @@ pub trait Transport: fmt::Debug + Send + Sync {
     /// Copies a local file to `remote` at the far end, creating whatever the
     /// path needs.
     fn copy_in(&self, local: &Path, remote: &str) -> Result<(), Error>;
+
+    /// Whether a failure is worth trying again.
+    ///
+    /// Almost everything is: an endpoint that has not started yet, a container
+    /// being rebuilt, a network that is down. The exception is a failure that
+    /// will keep happening until a person does something about it — a
+    /// credential that is refused is the one that matters — and saying so is
+    /// what stops something from retrying forever in a state nobody is being
+    /// told about.
+    fn recoverable(&self, _error: &Error) -> bool {
+        true
+    }
 
     /// How long to wait before trying again after this transport breaks.
     ///

@@ -23,7 +23,14 @@
 //! the far end is often a machine this one does not contain a binary for, and
 //! then the matching one is fetched from where this version was published and
 //! checked against what the release said it would be before it goes anywhere.
+//!
+//! [`Attachment`] is what all of that is for. It subscribes to the daemon at the
+//! far end, stamps every session, observation and event it reports with the hop
+//! that reaches it, and merges them into this daemon's own stream — so that
+//! something reading one socket on this machine is told about agents running on
+//! all of them.
 
+pub mod attach;
 pub mod bootstrap;
 pub mod release;
 pub mod transport;
@@ -35,6 +42,7 @@ mod published;
 #[cfg(test)]
 mod tests;
 
+pub use attach::Attachment;
 pub use bootstrap::{Bootstrap, SCRIPT, TARGET};
 pub use release::Release;
 pub use transport::{Backoff, Platform, Running, Transport};

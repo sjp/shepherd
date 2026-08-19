@@ -32,7 +32,8 @@
 //! running for is left alone rather than guessed at, because a status guessed
 //! wrong here reads exactly like one that was reported.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt;
 use std::sync::{Mutex, PoisonError};
 
 use agentbus_protocol::{
@@ -78,6 +79,37 @@ impl Published {
     }
 }
 
+/// One daemon this one has attached to, for as long as it is attached.
+///
+/// Opaque, and unique only within this process. What it is for is telling one
+/// attachment's contributions from another's: everything an attachment reports
+/// has to be withdrawable together when it goes away, and nothing else in the
+/// state it feeds is keyed in a way that would allow that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AttachmentId(u64);
+
+impl fmt::Display for AttachmentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// What one attached daemon has told this one.
+#[derive(Debug, Default)]
+struct Attached {
+    /// Every session learned through it, so that they can all be ended when it
+    /// stops reporting them or goes away.
+    sessions: BTreeSet<SessionKey>,
+    /// Whether the far end watches a process table at all. "Nobody is looking"
+    /// and "nobody is running anything" are different facts at every point in a
+    /// chain, so this is carried rather than inferred from an empty table.
+    watching: bool,
+    /// What it says is in the foreground, keyed by the correlation and the pid
+    /// in *its own* process namespace. The pid means nothing on this machine
+    /// beyond telling two of that daemon's observations apart.
+    foreground: BTreeMap<(String, u32), ForegroundEntry>,
+}
+
 /// Everything the daemon knows, and the one place events enter it.
 #[derive(Debug)]
 pub struct Bus {
@@ -101,6 +133,13 @@ struct State {
     /// The process each session was last seen speaking from, for as long as both
     /// of them are still there.
     bindings: Bindings,
+    /// How many daemons this one has attached to, ever, which is where the next
+    /// attachment's identity comes from.
+    attachments: u64,
+    /// What each attached daemon has reported, kept apart from what this daemon
+    /// knows first-hand so that losing one of them withdraws exactly what it
+    /// said and nothing else.
+    attached: BTreeMap<AttachmentId, Attached>,
 }
 
 impl Default for Bus {
@@ -125,6 +164,8 @@ impl Bus {
                 recent: VecDeque::with_capacity(RECENT_EVENTS),
                 foreground: None,
                 bindings: Bindings::new(),
+                attachments: 0,
+                attached: BTreeMap::new(),
             }),
             events,
         }
@@ -270,6 +311,181 @@ impl Bus {
         gone
     }
 
+    /// Registers a daemon this one is about to start reading, and hands back the
+    /// identity everything it says will be filed under.
+    pub fn attach(&self) -> AttachmentId {
+        let mut state = self.lock();
+        state.attachments += 1;
+        let id = AttachmentId(state.attachments);
+        state.attached.insert(id, Attached::default());
+        id
+    }
+
+    /// Replaces everything an attachment has reported with what its daemon says
+    /// is true now.
+    ///
+    /// This is the whole of what reaching another daemon brings back. It has
+    /// already folded its own events, so its sessions are *seeded* — set to the
+    /// status it reports — rather than replayed from events this one never saw.
+    /// A session it used to report and no longer mentions is over: either it
+    /// finished and was forgotten over there, or the daemon that knew it is
+    /// gone, and in both cases nothing further is ever going to be said about
+    /// it.
+    ///
+    /// `foreground` is `None` for a far end that watches no process table,
+    /// which is a different answer from an empty list and is carried as one.
+    ///
+    /// Sessions arrive on the far end's own account and there is no line on this
+    /// daemon's stream that could carry one, so a subscriber learns them from
+    /// its next snapshot. Observations do have a line, and the differences from
+    /// what this attachment last said are published as ordinary changes, so that
+    /// a subscriber applying the stream to the snapshot it started with stays
+    /// level with what a new one would be handed.
+    pub fn seed(
+        &self,
+        id: AttachmentId,
+        sessions: &[SessionEntry],
+        foreground: Option<&[ForegroundEntry]>,
+        now: &Timestamp,
+    ) {
+        let mut state = self.lock();
+        let mut seeded = BTreeSet::new();
+        for entry in sessions {
+            seeded.insert(state.table.seed(entry, now));
+        }
+        let attached = state.attached.entry(id).or_default();
+        let dropped: Vec<SessionKey> = attached.sessions.difference(&seeded).cloned().collect();
+        attached.sessions = seeded;
+
+        let reported: BTreeMap<(String, u32), ForegroundEntry> = foreground
+            .unwrap_or_default()
+            .iter()
+            .map(|entry| ((entry.correlation.clone(), entry.pid), entry.clone()))
+            .collect();
+        attached.watching = foreground.is_some();
+        let previous = std::mem::replace(&mut attached.foreground, reported.clone());
+
+        let withdrawn: BTreeSet<String> = previous
+            .keys()
+            .filter(|(correlation, _)| !reported.keys().any(|(still, _)| still == correlation))
+            .map(|(correlation, _)| correlation.clone())
+            .collect();
+        let observed: Vec<ForegroundEntry> = reported
+            .iter()
+            .filter(|(key, entry)| previous.get(*key) != Some(*entry))
+            .map(|(_, entry)| entry.clone())
+            .collect();
+
+        for key in &dropped {
+            state.table.ended(key, now);
+        }
+        for correlation in withdrawn {
+            state.seq += 1;
+            let line = ForegroundChange::withdrawn(state.seq, now.clone(), correlation);
+            let _ = self.events.send(Published::Foreground(line));
+        }
+        for entry in observed {
+            state.seq += 1;
+            let line = ForegroundChange::observed(state.seq, now.clone(), entry);
+            let _ = self.events.send(Published::Foreground(line));
+        }
+    }
+
+    /// Merges an event another daemon folded, numbering it in this daemon's
+    /// sequence and publishing it as though it had happened here.
+    ///
+    /// Everything ingest does, except the two things that would be claims about
+    /// somewhere else. The `origin` is the caller's and is left alone: only what
+    /// is reading the far end knows what boundary the event crossed to get here.
+    /// And nothing is bound to a process, because the pids an attached daemon
+    /// reports are numbers in its own process table; a session over there ends
+    /// when that daemon says so, and its `session_end` arrives here like any
+    /// other event.
+    pub fn merge(&self, id: AttachmentId, event: Event) -> Event {
+        let mut state = self.lock();
+        state.seq += 1;
+        let mut event = event;
+        event.seq = state.seq;
+        if let Some(conflict) = state.table.apply_event(&event) {
+            warn!(
+                agent = %conflict.key.agent,
+                session = %conflict.key.session,
+                "an event's origin disagrees with the chain this session was first seen with"
+            );
+        }
+        state
+            .attached
+            .entry(id)
+            .or_default()
+            .sessions
+            .insert(SessionKey::of(&event));
+        if state.recent.len() == RECENT_EVENTS {
+            state.recent.pop_front();
+        }
+        state.recent.push_back(event.clone());
+        let _ = self.events.send(Published::Event(event.clone()));
+        event
+    }
+
+    /// Merges a change in what an attached daemon says is in front of one of its
+    /// correlated shells, numbering it here and publishing it.
+    pub fn merge_foreground(&self, id: AttachmentId, change: ForegroundChange) -> ForegroundChange {
+        let mut state = self.lock();
+        state.seq += 1;
+        let mut change = change;
+        change.seq = state.seq;
+        let attached = state.attached.entry(id).or_default();
+        // A daemon that reports a change is a daemon that is watching, whatever
+        // its last snapshot said.
+        attached.watching = true;
+        match &change.foreground {
+            Some(entry) => {
+                attached
+                    .foreground
+                    .insert((entry.correlation.clone(), entry.pid), entry.clone());
+            }
+            // A withdrawal names a correlation and nothing else, so it takes
+            // every observation of that correlation with it. That is what the
+            // line means at the far end too: the daemon that wrote it keeps its
+            // own table by exactly this rule.
+            None => {
+                if let Some(correlation) = change.correlation() {
+                    attached
+                        .foreground
+                        .retain(|(reported, _), _| reported != correlation);
+                }
+            }
+        }
+        let _ = self.events.send(Published::Foreground(change.clone()));
+        change
+    }
+
+    /// Forgets everything an attachment reported: its sessions are over, and its
+    /// observations are withdrawn.
+    ///
+    /// The daemon at the far end is untouched by this and carries on. What ends
+    /// is this daemon's account of it, which is the only thing it was ever
+    /// entitled to end.
+    pub fn detach(&self, id: AttachmentId, now: &Timestamp) {
+        let mut state = self.lock();
+        let Some(attached) = state.attached.remove(&id) else {
+            return;
+        };
+        for key in &attached.sessions {
+            state.table.ended(key, now);
+        }
+        let withdrawn: BTreeSet<String> = attached
+            .foreground
+            .into_keys()
+            .map(|(correlation, _)| correlation)
+            .collect();
+        for correlation in withdrawn {
+            state.seq += 1;
+            let line = ForegroundChange::withdrawn(state.seq, now.clone(), correlation);
+            let _ = self.events.send(Published::Foreground(line));
+        }
+    }
+
     /// A receiver of every line published from now on.
     pub fn events(&self) -> broadcast::Receiver<Published> {
         self.events.subscribe()
@@ -287,8 +503,8 @@ impl Bus {
     pub fn subscribe(&self) -> (Snapshot, broadcast::Receiver<Published>) {
         let state = self.lock();
         let snapshot = state.table.snapshot(state.seq);
-        let snapshot = match &state.foreground {
-            Some(table) => snapshot.with_foreground(table.values().cloned().collect()),
+        let snapshot = match state.watched() {
+            Some(foreground) => snapshot.with_foreground(foreground),
             None => snapshot,
         };
         (snapshot, self.events.subscribe())
@@ -305,13 +521,11 @@ impl Bus {
         self.lock().table.snapshot_sessions()
     }
 
-    /// The foreground observations a snapshot would carry, or nothing where the
-    /// bus is not watching the process table.
+    /// The foreground observations a snapshot would carry, or nothing where
+    /// neither this daemon nor any daemon it is attached to is watching a
+    /// process table.
     pub fn foreground(&self) -> Option<Vec<ForegroundEntry>> {
-        self.lock()
-            .foreground
-            .as_ref()
-            .map(|table| table.values().cloned().collect())
+        self.lock().watched()
     }
 
     /// The process a session is currently bound to, if it has been seen
@@ -342,6 +556,31 @@ impl Bus {
 }
 
 impl State {
+    /// Every foreground observation this daemon would report, its own and those
+    /// relayed from the daemons it is attached to, or nothing where nobody
+    /// anywhere in the chain is watching a process table at all.
+    ///
+    /// A daemon on a machine with no process table to read still reports what
+    /// the ones it reaches can see. Saying nothing there would be saying that
+    /// nothing is running, which is a different and false claim.
+    fn watched(&self) -> Option<Vec<ForegroundEntry>> {
+        let relayed = self
+            .attached
+            .values()
+            .filter(|attached| attached.watching)
+            .flat_map(|attached| attached.foreground.values().cloned());
+        match &self.foreground {
+            Some(table) => Some(table.values().cloned().chain(relayed).collect()),
+            None => {
+                let relayed: Vec<ForegroundEntry> = relayed.collect();
+                self.attached
+                    .values()
+                    .any(|attached| attached.watching)
+                    .then_some(relayed)
+            }
+        }
+    }
+
     /// Binds the session an event belongs to to the process the event was
     /// spoken from, where the process table says what that is.
     ///
