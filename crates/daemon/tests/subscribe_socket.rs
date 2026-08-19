@@ -42,7 +42,9 @@ fn start(settings: Settings) -> Running {
         ..settings
     };
     let daemon = Daemon::bind(SocketPaths::in_dir(dir.path().join("agentbus")), settings)
-        .expect("cannot start the daemon");
+        .expect("cannot start the daemon")
+        // Nothing on the machine this is running on is to be reached into.
+        .discovering(Vec::new());
     let bus = Arc::clone(daemon.bus());
     let paths = daemon.paths().clone();
     tokio::spawn(daemon.run());

@@ -19,9 +19,15 @@
 //! at any time, twice in a row, or after any amount of the file having changed
 //! behind its back.
 //!
-//! Attachments that were found by looking rather than by being declared are not
-//! this file's business, and a pass does not touch them: whichever transport
-//! discovered one is the thing that knows whether it is still there.
+//! # What was found rather than declared
+//!
+//! A pass also asks every transport that can find its own endpoints what it can
+//! see, on whatever cadence that transport asks to be asked on, and keeps those
+//! attachments in step with the answer the same way. The two sets never touch:
+//! taking a declaration back never stops something that was found, and a list
+//! that has stopped mentioning an endpoint never stops one somebody asked for.
+//! Where both name one endpoint the declaration wins, because somebody asked
+//! for that one and nobody asked for the other.
 //!
 //! # Why a thread
 //!
@@ -35,7 +41,7 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use agentbus_protocol::Timestamp;
 use tracing::{debug, info, warn};
@@ -43,6 +49,7 @@ use tracing::{debug, info, warn};
 use super::attach::{self, Attachment};
 use super::attachments::{Attachments, Entry, State};
 use super::bootstrap::Bootstrap;
+use super::discover::{Context, Discovery, Found};
 use super::targets::{Target, Targets};
 use super::transport::Registry;
 use crate::bus::Bus;
@@ -65,6 +72,8 @@ pub struct Plan {
     pub attachments: Attachments,
     /// How a declaration is turned into a way of reaching an endpoint.
     pub transports: Registry,
+    /// The transports that find their own endpoints rather than being told.
+    pub discoveries: Vec<Arc<dyn Discovery>>,
     /// The bus everything reached this way is merged into.
     pub bus: Arc<Bus>,
     /// The version to establish at each far end.
@@ -207,6 +216,8 @@ struct Live {
     state: State,
     attempt: u32,
     since: Timestamp,
+    /// Whether it was found by looking rather than by being declared.
+    auto: bool,
 }
 
 impl Live {
@@ -225,7 +236,7 @@ impl Live {
             attempt: self.attempt,
             last_error: self.refused.clone(),
             since: self.since.clone(),
-            auto: false,
+            auto: self.auto,
         }
     }
 
@@ -245,7 +256,11 @@ struct Reconciler {
     bootstrap: Bootstrap,
     settings: attach::Settings,
     every: Duration,
-    live: Vec<Live>,
+    discoveries: Vec<Sweeping>,
+    /// The endpoints somebody declared.
+    wanted: Vec<Live>,
+    /// The endpoints a transport found for itself.
+    found: Vec<Live>,
     /// When the declarations were last read, and whether they ever have been.
     read: Option<Option<SystemTime>>,
     /// The names complained about already, so that a declaration nobody can act
@@ -262,6 +277,7 @@ impl Reconciler {
             targets,
             attachments,
             transports,
+            discoveries,
             bus,
             bootstrap,
             attach,
@@ -275,7 +291,11 @@ impl Reconciler {
             bootstrap,
             settings: attach,
             every,
-            live: Vec::new(),
+            // Due at once, so that the first pass is a whole pass rather than
+            // one that has looked at only half of what is reachable.
+            discoveries: discoveries.into_iter().map(Sweeping::new).collect(),
+            wanted: Vec::new(),
+            found: Vec::new(),
             read: None,
             unknown: BTreeSet::new(),
             published: None,
@@ -286,6 +306,7 @@ impl Reconciler {
     /// attachment is doing, and writes it down if any of it is news.
     fn pass(&mut self) {
         self.declared();
+        self.discovered();
         self.observe();
         self.publish();
     }
@@ -312,10 +333,10 @@ impl Reconciler {
     /// Starts what is declared and not attached, stops what is attached and no
     /// longer declared.
     fn reconcile(&mut self, declared: &[Target]) {
-        let (kept, gone): (Vec<Live>, Vec<Live>) = std::mem::take(&mut self.live)
+        let (kept, gone): (Vec<Live>, Vec<Live>) = std::mem::take(&mut self.wanted)
             .into_iter()
             .partition(|live| declared.iter().any(|target| live.is(target)));
-        self.live = kept;
+        self.wanted = kept;
         for live in gone {
             info!(
                 transport = live.transport,
@@ -328,13 +349,130 @@ impl Reconciler {
             drop(live);
         }
         for target in declared {
-            if self.live.iter().any(|live| live.is(target)) {
+            if self.wanted.iter().any(|live| live.is(target)) {
                 continue;
             }
             if let Some(live) = self.begin(target) {
-                self.live.push(live);
+                self.wanted.push(live);
             }
         }
+    }
+
+    /// Asks every transport that is due what it can find, and keeps what is
+    /// attached in step with the answer.
+    fn discovered(&mut self) {
+        // Something that has since been declared is attached because somebody
+        // asked for it. Letting go of the one that was found is done here
+        // rather than left to the next sweep so that the two never overlap.
+        let claimed: Vec<(String, Vec<String>)> = self
+            .wanted
+            .iter()
+            .map(|live| (live.transport.clone(), live.args.clone()))
+            .collect();
+        self.found.retain(|found| {
+            !claimed
+                .iter()
+                .any(|(transport, args)| *transport == found.transport && *args == found.args)
+        });
+
+        for index in 0..self.discoveries.len() {
+            if !self.discoveries[index].due() {
+                continue;
+            }
+            let discovery = Arc::clone(&self.discoveries[index].discovery);
+            let name = discovery.transport();
+            let working = self.working();
+            let declared: Vec<Vec<String>> = self
+                .wanted
+                .iter()
+                .filter(|live| live.transport == name)
+                .map(|live| live.args.clone())
+                .collect();
+            let swept = discovery.sweep(&Context {
+                working: &working,
+                declared: &declared,
+            });
+            // Set from when the answer came back rather than from when the
+            // question was asked, so that a discovery which takes a while to
+            // answer is not asked again the moment it has.
+            self.discoveries[index].again(discovery.every());
+            // Nothing means the question could not be asked, which is not the
+            // same as an answer of nothing and must not be treated like one.
+            if let Some(swept) = swept {
+                self.settle(name, swept);
+            }
+        }
+    }
+
+    /// Makes what is attached through `transport` exactly what it just found.
+    fn settle(&mut self, transport: &str, swept: Vec<Found>) {
+        let (kept, gone): (Vec<Live>, Vec<Live>) = std::mem::take(&mut self.found)
+            .into_iter()
+            .partition(|live| {
+                live.transport != transport || swept.iter().any(|found| found.args == live.args)
+            });
+        self.found = kept;
+        for live in gone {
+            info!(
+                transport,
+                endpoint = live.label,
+                "this is not there any more"
+            );
+            drop(live);
+        }
+        for found in swept {
+            if self
+                .found
+                .iter()
+                .any(|live| live.transport == transport && live.args == found.args)
+            {
+                continue;
+            }
+            let label = found.transport.label();
+            info!(
+                transport,
+                endpoint = label,
+                "attaching to an endpoint that was found here"
+            );
+            let attachment = Attachment::start(
+                found.transport,
+                self.bootstrap.clone(),
+                Arc::clone(&self.bus),
+                self.settings,
+            );
+            self.found.push(Live {
+                transport: transport.to_owned(),
+                args: found.args,
+                label,
+                attachment: Some(attachment),
+                refused: None,
+                state: State::Connecting,
+                attempt: 0,
+                since: clock::now(),
+                auto: true,
+            });
+        }
+    }
+
+    /// Where this daemon's own sessions said they were working, newest first
+    /// and each place once.
+    ///
+    /// Only this daemon's own: a session relayed from somewhere else is working
+    /// in a directory on that machine, and looking for it here would match the
+    /// wrong thing or nothing at all.
+    fn working(&self) -> Vec<String> {
+        let mut seen: Vec<String> = Vec::new();
+        for entry in self.bus.sessions() {
+            if !entry.origin.is_empty() {
+                continue;
+            }
+            if let Some(cwd) = entry.cwd.filter(|cwd| !cwd.is_empty())
+                && !seen.contains(&cwd)
+            {
+                seen.push(cwd);
+            }
+        }
+        seen
     }
 
     /// Starts reaching one endpoint, or says why nothing was started.
@@ -373,6 +511,7 @@ impl Reconciler {
                     state: State::Connecting,
                     attempt: 0,
                     since: now,
+                    auto: false,
                 })
             }
             Err(said) => {
@@ -389,6 +528,7 @@ impl Reconciler {
                     state: State::NeedsAttention,
                     attempt: 0,
                     since: now,
+                    auto: false,
                 })
             }
         }
@@ -406,7 +546,7 @@ impl Reconciler {
     /// Asks every attachment what it is doing, and stamps the ones that have
     /// changed with the moment they changed.
     fn observe(&mut self) {
-        for live in &mut self.live {
+        for live in self.wanted.iter_mut().chain(self.found.iter_mut()) {
             let Some(attachment) = live.attachment.as_ref() else {
                 continue;
             };
@@ -425,7 +565,12 @@ impl Reconciler {
     /// Writes what every attachment is doing, if it is not what was written
     /// last time.
     fn publish(&mut self) {
-        let entries: Vec<Entry> = self.live.iter().map(Live::entry).collect();
+        let entries: Vec<Entry> = self
+            .wanted
+            .iter()
+            .chain(self.found.iter())
+            .map(Live::entry)
+            .collect();
         if self.published.as_ref() == Some(&entries) {
             return;
         }
@@ -440,10 +585,41 @@ impl Reconciler {
 
     /// Detaches everything and takes the file away.
     fn stop(&mut self) {
-        self.live.clear();
+        self.wanted.clear();
+        self.found.clear();
         if let Err(error) = self.attachments.remove() {
             debug!(%error, "cannot remove what is attached");
         }
+    }
+}
+
+/// One discovery, and when it is next to be asked.
+///
+/// The cadence is the discovery's own and is asked for after every sweep rather
+/// than once, so that one which has just found the thing it looks with missing
+/// can slow itself down without anything here knowing why.
+#[derive(Debug)]
+struct Sweeping {
+    discovery: Arc<dyn Discovery>,
+    due: Instant,
+}
+
+impl Sweeping {
+    fn new(discovery: Arc<dyn Discovery>) -> Self {
+        Self {
+            discovery,
+            due: Instant::now(),
+        }
+    }
+
+    /// Whether it is time to ask again.
+    fn due(&self) -> bool {
+        Instant::now() >= self.due
+    }
+
+    /// Not before `how_long` from now.
+    fn again(&mut self, how_long: Duration) {
+        self.due = Instant::now() + how_long;
     }
 }
 

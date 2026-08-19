@@ -118,6 +118,7 @@ async fn a_daemon_told_to_reload_reads_the_declarations_without_waiting_for_its_
     )
     .expect("cannot start the daemon")
     .declaring(targets.clone())
+    .discovering(Vec::new())
     .reaching(Registry::new().with(FAKE, Fake::of));
     let serving = tokio::spawn(daemon.run());
 

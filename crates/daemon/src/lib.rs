@@ -74,6 +74,7 @@ use agentbus_protocol::{DEFAULT_DONE_RETENTION, DEFAULT_STALE_AFTER, Fold, Sessi
 use bus::Published;
 use foreground::Monitor;
 use procfs::ProcFs;
+use remote::discover::Discovery;
 use remote::reconcile::{self, Plan, Reconciling, Wake};
 use remote::{Attachments, Bootstrap, Registry, Targets, attach};
 use subscribe::DEFAULT_HEARTBEAT;
@@ -249,6 +250,7 @@ pub struct Daemon {
     signals: Option<Signals>,
     targets: Targets,
     transports: Registry,
+    discoveries: Vec<Arc<dyn Discovery>>,
 }
 
 impl Daemon {
@@ -317,6 +319,7 @@ impl Daemon {
             settings,
             targets: Targets::resolve(),
             transports: Registry::standard(),
+            discoveries: remote::discover::standard(),
         })
     }
 
@@ -332,6 +335,18 @@ impl Daemon {
     #[must_use]
     pub fn reaching(mut self, transports: Registry) -> Self {
         self.transports = transports;
+        self
+    }
+
+    /// The same daemon, looking for endpoints of its own accord in `discoveries`
+    /// and nowhere else.
+    ///
+    /// An empty list is a daemon that attaches to exactly what has been declared
+    /// and to nothing else, which is what a test wanting no surprises from the
+    /// machine it happens to be running on asks for.
+    #[must_use]
+    pub fn discovering(mut self, discoveries: Vec<Arc<dyn Discovery>>) -> Self {
+        self.discoveries = discoveries;
         self
     }
 
@@ -375,6 +390,7 @@ impl Daemon {
             signals,
             targets,
             transports,
+            discoveries,
         } = self;
         info!(socket = %emit.path().display(), "listening for events");
         info!(socket = %subscribe.path().display(), "publishing the stream");
@@ -384,6 +400,7 @@ impl Daemon {
             targets,
             attachments: Attachments::in_dir(paths.dir()),
             transports,
+            discoveries,
             bus: Arc::clone(&bus),
             bootstrap: Bootstrap::new(VERSION),
             attach: attach::Settings::default(),

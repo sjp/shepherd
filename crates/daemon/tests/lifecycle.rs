@@ -23,7 +23,9 @@ struct Started {
 fn start(settings: Settings) -> Started {
     let dir = tempfile::tempdir().expect("cannot make a temporary directory");
     let daemon = Daemon::bind(SocketPaths::in_dir(dir.path().join("agentbus")), settings)
-        .expect("cannot start the daemon");
+        .expect("cannot start the daemon")
+        // Nothing on the machine this is running on is to be reached into.
+        .discovering(Vec::new());
     Started { daemon, _dir: dir }
 }
 

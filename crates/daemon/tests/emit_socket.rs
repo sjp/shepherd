@@ -33,7 +33,11 @@ fn start() -> Running {
         SocketPaths::in_dir(dir.path().join("agentbus")),
         Settings::default(),
     )
-    .expect("cannot start the daemon");
+    .expect("cannot start the daemon")
+    // Nothing on the machine this is running on is to be reached into: what is
+    // being tested is one socket, and a container found here would be a
+    // surprise from somebody else's laptop.
+    .discovering(Vec::new());
     let bus = Arc::clone(daemon.bus());
     let paths = daemon.paths().clone();
     tokio::spawn(daemon.run());

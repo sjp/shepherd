@@ -198,6 +198,9 @@ impl Bench {
             targets: self.targets.clone(),
             attachments: self.attachments.clone(),
             transports,
+            // Nothing is found here: what these tests are about is the loop
+            // between the declarations and the attachments.
+            discoveries: Vec::new(),
             bus: Arc::clone(&self.bus),
             bootstrap: Bootstrap::new(crate::VERSION),
             attach: attach::Settings {

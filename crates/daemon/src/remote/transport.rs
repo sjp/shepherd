@@ -432,6 +432,19 @@ pub trait Transport: fmt::Debug + Send + Sync {
         true
     }
 
+    /// Told that a copy of this program of `version` is now running at the far
+    /// end.
+    ///
+    /// The hook a transport gets for whatever else has to be true over there
+    /// before an endpoint is fully set up. Nothing is required of it and
+    /// nothing is reported by it: what it does is beyond what the caller asked
+    /// for, so failing at it must not fail the thing that was asked for, and a
+    /// transport that has trouble here says so in the log and carries on.
+    ///
+    /// Called every time a connection is established, so an implementation
+    /// remembers what it has already done rather than doing it again.
+    fn established(&self, _version: &str) {}
+
     /// How long to wait before trying again after this transport breaks.
     ///
     /// Transport-appropriate, not shared: reconnecting to a container on this
@@ -519,10 +532,15 @@ impl Registry {
 
     /// Every way of reaching an endpoint that this build has.
     ///
-    /// There are none yet. A transport is added here as it is written, which is
-    /// the whole of what a daemon has to be told about a new one.
+    /// A transport is added here as it is written, which is the whole of what a
+    /// daemon has to be told about a new one.
     pub fn standard() -> Self {
-        Self::new()
+        Self::new().with(super::docker::NAME, |args| match args {
+            [reference] if !reference.is_empty() => Ok(Arc::new(
+                super::docker::Docker::resolve().container(reference),
+            ) as Arc<dyn Transport>),
+            _ => Err("a container is named by one word: its name or its id".to_owned()),
+        })
     }
 
     /// The same registry, also able to reach an endpoint declared under `name`.

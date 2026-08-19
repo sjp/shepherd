@@ -38,7 +38,9 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use agentbus_daemon::remote::attachments::Attachments;
-use agentbus_daemon::remote::targets::{CONFIG_DIR_VAR, Targets};
+use agentbus_daemon::remote::bootstrap::Bootstrap;
+use agentbus_daemon::remote::docker::Docker;
+use agentbus_daemon::remote::targets::{CONFIG_DIR_VAR, DOCKER, Targets};
 use agentbus_daemon::{Daemon, Settings, SocketPaths, clock, paths::DIR_VAR};
 use agentbus_install::{Agent, Environment, Mode, UnknownAgent};
 use agentbus_protocol::ForegroundEntry;
@@ -76,6 +78,14 @@ const UNAVAILABLE: &str = "foreground monitoring unavailable on this daemon";
 /// all: something whose goal is "a daemon is running here" has got what it
 /// wanted, and can say so by treating this one code as success.
 const ALREADY_RUNNING: u8 = 3;
+
+/// The status a command line that does not make sense exits with, which is the
+/// one the parser itself uses for the same thing.
+const USAGE: u8 = 2;
+
+/// What this program is asked at a far end to find out whether the copy there
+/// is the one that was wanted.
+const VERSION_FLAG: &str = "--version";
 
 /// How each command names itself in what it prints, so that a message read out
 /// of a supervisor's log or a shell's scrollback says which one produced it.
@@ -118,7 +128,7 @@ enum Command {
     Foreground(ForegroundArgs),
     /// Read a payload on stdin, normalize it, and send it to the bus.
     Emit(EmitArgs),
-    /// Put the hooks that emit events into the coding agents on this machine.
+    /// Put the hooks that emit events into the coding agents on this machine, or into a container.
     Install(InstallArgs),
     /// Take those hooks back out again.
     Uninstall(InstallArgs),
@@ -313,9 +323,13 @@ struct EmitArgs {
     source: Option<String>,
 }
 
-/// Which agents to act on, and whether to act at all.
+/// Which agents to act on, and whether to act at all — or, instead, which
+/// endpoint that is not this machine to act on.
 #[derive(Debug, Args)]
 struct InstallArgs {
+    #[command(subcommand)]
+    endpoint: Option<Endpoint>,
+
     /// The agent to act on; repeat to name several [default: every one detected]
     #[arg(long, value_name = "NAME", value_parser = agent)]
     agent: Vec<Agent>,
@@ -323,6 +337,25 @@ struct InstallArgs {
     /// Say what would change, and change nothing
     #[arg(long)]
     dry_run: bool,
+}
+
+/// Somewhere other than this machine to put this program, or take it back from.
+#[derive(Debug, Subcommand)]
+enum Endpoint {
+    /// A container on this machine: put a copy of this program in it, wire up
+    /// whichever agents are in there, and keep it attached
+    Docker(ContainerArgs),
+}
+
+/// Which container, and where the declaration about it is kept.
+#[derive(Debug, Args)]
+struct ContainerArgs {
+    /// The container: its name, or as much of its id as is unambiguous
+    #[arg(value_name = "CONTAINER")]
+    container: String,
+
+    #[command(flatten)]
+    config: Config,
 }
 
 impl InstallArgs {
@@ -393,8 +426,8 @@ where
             Command::Status(args) => status(&args),
             Command::Foreground(args) => foreground(&args),
             Command::Emit(args) => emit(&args, started),
-            Command::Install(args) => hooks(&args, install::Direction::Install),
-            Command::Uninstall(args) => hooks(&args, install::Direction::Uninstall),
+            Command::Install(args) => elsewhere(&args, install::Direction::Install),
+            Command::Uninstall(args) => elsewhere(&args, install::Direction::Uninstall),
             Command::Attach(args) => attach(&args),
             Command::Detach(args) => detach(&args),
             Command::Targets(args) => targets(&args),
@@ -696,6 +729,100 @@ fn hooks(args: &InstallArgs, direction: install::Direction) -> ExitCode {
     match std::io::stdout().write_all(report.as_bytes()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => fail(context, &error),
+    }
+}
+
+/// Acts on this machine, or on the endpoint the command line named instead.
+///
+/// The two flags choose which of *this* machine's agents to act on and whether
+/// to act at all, and neither means anything about a container: what gets
+/// installed in there is whatever turns out to be in there, and there is no
+/// halfway version of putting a binary on a machine. So a command line carrying
+/// both is refused rather than quietly doing half of what it says.
+fn elsewhere(args: &InstallArgs, direction: install::Direction) -> ExitCode {
+    let Some(endpoint) = &args.endpoint else {
+        return hooks(args, direction);
+    };
+    let context = direction.context();
+    if !args.agent.is_empty() || args.dry_run {
+        eprintln!(
+            "{context}: --agent and --dry-run are about the agents on this \
+             machine, and say nothing about an endpoint that is not it"
+        );
+        return ExitCode::from(USAGE);
+    }
+    match (endpoint, direction) {
+        (Endpoint::Docker(container), install::Direction::Install) => provision(container),
+        (Endpoint::Docker(container), install::Direction::Uninstall) => strip(container),
+    }
+}
+
+/// Puts a copy of this program into a container, wires up the agents in there,
+/// and declares the container so that it stays attached.
+///
+/// Only the last of those three is this process's own doing. Establishing the
+/// binary is the same provisioning a daemon does when it attaches, asked for by
+/// hand here; wiring up the agents inside is what a container is told when that
+/// has worked. Which means this command is worth having for exactly one reason:
+/// a container that carries no devcontainer label is one nothing would ever
+/// find, and this is how somebody says they want it anyway.
+fn provision(args: &ContainerArgs) -> ExitCode {
+    let container = Docker::resolve().container(&args.container);
+    let mut running =
+        match Bootstrap::new(agentbus_daemon::VERSION).run(&container, &[VERSION_FLAG]) {
+            Ok(running) => running,
+            Err(error) => return fail(INSTALL, &error),
+        };
+    let mut answered = String::new();
+    if let Err(error) = running.stdout().read_line(&mut answered) {
+        return fail(INSTALL, &error);
+    }
+    match running.wait() {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            eprintln!(
+                "{INSTALL}: the copy in {} would not say what it is: {status}",
+                args.container
+            );
+            return ExitCode::FAILURE;
+        }
+        Err(error) => return fail(INSTALL, &error),
+    }
+
+    let words = vec![args.container.clone()];
+    let there = format!("{} in {}", answered.trim(), args.container);
+    match args.config.targets().declare(DOCKER, &words, &clock::now()) {
+        Ok(true) => said(
+            INSTALL,
+            &format!("{there}\ndeclared: docker {}", args.container),
+        ),
+        Ok(false) => said(INSTALL, &format!("{there}\nalready declared")),
+        Err(error) => fail(INSTALL, &error),
+    }
+}
+
+/// Takes this program back out of a container and stops wanting it attached.
+///
+/// The container is left running and everything else in it is left alone: what
+/// is removed is the hooks this program wrote and every copy of it that was put
+/// there, which between them are the whole of what it left behind.
+///
+/// This takes back a declaration; it does not make a container invisible. One
+/// that carries a devcontainer label is found by looking, and a daemon that is
+/// running will attach to it again and put the hooks back — which is what being
+/// found automatically means. This command is how a container that would never
+/// have been found is let go of.
+fn strip(args: &ContainerArgs) -> ExitCode {
+    let container = Docker::resolve().container(&args.container);
+    if let Err(error) = container.uninstall(agentbus_daemon::VERSION) {
+        return fail(UNINSTALL, &error);
+    }
+    let words = vec![args.container.clone()];
+    let there = format!("taken out of {}", args.container);
+    match args.config.targets().undeclare(DOCKER, &words) {
+        Ok(true) => said(UNINSTALL, &format!("{there}\nno longer declared")),
+        Ok(false) => said(UNINSTALL, &there),
+        Err(error) => fail(UNINSTALL, &error),
     }
 }
 

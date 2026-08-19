@@ -39,10 +39,21 @@
 //! each ([`Attachments`]). [`Reconciling`] is the loop that does the keeping in
 //! step, and [`Registry`] is how a name in a declaration becomes a way of
 //! reaching something.
+//!
+//! # Endpoints nobody had to name
+//!
+//! Where something on this machine already keeps an authoritative list of what
+//! is running — Docker does — being told is unnecessary and being wrong is
+//! avoidable, so the transport reads the list instead ([`Discovery`]). An
+//! endpoint found that way is attached and reported exactly like a declared
+//! one; the difference is only that nothing has to be written down for it to
+//! happen and nothing has to be taken back for it to stop.
 
 pub mod attach;
 pub mod attachments;
 pub mod bootstrap;
+pub mod discover;
+pub mod docker;
 pub mod reconcile;
 pub mod release;
 pub mod store;
@@ -59,6 +70,7 @@ mod tests;
 pub use attach::Attachment;
 pub use attachments::Attachments;
 pub use bootstrap::{Bootstrap, SCRIPT, TARGET};
+pub use discover::{Discovery, Found};
 pub use reconcile::{Plan, Reconciling};
 pub use release::Release;
 pub use targets::{Target, Targets};

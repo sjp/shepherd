@@ -40,6 +40,7 @@ pub const PATIENCE: Duration = Duration::from_secs(10);
 const INHERITED: &[&str] = &[
     "AGENTBUS_CONFIG_DIR",
     "AGENTBUS_DIR",
+    "AGENTBUS_DOCKER_BIN",
     "AGENTBUS_LOG",
     "AGENTBUS_PANE",
     "AGENTBUS_PROC_ROOT",
@@ -61,6 +62,11 @@ fn command(dir: &Path, args: &[&str]) -> Command {
     for variable in INHERITED {
         command.env_remove(variable);
     }
+    // Whatever containers are on the machine running these tests are somebody
+    // else's, and a daemon that went looking for them would push a binary into
+    // them. Naming a command that is not there is how a bus is told there is no
+    // Docker here, and it is the only honest way to say so from a test.
+    command.env("AGENTBUS_DOCKER_BIN", "no-docker-while-testing");
     command
 }
 

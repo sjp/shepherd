@@ -846,3 +846,81 @@ and the temporary one has to be made in the target's own directory — the same
 rule, and the same reasoning, as the installer's. **`agentbus-cli` takes `serde`
 directly** for the `Serialize` on the merged structure `agentbus targets --json`
 prints, which is a shape this crate owns rather than one the protocol defines.
+
+## 2026-08-19 — reaching a container
+
+### Containers are found rather than declared, through a trait of their own
+
+**`Discovery` sits beside `Transport`: a transport that has an authoritative
+list of its own endpoints reads it, and the reconciler drives that on the
+transport's own cadence.** Docker keeps such a list and ssh does not, and that
+asymmetry is a fact about the two rather than an inconsistency to be tidied
+away. Making it a trait rather than a branch in the reconciler keeps the loop
+between the two files free of any knowledge of Docker, and keeps one writer of
+`attachments.json`, which is what makes something found appear in `agentbus
+targets` beside something declared without a second mechanism.
+
+A discovery is told the working directories this daemon's own sessions reported
+and the declarations already made, and may use the first only to order and name
+what its list already said. A bus that found fewer containers the less its
+subscribers happened to say would be one whose aggregation depended on who was
+watching, and the whole arrangement exists to avoid exactly that.
+
+### Every running labelled container is attached, and a declaration wins over a find
+
+**Being up and carrying `devcontainer.local_folder` is the whole test.** A
+Compose project builds several containers from one directory and each is a
+machine of its own, so there is no sense in which one of them is the project's
+container; walking up from a working directory to find a devcontainer
+definition settles which project a container belongs to, and that decides the
+*order* they are reached in and nothing else. Where a declaration and a find
+name one container the declaration wins, because somebody asked for that one and
+nobody asked for the other — which is also what makes `agentbus install docker`
+worth having for a container that carries no label at all.
+
+### A container is addressed by whatever it was called and identified by its id
+
+**Commands go to the word somebody used — a name, or as much of an id as they
+copied — and what gets written down as the far end's identity is the full id,
+asked for with `docker inspect` once and remembered.** Docker resolves both, so
+sending to the word that was used is what was asked for; a name is the wrong
+thing to deduplicate two views of one container by, because Docker will give the
+same name to a different container tomorrow. The question is asked when the
+first command is sent rather than whenever somebody wants the answer, so that a
+container which is not there does not cost a process every time a loop comes
+round.
+
+### The transport is told when a copy is running at the far end
+
+**`Transport::established` is called with the version whenever the provisioner
+has a copy of this program running over there.** Some far ends need more than a
+binary to be worth having: a container needs the agents inside it wired up to
+the daemon that has just been started in it, or an agent started in there is
+invisible to somebody who may not know the container exists. Nothing is required
+of the hook and nothing is reported by it — what it does is beyond what the
+caller asked for, so failing at it must not fail the attachment.
+
+Writing hooks into a container without asking is deliberate and does not
+generalise. The file it lands in was made by an image and goes away with it,
+which is the opposite of the position on somebody's own machine.
+
+### Docker is a command line, not a library
+
+**The daemon runs `docker` and reads what it prints.** API version negotiation,
+the socket's location, credentials and the rootless variants are then somebody
+else's problem for as long as the command line stays the one everybody
+implements — including the things that answer to it without being Docker, which
+`AGENTBUS_DOCKER_BIN` is there for. The listing is asked for tab-separated
+rather than as JSON because Docker flattens labels into one comma-joined string,
+and the label being read holds a filesystem path: a path with a comma in it is
+ordinary, and a path with a tab in it is not.
+
+### Provisioning an endpoint is a subcommand of `install`, and the local flags are refused with it
+
+**`agentbus install docker <container>` acts on a container; `agentbus install`
+with no endpoint acts on this machine.** `--agent` and `--dry-run` choose which
+of *this* machine's agents to act on and whether to act at all, and neither means
+anything about a container — what goes in is whatever turns out to be in there,
+and there is no halfway version of putting a binary on a machine. A command line
+carrying both is refused with the parser's own usage status rather than quietly
+doing half of what it says.

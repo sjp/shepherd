@@ -14,6 +14,15 @@
 //! of them is ever executed. It is also what makes provisioning idempotent — a
 //! far end that is already current costs one round trip and no writes at all.
 //!
+//! # Telling the transport it worked
+//!
+//! Whichever way it went, the transport is told the version that is now running
+//! over there ([`Transport::established`]) before the handle is returned. Some
+//! far ends need more than a binary to be worth having — a container needs the
+//! agents inside it wired up to the daemon that has just been started there —
+//! and this is the moment that is known to be true, whether it was true already
+//! or has just been made true.
+//!
 //! # What is never written over
 //!
 //! Only [`Transport::install_path`], ever. Somebody who installed `agentbus`
@@ -199,7 +208,10 @@ impl Bootstrap {
     pub fn run(&self, transport: &dyn Transport, command: &[&str]) -> Result<Running, Error> {
         let label = transport.label();
         let platform = match self.attempt(transport, command)? {
-            Attempt::Started(running) => return Ok(running),
+            Attempt::Started(running) => {
+                transport.established(&self.version);
+                return Ok(running);
+            }
             Attempt::Needs(platform) => platform,
         };
 
@@ -235,7 +247,10 @@ impl Bootstrap {
         self.make_executable(transport, &remote)?;
 
         match self.attempt(transport, command)? {
-            Attempt::Started(running) => Ok(running),
+            Attempt::Started(running) => {
+                transport.established(&self.version);
+                Ok(running)
+            }
             // One retry and no more. A copy that was written and still does not
             // answer to its own version is not going to answer to it on the
             // third ask, and looping here would mean rewriting the same file at
