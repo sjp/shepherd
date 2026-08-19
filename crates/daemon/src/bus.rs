@@ -1,5 +1,6 @@
 //! The state every part of the daemon shares: the sequence counter, the session
-//! table, the recent-event buffer and the publisher.
+//! table, the foreground observations, the recent-event buffer and the
+//! publisher.
 //!
 //! Ingest is where an emitter's line stops being a string and becomes an event
 //! this daemon vouches for. Three of the envelope's fields are the daemon's to
@@ -17,16 +18,26 @@
 //! connects and stalls holds up nothing but itself, and publishing under it
 //! costs nothing that could block: a full subscriber is dropped rather than
 //! waited for.
+//!
+//! What the process table says goes through the same door for the same reason.
+//! An observation is numbered from the same counter as an event and published
+//! from under the same lock, so the stream a subscriber reads has one order in
+//! it rather than two that have to be reconciled.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Mutex, PoisonError};
 
-use agentbus_protocol::{Event, SessionEntry, SessionTable, Snapshot, Timestamp, UnstampedEvent};
+use agentbus_protocol::{
+    Event, ForegroundChange, ForegroundEntry, SessionEntry, SessionTable, Snapshot, Timestamp,
+    UnstampedEvent,
+};
 use serde_json::Value;
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
 use crate::clock;
+use crate::foreground::Transition;
+use crate::procfs::Pid;
 
 /// How many recent events the daemon keeps.
 ///
@@ -35,11 +46,34 @@ use crate::clock;
 /// deliberately not persisted anywhere.
 pub const RECENT_EVENTS: usize = 1024;
 
+/// One line the bus publishes to everything watching it.
+///
+/// Both kinds travel on one channel because they are numbered from one counter
+/// and a subscriber is promised that counter's order. Two channels would be free
+/// to deliver 42 after 43.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Published {
+    /// An event that was ingested.
+    Event(Event),
+    /// A change in what is running in front of a correlated shell.
+    Foreground(ForegroundChange),
+}
+
+impl Published {
+    /// The sequence number this line was stamped with.
+    pub fn seq(&self) -> u64 {
+        match self {
+            Self::Event(event) => event.seq,
+            Self::Foreground(change) => change.seq,
+        }
+    }
+}
+
 /// Everything the daemon knows, and the one place events enter it.
 #[derive(Debug)]
 pub struct Bus {
     state: Mutex<State>,
-    events: broadcast::Sender<Event>,
+    events: broadcast::Sender<Published>,
 }
 
 /// The parts of the bus that only ever move together.
@@ -48,6 +82,13 @@ struct State {
     table: SessionTable,
     seq: u64,
     recent: VecDeque<Event>,
+    /// What is in the foreground of each correlated shell, keyed by the
+    /// correlation and the shell it was seen through, or `None` where nothing
+    /// is watching the process table at all.
+    ///
+    /// Two shells may carry one correlation, and they are two answers to one
+    /// question rather than one answer twice, so the shell is part of the key.
+    foreground: Option<BTreeMap<(String, Pid), ForegroundEntry>>,
 }
 
 impl Default for Bus {
@@ -70,9 +111,27 @@ impl Bus {
                 table,
                 seq: 0,
                 recent: VecDeque::with_capacity(RECENT_EVENTS),
+                foreground: None,
             }),
             events,
         }
+    }
+
+    /// The same bus, reporting foreground observations.
+    ///
+    /// Whether anything is watching the process table is settled before the bus
+    /// serves anything, because "nobody is looking" and "nobody is running
+    /// anything" are different facts and a snapshot has to be able to say which
+    /// one it means. A bus that is not watching says nothing whatever about the
+    /// foreground; one that is says so from its first snapshot, when the answer
+    /// is still an empty list.
+    #[must_use]
+    pub fn observing(mut self) -> Self {
+        self.state
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .foreground = Some(BTreeMap::new());
+        self
     }
 
     /// Turns one received line into a stamped event, folds it into its session,
@@ -116,7 +175,7 @@ impl Bus {
             // publisher in the opposite order to the one they were numbered in.
             // Nobody may be listening, and that is not a failure: the bus exists
             // whether or not anything is watching it.
-            let _ = self.events.send(event.clone());
+            let _ = self.events.send(Published::Event(event.clone()));
             event
         };
         Some(event)
@@ -128,8 +187,58 @@ impl Bus {
         self.lock().table.tick(now);
     }
 
-    /// A receiver of every event ingested from now on.
-    pub fn events(&self) -> broadcast::Receiver<Event> {
+    /// Records what a foreground monitor saw, publishes a line for each change,
+    /// and hands back the pids it reported as having ended.
+    ///
+    /// A transition is by construction news — the monitor produces one only when
+    /// something differs from what it last reported — so every one of them is
+    /// numbered and published. That is also why the numbering happens here,
+    /// under the lock ingest stamps events under: a subscriber reads one stream
+    /// and is owed one order for it.
+    ///
+    /// The table a snapshot is built from is maintained *from the transitions*
+    /// rather than copied from whatever produced them, which is what makes the
+    /// two halves of a subscription agree: a subscriber that applies the lines
+    /// it reads to the snapshot it started with arrives at exactly this table.
+    ///
+    /// The pids that ended are returned rather than acted on. What the end of a
+    /// process means for a session that was running under it is the fold's
+    /// business, and this is the only place that hears about it.
+    pub fn observed(&self, transitions: &[Transition], now: &Timestamp) -> Vec<Pid> {
+        let gone: Vec<Pid> = transitions
+            .iter()
+            .filter_map(|change| change.gone)
+            .collect();
+        let mut state = self.lock();
+        let State {
+            seq, foreground, ..
+        } = &mut *state;
+        // Nothing is watching, so there is nothing to report and nothing that
+        // could have produced a transition in the first place.
+        let Some(table) = foreground.as_mut() else {
+            return gone;
+        };
+
+        for transition in transitions {
+            *seq += 1;
+            let key = (transition.correlation.clone(), transition.shell);
+            let line = match &transition.foreground {
+                Some(entry) => {
+                    table.insert(key, entry.clone());
+                    ForegroundChange::observed(*seq, now.clone(), entry.clone())
+                }
+                None => {
+                    table.remove(&key);
+                    ForegroundChange::withdrawn(*seq, now.clone(), &transition.correlation)
+                }
+            };
+            let _ = self.events.send(Published::Foreground(line));
+        }
+        gone
+    }
+
+    /// A receiver of every line published from now on.
+    pub fn events(&self) -> broadcast::Receiver<Published> {
         self.events.subscribe()
     }
 
@@ -142,13 +251,18 @@ impl Bus {
     /// ignores what the snapshot already covers is therefore reading a
     /// continuation of it, and stays right whatever the bus does with its own
     /// ordering later.
-    pub fn subscribe(&self) -> (Snapshot, broadcast::Receiver<Event>) {
+    pub fn subscribe(&self) -> (Snapshot, broadcast::Receiver<Published>) {
         let state = self.lock();
-        (state.table.snapshot(state.seq), self.events.subscribe())
+        let snapshot = state.table.snapshot(state.seq);
+        let snapshot = match &state.foreground {
+            Some(table) => snapshot.with_foreground(table.values().cloned().collect()),
+            None => snapshot,
+        };
+        (snapshot, self.events.subscribe())
     }
 
-    /// The sequence number of the most recently ingested event; zero before the
-    /// first one.
+    /// The sequence number the most recently published line was stamped with;
+    /// zero before there has been one.
     pub fn last_seq(&self) -> u64 {
         self.lock().seq
     }
@@ -156,6 +270,15 @@ impl Bus {
     /// The sessions worth reporting, in the order a snapshot lists them.
     pub fn sessions(&self) -> Vec<SessionEntry> {
         self.lock().table.snapshot_sessions()
+    }
+
+    /// The foreground observations a snapshot would carry, or nothing where the
+    /// bus is not watching the process table.
+    pub fn foreground(&self) -> Option<Vec<ForegroundEntry>> {
+        self.lock()
+            .foreground
+            .as_ref()
+            .map(|table| table.values().cloned().collect())
     }
 
     /// The events still in the recent buffer, oldest first.
@@ -194,8 +317,44 @@ fn parse(line: &[u8]) -> Result<(UnstampedEvent, Option<Timestamp>), serde_json:
 mod tests {
     use super::*;
 
-    use agentbus_protocol::{Agent, Kind, OriginHop, SessionStatus, Source};
+    use agentbus_protocol::{Agent, ForegroundState, Kind, OriginHop, SessionStatus, Source};
     use serde_json::json;
+
+    /// A bus that is watching a process table, as one with a monitor behind it
+    /// is.
+    fn watching() -> Bus {
+        Bus::new().observing()
+    }
+
+    fn at(text: &str) -> Timestamp {
+        Timestamp::parse(text).expect("not a timestamp")
+    }
+
+    fn now() -> Timestamp {
+        at("2026-08-17T10:32:01.412Z")
+    }
+
+    /// What a monitor produces when it first sees something in front of a shell.
+    fn appeared(correlation: &str, shell: Pid, pid: u32, process: &str) -> Transition {
+        let mut entry = ForegroundEntry::new(correlation, pid, process, process, now());
+        entry.state = Some(ForegroundState::Foreground);
+        Transition {
+            correlation: correlation.to_owned(),
+            shell,
+            foreground: Some(entry),
+            gone: None,
+        }
+    }
+
+    /// What it produces when there is no longer anything to report there.
+    fn withdrawn(correlation: &str, shell: Pid, gone: Option<Pid>) -> Transition {
+        Transition {
+            correlation: correlation.to_owned(),
+            shell,
+            foreground: None,
+            gone,
+        }
+    }
 
     fn line(value: &Value) -> Vec<u8> {
         serde_json::to_vec(value).unwrap()
@@ -329,7 +488,7 @@ mod tests {
 
         let ingested = bus.ingest(&line(&tool_start())).unwrap();
 
-        assert_eq!(events.try_recv().unwrap(), ingested);
+        assert_eq!(events.try_recv().unwrap(), Published::Event(ingested));
     }
 
     #[test]
@@ -352,6 +511,123 @@ mod tests {
         assert_eq!(recent.len(), RECENT_EVENTS);
         assert_eq!(recent.first().unwrap().seq, 11);
         assert_eq!(recent.last().unwrap().seq, (RECENT_EVENTS + 10) as u64);
+    }
+
+    #[test]
+    fn an_observation_is_recorded_numbered_and_published() {
+        let bus = watching();
+        let mut published = bus.events();
+
+        bus.observed(&[appeared("w9:p3", 100, 4471, "claude")], &now());
+
+        let observations = bus.foreground().expect("this bus is watching");
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].correlation, "w9:p3");
+        assert_eq!(observations[0].pid, 4471);
+        assert_eq!(bus.last_seq(), 1);
+        let Published::Foreground(line) = published.try_recv().unwrap() else {
+            panic!("an observation was published as something else");
+        };
+        assert_eq!(line.seq, 1);
+        assert_eq!(line.ts, now());
+        assert_eq!(line.foreground.unwrap().process, "claude");
+    }
+
+    #[test]
+    fn observations_and_events_are_numbered_from_the_one_counter() {
+        let bus = watching();
+
+        bus.ingest(&line(&tool_start()));
+        bus.observed(&[appeared("w9:p3", 100, 4471, "claude")], &now());
+        let last = bus.ingest(&line(&tool_start())).unwrap();
+
+        assert_eq!(last.seq, 3);
+        assert_eq!(bus.last_seq(), 3);
+    }
+
+    #[test]
+    fn a_withdrawal_takes_the_observation_away_and_says_which_correlation() {
+        let bus = watching();
+        bus.observed(&[appeared("w9:p3", 100, 4471, "claude")], &now());
+        let mut published = bus.events();
+
+        bus.observed(&[withdrawn("w9:p3", 100, Some(4471))], &now());
+
+        assert_eq!(bus.foreground(), Some(Vec::new()));
+        let Published::Foreground(line) = published.try_recv().unwrap() else {
+            panic!("a withdrawal was published as something else");
+        };
+        assert_eq!(line.foreground, None);
+        assert_eq!(line.correlation.as_deref(), Some("w9:p3"));
+    }
+
+    #[test]
+    fn a_process_that_ended_is_handed_back_to_the_caller() {
+        let bus = watching();
+
+        let gone = bus.observed(
+            &[
+                withdrawn("w9:p3", 100, Some(4471)),
+                withdrawn("w9:p4", 101, None),
+            ],
+            &now(),
+        );
+
+        assert_eq!(gone, vec![4471]);
+    }
+
+    #[test]
+    fn two_shells_carrying_one_correlation_are_two_observations() {
+        let bus = watching();
+
+        bus.observed(
+            &[
+                appeared("w9:p3", 100, 4471, "claude"),
+                appeared("w9:p3", 200, 5512, "vim"),
+            ],
+            &now(),
+        );
+
+        let observations = bus.foreground().expect("this bus is watching");
+        assert_eq!(observations.len(), 2);
+        // One of them going away leaves the other where it was.
+        bus.observed(&[withdrawn("w9:p3", 100, None)], &now());
+        let observations = bus.foreground().expect("this bus is watching");
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].pid, 5512);
+    }
+
+    #[test]
+    fn a_bus_that_is_not_watching_says_nothing_about_the_foreground() {
+        let bus = Bus::new();
+        let mut published = bus.events();
+
+        let gone = bus.observed(&[withdrawn("w9:p3", 100, Some(4471))], &now());
+
+        assert_eq!(
+            gone,
+            vec![4471],
+            "what ended is news to the caller either way"
+        );
+        assert_eq!(bus.foreground(), None);
+        assert_eq!(bus.last_seq(), 0, "a line nobody was sent was numbered");
+        assert!(published.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_snapshot_reports_the_foreground_only_from_a_bus_that_is_watching() {
+        let watching = watching();
+        watching.observed(&[appeared("w9:p3", 100, 4471, "claude")], &now());
+
+        let (snapshot, _) = watching.subscribe();
+        assert_eq!(snapshot.foreground.as_deref().map(<[_]>::len), Some(1));
+        assert_eq!(snapshot.seq, 1);
+
+        let (snapshot, _) = Bus::new().subscribe();
+        assert_eq!(snapshot.foreground, None);
+
+        let (snapshot, _) = Bus::new().observing().subscribe();
+        assert_eq!(snapshot.foreground, Some(Vec::new()));
     }
 
     #[test]

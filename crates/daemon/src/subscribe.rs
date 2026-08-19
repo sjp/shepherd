@@ -1,8 +1,9 @@
 //! The socket subscribers read the stream from.
 //!
 //! The exchange has no request in it. A client connects and reads; the daemon
-//! writes a snapshot, then every event as it is ingested, then a heartbeat
-//! whenever the stream would otherwise be silent for too long. Nothing a client
+//! writes a snapshot, then every event as it is ingested and every change in
+//! what is running in front of a correlated shell, then a heartbeat whenever
+//! the stream would otherwise be silent for too long. Nothing a client
 //! writes is ever read as a message — it is drained and discarded — because a
 //! socket with no request protocol on it cannot be wedged by a client that
 //! misunderstands one.
@@ -38,7 +39,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentbus_protocol::{Event, Heartbeat};
+use agentbus_protocol::Heartbeat;
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -46,7 +47,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
 
-use crate::bus::Bus;
+use crate::bus::{Bus, Published};
 use crate::paths::SOCKET_MODE;
 use crate::{ACCEPT_RETRY_DELAY, clock};
 
@@ -163,14 +164,16 @@ enum Ended {
 /// Queues every line this subscriber should see, until it cannot keep up or has
 /// gone away.
 ///
-/// Events already reflected in the snapshot are not queued again. An event is
-/// published to subscribers a moment after it enters the session table, so a
-/// subscription that begins in that moment sees the event in its snapshot *and*
-/// on the stream; comparing against the snapshot's sequence number is what makes
-/// the stream a continuation of the snapshot rather than an overlap with it.
+/// What the snapshot already reflects is not queued again. A line is published
+/// to subscribers a moment after it enters the state the snapshot is built
+/// from, so a subscription that begins in that moment sees it in its snapshot
+/// *and* on the stream; comparing against the snapshot's sequence number is
+/// what makes the stream a continuation of the snapshot rather than an overlap
+/// with it, and it works for an observation exactly as it works for an event
+/// because both are numbered from the one counter.
 async fn feed(
     bus: Arc<Bus>,
-    mut events: tokio::sync::broadcast::Receiver<Event>,
+    mut events: tokio::sync::broadcast::Receiver<Published>,
     snapshot_seq: u64,
     queue: &mpsc::Sender<String>,
     heartbeat: Duration,
@@ -182,9 +185,10 @@ async fn feed(
     let mut beat = tokio::time::interval_at(tokio::time::Instant::now() + heartbeat, heartbeat);
     loop {
         let line = tokio::select! {
-            event = events.recv() => match event {
-                Ok(event) if event.seq <= snapshot_seq => continue,
-                Ok(event) => line(&event),
+            published = events.recv() => match published {
+                Ok(published) if published.seq() <= snapshot_seq => continue,
+                Ok(Published::Event(event)) => line(&event),
+                Ok(Published::Foreground(change)) => line(&change),
                 // Lagging means lines were published faster than this
                 // subscriber's own queue could be filled, which is the same
                 // failure as an overflow and is treated the same way.

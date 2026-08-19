@@ -23,9 +23,11 @@
 
 pub mod adapters;
 pub mod emit;
+pub mod foreground;
 pub mod install;
 pub mod status;
 pub mod stream;
+pub mod table;
 
 use std::ffi::OsString;
 use std::io::{IsTerminal, Write};
@@ -35,6 +37,7 @@ use std::time::{Duration, Instant};
 
 use agentbus_daemon::{Daemon, Settings, SocketPaths, clock, paths::DIR_VAR};
 use agentbus_install::{Agent, Environment, Mode, UnknownAgent};
+use agentbus_protocol::ForegroundEntry;
 use clap::{Args, Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -49,6 +52,20 @@ const STALE_SECS_VAR: &str = "AGENTBUS_STALE_SECS";
 /// The environment variable behind `--done-retention-secs`.
 const DONE_RETENTION_SECS_VAR: &str = "AGENTBUS_DONE_RETENTION_SECS";
 
+/// The environment variable behind `--proc-root`.
+const PROC_ROOT_VAR: &str = "AGENTBUS_PROC_ROOT";
+
+/// The status `foreground` exits with when there is nothing to report from: no
+/// daemon to ask, or one that is not watching a process table.
+///
+/// Distinct from the general failure code because this command already uses
+/// that one to mean something narrower — a filter that matched nothing — and a
+/// caller has to be able to tell "no such correlation" from "nobody is looking".
+const NOT_WATCHING: u8 = 2;
+
+/// What is said on stderr when a daemon cannot see a process table.
+const UNAVAILABLE: &str = "foreground monitoring unavailable on this daemon";
+
 /// The status a second daemon exits with when one is already running.
 ///
 /// Distinct from the general failure code because it is often not a failure at
@@ -62,6 +79,7 @@ const DAEMON: &str = "agentbus daemon";
 const EMIT: &str = "agentbus emit";
 const SUBSCRIBE: &str = "agentbus subscribe";
 const STATUS: &str = "agentbus status";
+const FOREGROUND: &str = "agentbus foreground";
 const INSTALL: &str = "agentbus install";
 const UNINSTALL: &str = "agentbus uninstall";
 
@@ -89,6 +107,8 @@ enum Command {
     Subscribe(SubscribeArgs),
     /// Print what every agent session is doing, once.
     Status(StatusArgs),
+    /// Print what is running in front of each correlated shell, once.
+    Foreground(ForegroundArgs),
     /// Read a payload on stdin, normalize it, and send it to the bus.
     Emit(EmitArgs),
     /// Put the hooks that emit events into the coding agents on this machine.
@@ -156,14 +176,28 @@ struct DaemonArgs {
         value_parser = filter,
     )]
     log_level: String,
+
+    /// Where the process table is read from. For tests: a machine has exactly
+    /// one and it is the default. Hidden from the usage text for that reason,
+    /// and left as a flag rather than a constant so that a test can put a
+    /// daemon in front of a process table it wrote itself and hold it still.
+    #[arg(
+        long,
+        value_name = "PATH",
+        env = PROC_ROOT_VAR,
+        hide = true,
+        default_value_os_t = Settings::default().proc_root,
+    )]
+    proc_root: PathBuf,
 }
 
 impl DaemonArgs {
-    /// The timings to start the bus with.
+    /// What to start the bus with.
     fn settings(&self) -> Settings {
         Settings {
             stale_after: Duration::from_secs(self.stale_secs),
             done_retention: Duration::from_secs(self.done_retention_secs),
+            proc_root: self.proc_root.clone(),
             ..Settings::default()
         }
     }
@@ -194,6 +228,21 @@ struct StatusArgs {
         default_missing_value = DEFAULT_TAIL_SECS,
     )]
     recent: Option<u64>,
+}
+
+/// What to report about the foreground, and how.
+#[derive(Debug, Args)]
+struct ForegroundArgs {
+    #[command(flatten)]
+    location: Location,
+
+    /// Print only what is running in this correlation, compared exactly
+    #[arg(long, value_name = "CORRELATION")]
+    correlation: Option<String>,
+
+    /// Print the observations as newline-delimited JSON instead of as a table
+    #[arg(long)]
+    json: bool,
 }
 
 /// What to send, and what it is.
@@ -259,6 +308,7 @@ where
             Command::Daemon(args) => daemon(&args),
             Command::Subscribe(args) => subscribe(&args),
             Command::Status(args) => status(&args),
+            Command::Foreground(args) => foreground(&args),
             Command::Emit(args) => emit(&args, started),
             Command::Install(args) => hooks(&args, install::Direction::Install),
             Command::Uninstall(args) => hooks(&args, install::Direction::Uninstall),
@@ -410,6 +460,59 @@ fn status(args: &StatusArgs) -> ExitCode {
     }
 }
 
+/// Prints what the process table says is in front of each correlated shell.
+///
+/// The snapshot carries the answer, so this is the same one connection and one
+/// line that `status` is, and the same reason: somebody asking what is running
+/// in a terminal should get an answer rather than a stream.
+///
+/// The three exit codes are three different answers, and the middle one is why
+/// they cannot collapse. Nothing matched the filter is *news* — the correlation
+/// is real and nothing is running in it — and a script has to be able to tell it
+/// from the daemon not being there or not being able to look, which is why
+/// every way of failing to get an answer at all shares the other code.
+fn foreground(args: &ForegroundArgs) -> ExitCode {
+    let snapshot = match stream::connect(&args.location.paths())
+        .and_then(|mut stream| stream.snapshot().map(|(_, snapshot)| snapshot))
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            report(FOREGROUND, &error);
+            return ExitCode::from(NOT_WATCHING);
+        }
+    };
+    let Some(entries) = snapshot.foreground else {
+        eprintln!("{FOREGROUND}: {UNAVAILABLE}");
+        return ExitCode::from(NOT_WATCHING);
+    };
+
+    let wanted: Vec<&ForegroundEntry> = entries
+        .iter()
+        .filter(|entry| {
+            args.correlation
+                .as_ref()
+                .is_none_or(|correlation| &entry.correlation == correlation)
+        })
+        .collect();
+    if wanted.is_empty() && args.correlation.is_some() {
+        return ExitCode::FAILURE;
+    }
+
+    let text = match args.json {
+        true => foreground::json(&wanted),
+        false => foreground::render(&wanted, &clock::now()),
+    };
+    let mut out = std::io::stdout().lock();
+    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        Ok(()) => ExitCode::SUCCESS,
+        // Whoever was reading this has finished — `| head`, a pipeline that
+        // ended — which is how a pipe is supposed to end rather than something
+        // to complain about.
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(error) => fail(FOREGROUND, &error),
+    }
+}
+
 /// Prints what arrives on the stream for a while, then stops.
 fn tail(stream: &mut stream::Stream, of: Duration, out: &mut impl Write) -> ExitCode {
     let deadline = Instant::now() + of;
@@ -503,13 +606,19 @@ fn agent(name: &str) -> Result<Agent, UnknownAgent> {
 /// `context` names the command that failed, so that a message read out of a
 /// supervisor's log says which of them produced it.
 fn fail(context: &str, error: &dyn std::error::Error) -> ExitCode {
+    report(context, error);
+    ExitCode::FAILURE
+}
+
+/// Says on stderr what went wrong, and what was underneath it, for a caller
+/// that has its own idea of what to exit with.
+fn report(context: &str, error: &dyn std::error::Error) {
     eprintln!("{context}: {error}");
     let mut cause = error.source();
     while let Some(error) = cause {
         eprintln!("  caused by: {error}");
         cause = error.source();
     }
-    ExitCode::FAILURE
 }
 
 /// Accepts a verbosity the log filter understands, and hands it back unchanged.

@@ -23,7 +23,9 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 
-use agentbus_protocol::{Event, SessionEntry, SessionStatus, Snapshot, StreamLine};
+use agentbus_protocol::{
+    Event, ForegroundChange, ForegroundEntry, SessionEntry, SessionStatus, Snapshot, StreamLine,
+};
 
 /// How long a test waits for something that should happen immediately.
 ///
@@ -37,6 +39,7 @@ const INHERITED: &[&str] = &[
     "AGENTBUS_DIR",
     "AGENTBUS_LOG",
     "AGENTBUS_PANE",
+    "AGENTBUS_PROC_ROOT",
     "AGENTBUS_STALE_SECS",
     "AGENTBUS_DONE_RETENTION_SECS",
     "XDG_RUNTIME_DIR",
@@ -84,12 +87,31 @@ impl Drop for Bus {
 }
 
 impl Bus {
+    /// Starts a daemon with no process table to read.
+    ///
+    /// That is what a test about sessions wants: such a daemon says nothing
+    /// whatever about the foreground, so what these tests read on the stream is
+    /// what they themselves put into it, on any machine.
+    pub fn start() -> Self {
+        Self::started(None)
+    }
+
+    /// Starts a daemon watching the process table under `proc_root`.
+    pub fn watching(proc_root: &Path) -> Self {
+        Self::started(Some(proc_root))
+    }
+
     /// Starts a daemon on a fresh directory and returns once both of its sockets
     /// answer, so that a test never races the thing it is about to talk to.
-    pub fn start() -> Self {
+    fn started(proc_root: Option<&Path>) -> Self {
         let temp = tempfile::tempdir().expect("cannot make a temporary directory");
         let dir = temp.path().join("bus");
+        let unreadable = temp.path().join("no-process-table");
         let daemon = command(&dir, &["daemon"])
+            .env(
+                "AGENTBUS_PROC_ROOT",
+                proc_root.unwrap_or(unreadable.as_path()),
+            )
             .stdout(Stdio::null())
             .spawn()
             .expect("cannot run agentbus");
@@ -303,9 +325,60 @@ impl Subscriber {
         })
     }
 
+    /// The next change to what is in front of a correlated shell, skipping
+    /// everything else the bus says while a test is waiting.
+    pub fn foreground_change(&mut self, what: &str) -> ForegroundChange {
+        self.until(what, |line| match line {
+            StreamLine::ForegroundChange(change) => Some(change.clone()),
+            _ => None,
+        })
+    }
+
+    /// Whatever the bus says in the next `patience`, heartbeats aside, or
+    /// nothing at all if it stays quiet — for a test whose subject *is* the
+    /// quiet, where waiting the full patience is the measurement rather than a
+    /// delay to be avoided.
+    pub fn quiet_for(&mut self, patience: Duration) -> Option<StreamLine> {
+        let deadline = Instant::now() + patience;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let line = match self.lines.recv_timeout(remaining) {
+                Ok(line) => line,
+                Err(RecvTimeoutError::Timeout) => return None,
+                Err(RecvTimeoutError::Disconnected) => panic!("the stream ended"),
+            };
+            match serde_json::from_str(&line) {
+                Ok(StreamLine::Heartbeat(_)) => {}
+                Ok(line) => return Some(line),
+                Err(error) => panic!("{error} in {line:?}"),
+            }
+        }
+    }
+
     /// Disconnects, the way a subscriber that has been killed does.
     pub fn close(self) {
         drop(self.connection);
+    }
+}
+
+/// The one foreground observation in `snapshot` for this correlation, failing
+/// the test if the bus has none or has several.
+pub fn foreground_of<'a>(snapshot: &'a Snapshot, correlation: &str) -> &'a ForegroundEntry {
+    let observed = snapshot
+        .foreground
+        .as_deref()
+        .expect("this daemon is not watching a process table");
+    let found: Vec<&ForegroundEntry> = observed
+        .iter()
+        .filter(|entry| entry.correlation == correlation)
+        .collect();
+    match found.as_slice() {
+        [entry] => entry,
+        [] => panic!("{correlation} is not in {observed:?}"),
+        many => panic!(
+            "{correlation} is in the snapshot {} times: {many:?}",
+            many.len()
+        ),
     }
 }
 

@@ -474,3 +474,57 @@ table and reading its `stat` is the ordinary case, not a fault, and so is an
 `environ` belonging to another uid, which needs `CAP_SYS_PTRACE` to open. An
 error type would put a decision in front of every call site for a condition that
 has exactly one sensible response, which is to have no observation this time.
+
+## 2026-08-19 — publishing what the process table says
+
+### Observations travel on the stream that carries events, numbered with them
+
+**One broadcast channel, one sequence counter, one order.** A `foreground_change`
+is stamped with the next `seq` under the same lock an event is stamped under, and
+published from inside it. Two channels would have been simpler to write and would
+have broken the one promise a subscriber is given — that it reads the stream in
+`seq` order — because two senders are free to reach a subscriber in the opposite
+order to the one they were numbered in. Numbering observations from the same
+counter also means the rule that makes a stream a continuation of its snapshot
+rather than an overlap with it — *skip what is at or below the snapshot's `seq`* —
+needs nothing added to it.
+
+### The `foreground` key is absent, not empty, when nothing is watching
+
+**Whether a daemon can read a process table is settled once, when it starts.** A
+daemon that can says so from its first snapshot, when the answer is still `[]`; one
+that cannot — another operating system, a root that is not there, a table it may
+not list — never writes the key at all and never publishes a `foreground_change`.
+The two are different facts: "nobody is looking" and "nobody is running anything".
+Deciding it once rather than per snapshot is what makes the absence stable, so a
+subscriber that saw the key once can rely on seeing it for the life of that
+connection.
+
+### Looking at the process table happens on a blocking thread
+
+**Each pass is handed to `spawn_blocking` rather than run on a runtime worker.**
+In the steady state a pass is a couple of file reads per correlated shell and would
+not be worth the hand-off; every few seconds it is one read of `environ` per
+process on the machine, which is bounded but not small. A worker parked in that is
+a worker not accepting the connection a hook is waiting on, and the hook is the one
+caller in this system that cannot be kept waiting.
+
+### The root of the process table is a hidden flag
+
+**`--proc-root`, with `AGENTBUS_PROC_ROOT` behind it, hidden from the usage
+text.** A machine has exactly one process table and its path is not a choice, so
+this is not an option in the sense the other flags are; it exists because the
+reader was built to take a root and a test can then write a process table as files
+and hold it still. It is the fifth entry in the list "Configuration is flags, with
+an environment variable behind each" gives above, and it follows that rule so that
+there is one way to configure a daemon; it is hidden so that it does not read as
+something a user is expected to set.
+
+### `agentbus foreground` has three exit codes and the middle one is why
+
+**0 printed something, 1 the filter matched nothing, 2 there was nothing to ask.**
+A correlation with nothing running in it is *news* — the shell is real and its
+terminal is idle — and a script has to be able to tell it from a daemon that is not
+there or cannot look. So every way of failing to get an answer at all, including a
+daemon that is not watching a process table, shares the one code, and the general
+failure code is spent on the answer instead.

@@ -6,6 +6,7 @@
 //! the timings it uses, that a directory left in a mess by an earlier run is
 //! usable again, and that the whole of a daemon's footprint goes away with it.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use agentbus_daemon::{Daemon, Settings, SocketPaths};
@@ -91,11 +92,12 @@ async fn the_settings_a_daemon_was_started_with_are_readable_from_it() {
         stale_after: Duration::from_secs(7),
         done_retention: Duration::from_secs(11),
         heartbeat: Duration::from_secs(13),
+        proc_root: PathBuf::from("/proc/somewhere/else"),
     };
 
-    let started = start(settings);
+    let started = start(settings.clone());
 
-    assert_eq!(started.daemon.settings(), settings);
+    assert_eq!(started.daemon.settings(), &settings);
 }
 
 #[tokio::test]

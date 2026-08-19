@@ -30,8 +30,17 @@ struct Running {
 }
 
 /// Starts a daemon on a temporary directory, with the timings given.
+///
+/// The process table it is pointed at is one that does not exist. Everything
+/// here is about the stream a subscriber reads, and a daemon reading the real
+/// process table would put whatever the machine running these tests happens to
+/// be doing into the middle of it.
 fn start(settings: Settings) -> Running {
     let dir = tempfile::tempdir().expect("cannot make a temporary directory");
+    let settings = Settings {
+        proc_root: dir.path().join("no-process-table"),
+        ..settings
+    };
     let daemon = Daemon::bind(SocketPaths::in_dir(dir.path().join("agentbus")), settings)
         .expect("cannot start the daemon");
     let bus = Arc::clone(daemon.bus());
@@ -162,8 +171,9 @@ async fn a_subscriber_is_told_the_whole_state_before_it_is_told_anything_else() 
         statuses.contains(&("def456", SessionStatus::Blocked)),
         "{statuses:?}"
     );
-    // Nothing this daemon cannot observe is claimed to be observed, and nothing
-    // says which daemon this is: both are absent rather than empty.
+    // This daemon has no process table to read, so it says nothing whatever
+    // about the foreground rather than saying there is nothing in it; and
+    // nothing says which daemon this is. Both are absent rather than empty.
     assert!(snapshot.foreground.is_none());
     assert!(snapshot.daemon.is_none());
 }

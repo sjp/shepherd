@@ -60,9 +60,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentbus_protocol::{DEFAULT_DONE_RETENTION, DEFAULT_STALE_AFTER, Fold, SessionTable};
+use bus::Published;
+use foreground::Monitor;
+use procfs::ProcFs;
 use subscribe::DEFAULT_HEARTBEAT;
 use thiserror::Error;
 use tokio::signal::unix::{Signal, SignalKind, signal};
+use tokio::sync::broadcast::error::TryRecvError;
 use tracing::{debug, error, info};
 
 pub use bus::Bus;
@@ -78,6 +82,14 @@ pub use subscribe::SubscribeListener;
 /// either timeout needs and costs one pass over a handful of sessions.
 pub const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How often the process table is looked at.
+///
+/// Steady state is a couple of reads per correlated shell, so looking this often
+/// costs nothing measurable, and it is fast enough that a command someone has
+/// just started is on the stream while they are still looking at the terminal
+/// they started it in.
+pub const FOREGROUND_INTERVAL: Duration = Duration::from_millis(750);
+
 /// The version this daemon reports when it starts.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -86,14 +98,14 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// burning a core.
 pub(crate) const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
-/// The timings a daemon can be started with.
+/// What a daemon can be started with.
 ///
-/// All of them are properties of the bus rather than of any client, which is why
+/// The timings are properties of the bus rather than of any client, which is why
 /// they are settled once here and not negotiated per connection: every
 /// subscriber has to be told the same thing about the same session, and a
 /// subscriber deciding for itself how often it wants to hear from the daemon
 /// would make one slow client's preference everyone else's cost.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     /// How long a session may go without activity before it is reported stale.
     pub stale_after: Duration,
@@ -101,6 +113,13 @@ pub struct Settings {
     pub done_retention: Duration,
     /// How often each subscriber is sent a heartbeat.
     pub heartbeat: Duration,
+    /// Where the process table is read from.
+    ///
+    /// Every machine this runs on answers `/proc`, which is the default. It is
+    /// settable because a test can then write a process table as files and put a
+    /// daemon in front of it, which is the only way to hold the table still long
+    /// enough to assert anything about it.
+    pub proc_root: PathBuf,
 }
 
 impl Default for Settings {
@@ -109,13 +128,14 @@ impl Default for Settings {
             stale_after: DEFAULT_STALE_AFTER,
             done_retention: DEFAULT_DONE_RETENTION,
             heartbeat: DEFAULT_HEARTBEAT,
+            proc_root: PathBuf::from(procfs::DEFAULT_ROOT),
         }
     }
 }
 
 impl Settings {
     /// A session table configured the way these settings ask for.
-    fn table(self) -> SessionTable {
+    fn table(&self) -> SessionTable {
         SessionTable::new()
             .with_fold(Fold::with_stale_after(self.stale_after))
             .with_done_retention(self.done_retention)
@@ -199,6 +219,7 @@ pub struct Daemon {
     bus: Arc<Bus>,
     emit: EmitListener,
     subscribe: SubscribeListener,
+    monitor: Option<Monitor>,
     lock: InstanceLock,
     signals: Option<Signals>,
 }
@@ -218,6 +239,12 @@ impl Daemon {
     /// The lock comes next, so that a second daemon is turned away before it has
     /// removed anything; the cleanup after that, because holding the lock is
     /// what proves the files found there are nobody's; binding comes last.
+    ///
+    /// Whether there is a process table to read is settled here too, once, by
+    /// trying to read it. A daemon that cannot — another operating system, a
+    /// root that is not there, a table it may not list — serves everything else
+    /// exactly as it would have done and says nothing whatever about the
+    /// foreground, which is different from saying there is nothing in it.
     pub fn bind(paths: SocketPaths, settings: Settings) -> Result<Self, Error> {
         let signals = Signals::install();
         paths.create_dir().map_err(|source| Error::Directory {
@@ -242,14 +269,25 @@ impl Daemon {
             path: paths.sub().to_owned(),
             source,
         })?;
+        let monitor = Monitor::new(ProcFs::new(&settings.proc_root));
+        let mut bus = Bus::with_table(settings.table());
+        if monitor.available() {
+            bus = bus.observing();
+        } else {
+            info!(
+                root = %settings.proc_root.display(),
+                "there is no process table here; not reporting foreground processes"
+            );
+        }
         Ok(Self {
             paths,
-            settings,
-            bus: Arc::new(Bus::with_table(settings.table())),
+            bus: Arc::new(bus),
             emit,
             subscribe,
+            monitor: monitor.available().then_some(monitor),
             lock,
             signals,
+            settings,
         })
     }
 
@@ -263,9 +301,9 @@ impl Daemon {
         &self.paths
     }
 
-    /// The timings this daemon was started with.
-    pub fn settings(&self) -> Settings {
-        self.settings
+    /// What this daemon was started with.
+    pub fn settings(&self) -> &Settings {
+        &self.settings
     }
 
     /// Serves until a termination signal arrives, then leaves the directory as
@@ -283,6 +321,7 @@ impl Daemon {
             bus,
             emit,
             subscribe,
+            monitor,
             lock,
             signals,
         } = self;
@@ -293,7 +332,7 @@ impl Daemon {
             stopped = terminated(signals) => stopped,
             // Serving never finishes on its own; it is here to be run, and to be
             // dropped the moment the signal arrives.
-            () = serve(bus, emit, subscribe, settings) => {
+            () = serve(bus, emit, subscribe, monitor, settings.heartbeat) => {
                 unreachable!("the bus stops only when it is told to")
             }
         };
@@ -306,17 +345,20 @@ impl Daemon {
     }
 }
 
-/// Accepts events, publishes them, and moves the clock forward, forever.
+/// Accepts events, publishes them, watches the process table, and moves the
+/// clock forward, forever.
 async fn serve(
     bus: Arc<Bus>,
     emit: EmitListener,
     subscribe: SubscribeListener,
-    settings: Settings,
+    monitor: Option<Monitor>,
+    heartbeat: Duration,
 ) {
     let ticking = tick(Arc::clone(&bus));
+    let watching = watch(Arc::clone(&bus), monitor);
     let receiving = emit.serve(Arc::clone(&bus));
-    let publishing = subscribe.serve(bus, settings.heartbeat);
-    tokio::join!(ticking, receiving, publishing);
+    let publishing = subscribe.serve(bus, heartbeat);
+    tokio::join!(ticking, watching, receiving, publishing);
 }
 
 /// Moves every session's clock forward, forever.
@@ -325,6 +367,87 @@ async fn tick(bus: Arc<Bus>) {
     loop {
         interval.tick().await;
         bus.tick(&clock::now());
+    }
+}
+
+/// Looks at the process table on a fixed cadence and publishes what changed,
+/// forever, or waits forever where there is no process table to look at.
+///
+/// The looking is done on a blocking thread rather than on a runtime worker. In
+/// the steady state it is a couple of reads per correlated shell and would not
+/// be worth the hand-off, but every few seconds it is one read of `environ` per
+/// process on the machine, and a worker parked in that is a worker not accepting
+/// the connection a hook is waiting on.
+async fn watch(bus: Arc<Bus>, monitor: Option<Monitor>) {
+    let Some(mut monitor) = monitor else {
+        return std::future::pending().await;
+    };
+    let mut published = bus.events();
+    let mut interval = tokio::time::interval(FOREGROUND_INTERVAL);
+    loop {
+        interval.tick().await;
+        if !wanted(&mut published, &mut monitor) {
+            return;
+        }
+        let now = clock::now();
+        let looked = tokio::task::spawn_blocking(move || {
+            let transitions = monitor.tick(&now);
+            (monitor, now, transitions)
+        })
+        .await;
+        let (returned, now, transitions) = match looked {
+            Ok(looked) => looked,
+            // The only way here is a panic in the monitor, which has already
+            // been reported by the panic hook. The rest of the daemon is
+            // untouched by it and carries on; what is lost is the foreground.
+            Err(error) => {
+                error!(%error, "the foreground monitor stopped; no more will be reported");
+                return;
+            }
+        };
+        monitor = returned;
+        for pid in bus.observed(&transitions, &now) {
+            debug!(pid, "a process that was being followed has ended");
+        }
+    }
+}
+
+/// Names to the monitor every correlation seen on an event since the last look,
+/// and says whether there is any point looking again.
+///
+/// This is what a correlation nobody has seen before buys: the monitor brings
+/// its next sweep forward and finds the shell at once instead of within its own
+/// interval. Nothing is filtered by it — a correlation the process table has and
+/// no event ever mentioned is reported just the same — so falling behind the
+/// published stream costs latency and nothing else.
+fn wanted(
+    published: &mut tokio::sync::broadcast::Receiver<Published>,
+    monitor: &mut Monitor,
+) -> bool {
+    loop {
+        match published.try_recv() {
+            Ok(Published::Event(event)) => {
+                if let Some(correlation) = event
+                    .correlation
+                    .as_deref()
+                    .filter(|correlation| !correlation.is_empty())
+                {
+                    monitor.want(correlation);
+                }
+            }
+            Ok(Published::Foreground(_)) => {}
+            Err(TryRecvError::Empty) => return true,
+            Err(TryRecvError::Lagged(lines)) => {
+                debug!(
+                    lines,
+                    "the foreground monitor fell behind the published stream"
+                );
+            }
+            // Unreachable while this holds the bus the channel belongs to, and
+            // the honest answer to it anyway: a bus nobody can publish to has
+            // no use for anything this would observe.
+            Err(TryRecvError::Closed) => return false,
+        }
     }
 }
 
