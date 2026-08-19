@@ -594,3 +594,78 @@ emulator where it cannot; and a test in the workspace pins that what the binary
 prints is what `[workspace.package]` declares, so the drift that would otherwise
 only appear at release time — a crate that stopped inheriting the workspace
 version — fails an ordinary test run.
+
+## 2026-08-19 — reaching another endpoint
+
+### What a transport is, and what a far end's paths are
+
+**One object-safe trait: run a command, copy a file in, say what the machine is,
+say how long to wait before retrying, plus a name and an identity.** Anything
+that holds these holds several at once, of kinds settled at run time, so the
+whole surface is dispatched dynamically and nothing above it is written against
+a particular kind of endpoint. The identity is separate from the name because
+several names may reach one machine and deduplication has to be done on the
+machine.
+
+**A far end's paths are `String`, not `Path`.** They are resolved by a
+filesystem this process cannot see, so the type that means "a path this program
+could open" is the wrong one: using it invites code that canonicalizes, joins or
+stats a name that only means something somewhere else. Only the *local* side of
+a copy is a `Path`.
+
+### The build's target triple comes from a build script
+
+**`crates/daemon/build.rs` re-exports Cargo's `TARGET` as `AGENTBUS_TARGET`.**
+Whether the executable that is running can be handed to another machine is a
+question only the compiler can answer, and Cargo tells a build script and nothing
+else. Two lines of build script beat every runtime guess.
+
+### Whether a copy can be pushed is decided loosely and verified exactly
+
+**The push is offered when the far end's operating system and architecture match
+this build's; whether it is *right* is settled over there, by `--version`.** A
+`uname` answer of `Linux x86_64` says nothing about which libc is installed, so
+an equality test against a musl triple would refuse to push from every ordinary
+`-gnu` build, including every development build; and a looser test cannot be
+wrong in a way that matters, because a copy that arrives and cannot run fails the
+version check exactly as a truncated one does. That check is the only thing that
+licenses execution, and it is the same check whether the copy was pushed, fetched
+or already there.
+
+### The bootstrap is told apart by one line, read and put back
+
+**The driver reads one line of the far end's stdout, and either recognizes the
+script's `need=` or hands the stream on with that line restored.** The script
+execs on success, so there is no exit status to wait for and no way to know what
+happened without looking; and the stream belongs to the caller, so what was
+looked at has to go back. Deciding on a timeout instead would make a slow far end
+indistinguishable from a failed one.
+
+### Backoff carries its jitter but does not draw it
+
+**`Backoff` is four numbers and two pure functions; the caller supplies the
+sample in `0..=1` that spreads a delay.** A backoff that reaches for a random
+number is a backoff no test can assert anything about, and a workspace that
+needs randomness in exactly one place should not take the dependency for four
+lines of arithmetic.
+
+### A daemon that outlives its subscriber is made by forking twice
+
+**`agentbus subscribe --ensure-daemon` spawns the daemon with a second `fork`
+and a `setsid` between the fork and the exec.** The state a daemon holds is the
+reason to have one — an agent that said it was blocked before a connection
+dropped never says so again — so a daemon that died with the attachment would
+lose exactly what the bus exists to show. The second fork means the daemon is
+nobody's child, so it survives the subscriber and leaves no zombie behind if it
+does not; the new session means the `^C` that stops the subscriber is not also
+sent to the daemon. What is started is an ordinary daemon: `agentbus daemon` is
+unchanged, and nothing about the process it becomes records who asked for it.
+
+**Whether a daemon is already there is answered by connecting, not by testing
+the lock.** The caller is about to connect anyway, and the lock answers a
+question one step removed from the one being asked: a daemon that holds the lock
+and has not yet bound its sockets would pass a lock test and fail the connection
+immediately afterwards. Connecting, then starting one, then waiting for the
+socket to answer covers that case and the race between two callers with the same
+code, since the loser of the race for the lock exits at once and both callers
+wait for the same socket.

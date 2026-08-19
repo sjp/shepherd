@@ -52,6 +52,7 @@ pub mod foreground;
 pub mod lock;
 pub mod paths;
 pub mod procfs;
+pub mod remote;
 pub mod subscribe;
 
 use std::fmt;
@@ -92,6 +93,10 @@ pub const TICK_INTERVAL: Duration = Duration::from_secs(1);
 pub const FOREGROUND_INTERVAL: Duration = Duration::from_millis(750);
 
 /// The version this daemon reports when it starts.
+///
+/// Also what a copy of this program at another endpoint has to answer to before
+/// it is trusted, which is why it is one constant and not a string written out
+/// wherever it is wanted.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// How long to wait after a failed `accept` before trying again, so that a

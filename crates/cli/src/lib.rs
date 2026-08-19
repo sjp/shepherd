@@ -23,6 +23,7 @@
 
 pub mod adapters;
 pub mod emit;
+pub mod ensure;
 pub mod foreground;
 pub mod install;
 pub mod status;
@@ -208,6 +209,10 @@ impl DaemonArgs {
 struct SubscribeArgs {
     #[command(flatten)]
     location: Location,
+
+    /// Start a daemon first if none is running here, and leave it running
+    #[arg(long)]
+    ensure_daemon: bool,
 }
 
 /// How to report what the bus knows.
@@ -398,9 +403,24 @@ fn daemon(args: &DaemonArgs) -> ExitCode {
 /// entirely — should see each line at the moment the daemon produced it, and
 /// should be able to tell the end of the stream from a pause in it. Restarting
 /// after the bus goes away is a decision for whoever ran this, not for it.
+///
+/// `--ensure-daemon` is the exception, and only to the first connection: it
+/// turns "there is no bus here" from something to report into something to fix,
+/// which is what anything arriving on a machine where nobody is going to start
+/// one by hand needs. The daemon it starts is left running afterwards.
 fn subscribe(args: &SubscribeArgs) -> ExitCode {
-    let mut stream = match stream::connect(&args.location.paths()) {
+    let paths = args.location.paths();
+    let mut stream = match stream::connect(&paths) {
         Ok(stream) => stream,
+        Err(stream::Error::NoDaemon { .. }) if args.ensure_daemon => {
+            if let Err(error) = ensure::daemon(&paths) {
+                return fail(SUBSCRIBE, &error);
+            }
+            match stream::connect(&paths) {
+                Ok(stream) => stream,
+                Err(error) => return fail(SUBSCRIBE, &error),
+            }
+        }
         Err(error) => return fail(SUBSCRIBE, &error),
     };
     let stdout = std::io::stdout();
