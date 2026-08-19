@@ -19,8 +19,10 @@
 		}
 	},
 	"mounts": [
-		"source=claude-code-config,target=/home/vscode/.claude,type=volume"
+		"source=claude-code-config,target=/home/vscode/.claude,type=volume",
+		"source=codex-config,target=/home/vscode/.codex,type=volume",
+		"source=opencode-config,target=/home/vscode/.config/opencode,type=volume"
 	],
 	"remoteUser": "vscode",
-	"postCreateCommand": "sudo chown -R $(id -u):$(id -g) ~/.claude && echo '{\"hasCompletedOnboarding\":true,\"numStartups\":1,\"installMethod\":\"npm\"}' > ~/.claude.json"
+	"postCreateCommand": "${containerWorkspaceFolder}/.devcontainer/post-create.sh"
 }
