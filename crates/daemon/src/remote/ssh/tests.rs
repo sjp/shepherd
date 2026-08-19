@@ -23,10 +23,10 @@ use super::trouble::Trouble;
 use crate::remote::transport::{Registry, Running, Transport};
 
 /// The declaration most of these use, and the resolution ssh gives for it.
-const DECLARED: [&str; 3] = ["-p", "2222", "bob@fs.haze.nz"];
+const DECLARED: [&str; 3] = ["-p", "2222", "bob@fs.example.net"];
 
 /// What the recorded `ssh -G` for that declaration says.
-const RESOLUTION: &str = "host fs.haze.nz\nuser bob\nhostname fs.haze.nz\nport 2222\n";
+const RESOLUTION: &str = "host fs.example.net\nuser bob\nhostname fs.example.net\nport 2222\n";
 
 /// The words a declaration is made of.
 fn words(words: &[&str]) -> Vec<String> {
@@ -219,7 +219,7 @@ fn our_options_come_first_the_declaration_next_and_the_command_after_a_separator
             // Verbatim, in order, untouched.
             "-p",
             "2222",
-            "bob@fs.haze.nz",
+            "bob@fs.example.net",
             "--",
             "agentbus",
             "subscribe",
@@ -306,7 +306,7 @@ fn what_ssh_complained_says_whether_another_attempt_could_go_differently() {
             false,
         ),
         (
-            "bob@fs.haze.nz: Permission denied (publickey).",
+            "bob@fs.example.net: Permission denied (publickey).",
             Trouble::Credentials,
             false,
         ),
@@ -316,22 +316,22 @@ fn what_ssh_complained_says_whether_another_attempt_could_go_differently() {
             false,
         ),
         (
-            "ssh: connect to host fs.haze.nz port 2222: Connection refused",
+            "ssh: connect to host fs.example.net port 2222: Connection refused",
             Trouble::Unreachable,
             true,
         ),
         (
-            "ssh: Could not resolve hostname fs.haze.nz: Name or service not known",
+            "ssh: Could not resolve hostname fs.example.net: Name or service not known",
             Trouble::Unreachable,
             true,
         ),
         (
-            "ssh: connect to host fs.haze.nz port 22: Connection timed out",
+            "ssh: connect to host fs.example.net port 22: Connection timed out",
             Trouble::Unreachable,
             true,
         ),
         (
-            "ssh: connect to host fs.haze.nz port 22: No route to host",
+            "ssh: connect to host fs.example.net port 22: No route to host",
             Trouble::Unreachable,
             true,
         ),
@@ -356,7 +356,7 @@ fn a_refusal_reaches_the_transport_through_whatever_wrapped_it() {
 
     // Whatever kind of failure carried the words, it is the words that decide.
     let wrapped = io::Error::other(
-        "the bootstrap failed at bob@fs: exit status: 255: bob@fs.haze.nz: Permission denied (publickey).",
+        "the bootstrap failed at bob@fs: exit status: 255: bob@fs.example.net: Permission denied (publickey).",
     );
     let down =
         io::Error::other("the bootstrap failed at bob@fs: exit status: 255: Connection refused");
@@ -450,7 +450,7 @@ fn letting_go_of_a_host_closes_the_connection_once() {
     assert_eq!(closed.len(), 1);
     assert_eq!(
         closed[0][closed[0].len() - 5..],
-        words(&["-O", "exit", "-p", "2222", "bob@fs.haze.nz"])[..]
+        words(&["-O", "exit", "-p", "2222", "bob@fs.example.net"])[..]
     );
 }
 
@@ -504,9 +504,9 @@ fn a_host_is_what_it_was_declared_as_and_where_ssh_says_that_is() {
 
     let host = host(dir.path(), &ssh);
 
-    assert_eq!(host.label(), "-p 2222 bob@fs.haze.nz");
+    assert_eq!(host.label(), "-p 2222 bob@fs.example.net");
     assert_eq!(host.kind(), "ssh");
-    assert_eq!(host.identity().as_deref(), Some("bob@fs.haze.nz:2222"));
+    assert_eq!(host.identity().as_deref(), Some("bob@fs.example.net:2222"));
     assert_eq!(host.install_path("1.2.3"), "/tmp/agentbus-1.2.3");
     // Its own schedule, and a slower one than a container on this machine gets.
     assert_eq!(host.backoff().initial, std::time::Duration::from_secs(5));

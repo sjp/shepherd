@@ -1,6 +1,6 @@
-host fs.haze.nz
+host fs.example.net
 user bob
-hostname fs.haze.nz
+hostname fs.example.net
 port 2222
 addressfamily any
 batchmode no

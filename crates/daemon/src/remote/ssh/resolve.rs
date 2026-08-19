@@ -2,7 +2,7 @@
 //!
 //! A declaration is an argument vector, kept exactly as it was written:
 //! `fileserver`, `vscode@fileserver`, `-p 2222 -o StrictHostKeyChecking=no
-//! bob@fs.haze.nz`, `-J bastion.example.com deep@inner`. Working out which
+//! bob@fs.example.net`, `-J bastion.example.com deep@inner`. Working out which
 //! machine one of those names would mean evaluating every `Host` block, `Match`
 //! block and `Include` in somebody's configuration, and resolving `ProxyJump`
 //! chains, certificates, `IdentityAgent`, FIDO keys and

@@ -27,7 +27,7 @@ Host bastion.example.com
 ```sh
 ssh -F config -G fileserver > openssh-10.0/fileserver
 ssh -F config -G vscode@fileserver > openssh-10.0/vscode-at-fileserver
-ssh -F config -G -p 2222 -o StrictHostKeyChecking=no bob@fs.haze.nz > openssh-10.0/bob-at-fs-haze-nz
+ssh -F config -G -p 2222 -o StrictHostKeyChecking=no bob@fs.example.net > openssh-10.0/bob-at-fs-example-net
 ssh -F config -G -J bastion.example.com deep@inner > openssh-10.0/deep-at-inner
 ssh -F config -G -p2222 fileserver > openssh-10.0/glued-port
 ssh -F config -G -o ControlMaster=auto -o 'ControlPath=/run/user/1000/agentbus/ssh-%C' \

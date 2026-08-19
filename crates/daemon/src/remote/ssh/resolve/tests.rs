@@ -221,10 +221,10 @@ fn the_argument_vectors_people_type_resolve_to_the_endpoint_they_name() {
                 "2222",
                 "-o",
                 "StrictHostKeyChecking=no",
-                "bob@fs.haze.nz",
+                "bob@fs.example.net",
             ],
-            "bob-at-fs-haze-nz",
-            ("bob", "fs.haze.nz", 2222),
+            "bob-at-fs-example-net",
+            ("bob", "fs.example.net", 2222),
         ),
         (
             &["-J", "bastion.example.com", "deep@inner"],
@@ -254,13 +254,13 @@ fn the_argument_vectors_people_type_resolve_to_the_endpoint_they_name() {
 
 #[test]
 fn what_was_declared_is_what_ssh_is_run_with() {
-    let fake = Fake::printing(fixture("openssh-10.0/bob-at-fs-haze-nz"));
+    let fake = Fake::printing(fixture("openssh-10.0/bob-at-fs-example-net"));
     let declared = declared(&[
         "-p",
         "2222",
         "-o",
         "StrictHostKeyChecking=no",
-        "bob@fs.haze.nz",
+        "bob@fs.example.net",
     ]);
     resolver(&fake).resolve(&declared).expect("cannot resolve");
     let mut expected = vec![DUMP.to_owned()];
@@ -310,8 +310,8 @@ fn an_options_value_is_never_mistaken_for_a_destination() {
         &["vscode@fileserver"][..],
         &["-p", "2222", "fileserver"][..],
         &["-p2222", "fileserver"][..],
-        &["-o", "StrictHostKeyChecking=no", "bob@fs.haze.nz"][..],
-        &["-oStrictHostKeyChecking=no", "bob@fs.haze.nz"][..],
+        &["-o", "StrictHostKeyChecking=no", "bob@fs.example.net"][..],
+        &["-oStrictHostKeyChecking=no", "bob@fs.example.net"][..],
         &["-J", "bastion.example.com", "deep@inner"][..],
         &["-i", "/home/vscode/.ssh/id_ed25519", "fileserver"][..],
         &["-4", "-v", "-p", "22", "fileserver"][..],
