@@ -44,6 +44,7 @@
 
 #![warn(missing_docs)]
 
+pub mod binding;
 pub mod bus;
 pub mod clock;
 pub mod emit;

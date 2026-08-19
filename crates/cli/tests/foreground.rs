@@ -14,12 +14,11 @@
 
 mod common;
 
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use agentbus_protocol::{ForegroundEntry, ForegroundState, SessionStatus, Snapshot, StreamLine};
-use common::{Bus, PATIENCE, foreground_of};
+use agentbus_protocol::{ForegroundEntry, ForegroundState, SessionStatus, StreamLine};
+use common::tree::{Tree, running, shell};
+use common::{Bus, foreground_of};
 
 /// How long a test waits to be sure nothing more is coming.
 ///
@@ -27,165 +26,12 @@ use common::{Bus, PATIENCE, foreground_of};
 /// something to say would have said it, and short enough to be a test.
 const SILENCE: Duration = Duration::from_secs(3);
 
-/// A process table written as files, which a test may then change.
-struct Tree {
-    dir: tempfile::TempDir,
-}
-
-impl Tree {
-    /// An empty table.
-    fn new() -> Self {
-        let dir = tempfile::tempdir().expect("cannot make a temporary directory");
-        fs::create_dir(dir.path().join("proc")).expect("cannot make the process table");
-        Self { dir }
-    }
-
-    /// The root a daemon is pointed at.
-    fn root(&self) -> PathBuf {
-        self.dir.path().join("proc")
-    }
-
-    /// Writes one process, replacing it if it is already there.
-    fn write(&self, process: &Process) {
-        let dir = self.root().join(process.pid.to_string());
-        fs::create_dir_all(&dir).expect("cannot make a process directory");
-        write(
-            &dir.join("stat"),
-            format!(
-                "{} ({}) S {} {} {} 34816 {} 4194304 0 0 0 0 5 2 0 0 20 0 1 0 0\n",
-                process.pid,
-                process.comm,
-                process.ppid,
-                process.pgrp,
-                process.session,
-                process.tpgid,
-            )
-            .into_bytes(),
-        );
-        write(
-            &dir.join("comm"),
-            format!("{}\n", process.comm).into_bytes(),
-        );
-        write(&dir.join("cmdline"), nul_terminated(&process.cmdline));
-        let environ: Vec<String> = process
-            .environ
-            .iter()
-            .map(|(name, value)| format!("{name}={value}"))
-            .collect();
-        let environ: Vec<&str> = environ.iter().map(String::as_str).collect();
-        write(&dir.join("environ"), nul_terminated(&environ));
-    }
-
-    /// Takes one process out of the table, as an exit does.
-    fn remove(&self, pid: i32) {
-        fs::remove_dir_all(self.root().join(pid.to_string())).expect("cannot remove a process");
-    }
-}
-
-/// One process to write into a [`Tree`].
-struct Process {
-    pid: i32,
-    comm: &'static str,
-    ppid: i32,
-    pgrp: i32,
-    session: i32,
-    tpgid: i32,
-    cmdline: Vec<&'static str>,
-    environ: Vec<(&'static str, String)>,
-}
-
-impl Process {
-    /// A process that is its own group and session leader, with nothing in its
-    /// environment and no terminal.
-    fn new(pid: i32, comm: &'static str) -> Self {
-        Self {
-            pid,
-            comm,
-            ppid: 1,
-            pgrp: pid,
-            session: pid,
-            tpgid: -1,
-            cmdline: vec![comm],
-            environ: Vec::new(),
-        }
-    }
-}
-
-/// A shell carrying `correlation`, with `foreground` in front of its terminal.
-fn shell(pid: i32, correlation: &str, foreground: i32) -> Process {
-    Process {
-        tpgid: foreground,
-        cmdline: vec!["-bash"],
-        environ: vec![("AGENTBUS_PANE", correlation.to_owned())],
-        ..Process::new(pid, "bash")
-    }
-}
-
-/// A process in the foreground of the terminal a shell owns.
-fn running(pid: i32, comm: &'static str, cmdline: Vec<&'static str>) -> Process {
-    Process {
-        cmdline,
-        ..Process::new(pid, comm)
-    }
-}
-
-/// Writes a file, replacing whatever was there, in one step.
-///
-/// A rename rather than a truncate-and-write because a daemon is reading these
-/// while they change: a kernel hands out a whole `stat` line or nothing, and a
-/// test whose files could be read half-written would be exercising a state no
-/// real process table is ever in.
-fn write(path: &Path, contents: Vec<u8>) {
-    let writing = path.with_extension("writing");
-    fs::write(&writing, contents)
-        .unwrap_or_else(|error| panic!("cannot write {}: {error}", writing.display()));
-    fs::rename(&writing, path)
-        .unwrap_or_else(|error| panic!("cannot replace {}: {error}", path.display()));
-}
-
-/// The bytes a process table holds a NUL-separated file in.
-fn nul_terminated(entries: &[&str]) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    for entry in entries {
-        bytes.extend_from_slice(entry.as_bytes());
-        bytes.push(0);
-    }
-    bytes
-}
-
 /// A table with one shell carrying `w9:p3` and `claude` running in front of it.
 fn one_shell_running_claude() -> Tree {
     let tree = Tree::new();
     tree.write(&shell(100, "w9:p3", 200));
     tree.write(&running(200, "claude", vec!["claude", "--resume"]));
     tree
-}
-
-/// Waits until the bus reports an observation for `correlation`, and returns
-/// the snapshot that says so.
-///
-/// Something has to wait: the daemon looks at the process table on its own
-/// schedule, and a test that wrote a file has not thereby been observed.
-fn wait_for_foreground(bus: &Bus, correlation: &str) -> Snapshot {
-    let deadline = Instant::now() + PATIENCE;
-    loop {
-        let snapshot = bus.snapshot();
-        let observed = snapshot
-            .foreground
-            .as_deref()
-            .expect("this daemon is not watching a process table");
-        if observed
-            .iter()
-            .any(|entry| entry.correlation == correlation)
-        {
-            return snapshot;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "nothing was ever observed for {correlation}: {observed:?}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
 }
 
 /// The rows `agentbus foreground` printed, without the headings.
@@ -198,7 +44,7 @@ fn what_is_running_in_front_of_a_correlated_shell_is_in_the_snapshot() {
     let tree = one_shell_running_claude();
     let bus = Bus::watching(&tree.root());
 
-    let snapshot = wait_for_foreground(&bus, "w9:p3");
+    let snapshot = bus.wait_for_foreground("w9:p3");
 
     let entry = foreground_of(&snapshot, "w9:p3");
     assert_eq!(entry.pid, 200);
@@ -216,7 +62,7 @@ fn what_is_running_in_front_of_a_correlated_shell_is_in_the_snapshot() {
 fn a_command_replacing_another_is_one_line_on_the_stream() {
     let tree = one_shell_running_claude();
     let bus = Bus::watching(&tree.root());
-    wait_for_foreground(&bus, "w9:p3");
+    bus.wait_for_foreground("w9:p3");
     let mut subscriber = bus.subscribe();
     subscriber.snapshot();
 
@@ -242,7 +88,7 @@ fn a_command_replacing_another_is_one_line_on_the_stream() {
 fn a_foreground_that_ends_is_withdrawn_rather_than_left_standing() {
     let tree = one_shell_running_claude();
     let bus = Bus::watching(&tree.root());
-    wait_for_foreground(&bus, "w9:p3");
+    bus.wait_for_foreground("w9:p3");
     let mut subscriber = bus.subscribe();
     subscriber.snapshot();
 
@@ -263,7 +109,7 @@ fn a_foreground_that_ends_is_withdrawn_rather_than_left_standing() {
 fn a_foreground_that_does_not_change_is_never_mentioned_again() {
     let tree = one_shell_running_claude();
     let bus = Bus::watching(&tree.root());
-    wait_for_foreground(&bus, "w9:p3");
+    bus.wait_for_foreground("w9:p3");
 
     let mut subscriber = bus.subscribe();
     subscriber.snapshot();
@@ -279,7 +125,7 @@ fn a_foreground_that_does_not_change_is_never_mentioned_again() {
 fn the_command_prints_a_row_for_what_it_can_see() {
     let tree = one_shell_running_claude();
     let bus = Bus::watching(&tree.root());
-    wait_for_foreground(&bus, "w9:p3");
+    bus.wait_for_foreground("w9:p3");
 
     let printed = bus.run(&["foreground"]);
 
@@ -315,8 +161,8 @@ fn a_correlation_is_filtered_by_exactly_the_string_it_was_given() {
     tree.write(&shell(101, "w9:p4", 201));
     tree.write(&running(201, "vim", vec!["vim"]));
     let bus = Bus::watching(&tree.root());
-    wait_for_foreground(&bus, "w9:p3");
-    wait_for_foreground(&bus, "w9:p4");
+    bus.wait_for_foreground("w9:p3");
+    bus.wait_for_foreground("w9:p4");
 
     let printed = bus.run(&["foreground", "--correlation", "w9:p3"]);
 
@@ -331,7 +177,7 @@ fn a_correlation_is_filtered_by_exactly_the_string_it_was_given() {
 fn a_correlation_nothing_is_running_in_is_reported_by_the_exit_code_alone() {
     let tree = one_shell_running_claude();
     let bus = Bus::watching(&tree.root());
-    wait_for_foreground(&bus, "w9:p3");
+    bus.wait_for_foreground("w9:p3");
 
     let printed = bus
         .command(&["foreground", "--correlation", "w9:p3 "])
@@ -346,7 +192,7 @@ fn a_correlation_nothing_is_running_in_is_reported_by_the_exit_code_alone() {
 fn the_json_is_the_entries_one_to_a_line() {
     let tree = one_shell_running_claude();
     let bus = Bus::watching(&tree.root());
-    wait_for_foreground(&bus, "w9:p3");
+    bus.wait_for_foreground("w9:p3");
 
     let printed = bus.run(&["foreground", "--json"]);
 

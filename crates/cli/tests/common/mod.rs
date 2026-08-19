@@ -15,6 +15,8 @@
 
 #![allow(dead_code)]
 
+pub mod tree;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
@@ -93,21 +95,28 @@ impl Bus {
     /// whatever about the foreground, so what these tests read on the stream is
     /// what they themselves put into it, on any machine.
     pub fn start() -> Self {
-        Self::started(None)
+        Self::started(None, &[])
     }
 
     /// Starts a daemon watching the process table under `proc_root`.
     pub fn watching(proc_root: &Path) -> Self {
-        Self::started(Some(proc_root))
+        Self::started(Some(proc_root), &[])
+    }
+
+    /// The same, with `settings` handed to the daemon as well, for a test whose
+    /// subject is a timeout it would otherwise have to wait out.
+    pub fn watching_with(proc_root: &Path, settings: &[&str]) -> Self {
+        Self::started(Some(proc_root), settings)
     }
 
     /// Starts a daemon on a fresh directory and returns once both of its sockets
     /// answer, so that a test never races the thing it is about to talk to.
-    fn started(proc_root: Option<&Path>) -> Self {
+    fn started(proc_root: Option<&Path>, settings: &[&str]) -> Self {
         let temp = tempfile::tempdir().expect("cannot make a temporary directory");
         let dir = temp.path().join("bus");
         let unreadable = temp.path().join("no-process-table");
         let daemon = command(&dir, &["daemon"])
+            .args(settings)
             .env(
                 "AGENTBUS_PROC_ROOT",
                 proc_root.unwrap_or(unreadable.as_path()),
@@ -160,7 +169,21 @@ impl Bus {
     /// The client's contract is checked on the way past, because every call in
     /// every test is another sample of it: nothing on stdout, and a zero exit.
     pub fn emit(&self, agent: &str, pane: Option<&str>, payload: &[u8]) -> Output {
-        let mut command = self.command(&["emit", "--agent", agent]);
+        self.sent(&["--agent", agent], pane, payload)
+    }
+
+    /// Sends one observation, the way a program that was watching a terminal
+    /// does. An observation states for itself what it was watching, so there is
+    /// no pane in the environment to set.
+    pub fn observe(&self, payload: &[u8]) -> Output {
+        self.sent(&["--source", "observed"], None, payload)
+    }
+
+    /// Runs one `emit`, whatever it is being told to send.
+    fn sent(&self, what: &[&str], pane: Option<&str>, payload: &[u8]) -> Output {
+        let mut args = vec!["emit"];
+        args.extend_from_slice(what);
+        let mut command = self.command(&args);
         command.stdin(Stdio::piped());
         if let Some(pane) = pane {
             command.env("AGENTBUS_PANE", pane);
@@ -211,6 +234,34 @@ impl Bus {
                 snapshot.sessions
             );
             std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Waits until the bus reports an observation for `correlation`, and returns
+    /// the snapshot that says so.
+    ///
+    /// Something has to wait here too: the daemon looks at the process table on
+    /// its own schedule, and a test that wrote a file has not thereby been
+    /// observed.
+    pub fn wait_for_foreground(&self, correlation: &str) -> Snapshot {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let snapshot = self.snapshot();
+            let observed = snapshot
+                .foreground
+                .as_deref()
+                .expect("this daemon is not watching a process table");
+            if observed
+                .iter()
+                .any(|entry| entry.correlation == correlation)
+            {
+                return snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "nothing was ever observed for {correlation}: {observed:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 

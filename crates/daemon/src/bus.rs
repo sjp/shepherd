@@ -23,18 +23,27 @@
 //! An observation is numbered from the same counter as an event and published
 //! from under the same lock, so the stream a subscriber reads has one order in
 //! it rather than two that have to be reconciled.
+//!
+//! Holding both halves is also what lets this say that a session is over. A
+//! session that speaks from a terminal something is being watched in is bound to
+//! that process, and the end of the process ends the session — definitively,
+//! whatever the agent did or did not manage to say on its way out. That is only
+//! ever done from a positive observation: a session nothing was ever seen
+//! running for is left alone rather than guessed at, because a status guessed
+//! wrong here reads exactly like one that was reported.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Mutex, PoisonError};
 
 use agentbus_protocol::{
-    Event, ForegroundChange, ForegroundEntry, SessionEntry, SessionTable, Snapshot, Timestamp,
-    UnstampedEvent,
+    Event, ForegroundChange, ForegroundEntry, ForegroundState, OriginHop, SessionEntry, SessionKey,
+    SessionStatus, SessionTable, Snapshot, Timestamp, UnstampedEvent,
 };
 use serde_json::Value;
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
+use crate::binding::{Bind, Bindings};
 use crate::clock;
 use crate::foreground::Transition;
 use crate::procfs::Pid;
@@ -89,6 +98,9 @@ struct State {
     /// Two shells may carry one correlation, and they are two answers to one
     /// question rather than one answer twice, so the shell is part of the key.
     foreground: Option<BTreeMap<(String, Pid), ForegroundEntry>>,
+    /// The process each session was last seen speaking from, for as long as both
+    /// of them are still there.
+    bindings: Bindings,
 }
 
 impl Default for Bus {
@@ -112,6 +124,7 @@ impl Bus {
                 seq: 0,
                 recent: VecDeque::with_capacity(RECENT_EVENTS),
                 foreground: None,
+                bindings: Bindings::new(),
             }),
             events,
         }
@@ -142,6 +155,10 @@ impl Bus {
     /// somebody's coding agent and cannot be told about it, and a daemon that
     /// stopped ingesting because one client sent nonsense would be trading every
     /// other session's status for a message nobody reads.
+    ///
+    /// An event is also where a session is bound to the process it is speaking
+    /// from, because an event is the only moment the two are known to be the
+    /// same thing: whatever is in front of that terminal now is what just spoke.
     pub fn ingest(&self, line: &[u8]) -> Option<Event> {
         let (mut event, reported_ts) = match parse(line) {
             Ok(parsed) => parsed,
@@ -165,6 +182,7 @@ impl Bus {
                     "an event's origin disagrees with the chain this session was first seen with"
                 );
             }
+            state.bind(&event);
             if state.recent.len() == RECENT_EVENTS {
                 state.recent.pop_front();
             }
@@ -184,7 +202,15 @@ impl Bus {
     /// Moves every session's clock forward, so that a session that has gone
     /// quiet becomes stale and one that is over is eventually forgotten.
     pub fn tick(&self, now: &Timestamp) {
-        self.lock().table.tick(now);
+        let mut state = self.lock();
+        state.table.tick(now);
+        let State {
+            table, bindings, ..
+        } = &mut *state;
+        // A session the table has dropped can never be told anything again, and
+        // its binding would otherwise be a row this daemon keeps for as long as
+        // it runs.
+        bindings.retain(|key| table.get(key).is_some());
     }
 
     /// Records what a foreground monitor saw, publishes a line for each change,
@@ -201,38 +227,45 @@ impl Bus {
     /// two halves of a subscription agree: a subscriber that applies the lines
     /// it reads to the snapshot it started with arrives at exactly this table.
     ///
-    /// The pids that ended are returned rather than acted on. What the end of a
-    /// process means for a session that was running under it is the fold's
-    /// business, and this is the only place that hears about it.
+    /// A pid that ended takes every session bound to it with it. That is the
+    /// one thing in this system that is certain rather than inferred — the
+    /// process is not in the table, so nothing is going to be reported from it
+    /// again — and it is why a killed agent reaches `done` without ever having
+    /// said so. The pids are returned as well, for a caller that wants to say
+    /// what it saw.
     pub fn observed(&self, transitions: &[Transition], now: &Timestamp) -> Vec<Pid> {
         let gone: Vec<Pid> = transitions
             .iter()
             .filter_map(|change| change.gone)
             .collect();
         let mut state = self.lock();
-        let State {
-            seq, foreground, ..
-        } = &mut *state;
-        // Nothing is watching, so there is nothing to report and nothing that
-        // could have produced a transition in the first place.
-        let Some(table) = foreground.as_mut() else {
-            return gone;
-        };
-
-        for transition in transitions {
-            *seq += 1;
-            let key = (transition.correlation.clone(), transition.shell);
-            let line = match &transition.foreground {
-                Some(entry) => {
-                    table.insert(key, entry.clone());
-                    ForegroundChange::observed(*seq, now.clone(), entry.clone())
+        {
+            let State {
+                seq, foreground, ..
+            } = &mut *state;
+            // Nothing is watching, so there is nothing to report — and nothing
+            // that could have produced a transition in the first place, nor a
+            // binding for one to end.
+            if let Some(table) = foreground.as_mut() {
+                for transition in transitions {
+                    *seq += 1;
+                    let key = (transition.correlation.clone(), transition.shell);
+                    let line = match &transition.foreground {
+                        Some(entry) => {
+                            table.insert(key, entry.clone());
+                            ForegroundChange::observed(*seq, now.clone(), entry.clone())
+                        }
+                        None => {
+                            table.remove(&key);
+                            ForegroundChange::withdrawn(*seq, now.clone(), &transition.correlation)
+                        }
+                    };
+                    let _ = self.events.send(Published::Foreground(line));
                 }
-                None => {
-                    table.remove(&key);
-                    ForegroundChange::withdrawn(*seq, now.clone(), &transition.correlation)
-                }
-            };
-            let _ = self.events.send(Published::Foreground(line));
+            }
+        }
+        for pid in &gone {
+            state.reap(*pid, now);
         }
         gone
     }
@@ -281,6 +314,18 @@ impl Bus {
             .map(|table| table.values().cloned().collect())
     }
 
+    /// The process a session is currently bound to, if it has been seen
+    /// speaking from one.
+    ///
+    /// Nothing this daemon serves reports a binding: it is an internal join
+    /// between a session and a row of the process table, and it changes nothing
+    /// a subscriber can see except the moment a session becomes `done`. It is
+    /// readable because a binding that is never observable is a rule that can
+    /// only be tested through its consequences.
+    pub fn bound_to(&self, key: &SessionKey) -> Option<Pid> {
+        self.lock().bindings.pid_of(key)
+    }
+
     /// The events still in the recent buffer, oldest first.
     pub fn recent(&self) -> Vec<Event> {
         self.lock().recent.iter().cloned().collect()
@@ -294,6 +339,117 @@ impl Bus {
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+impl State {
+    /// Binds the session an event belongs to to the process the event was
+    /// spoken from, where the process table says what that is.
+    ///
+    /// The correlation is the event's own rather than the session's: it is what
+    /// the emitter carried this time, and a session that moved to another
+    /// terminal is speaking from a different process now. Nothing here parses
+    /// it — the value is compared with `==` against what a shell exported, and
+    /// that is the whole of the matching.
+    fn bind(&mut self, event: &Event) {
+        let Some(correlation) = event
+            .correlation
+            .as_deref()
+            .filter(|correlation| !correlation.is_empty())
+        else {
+            return;
+        };
+        let Some(foreground) = &self.foreground else {
+            return;
+        };
+        let Some(pid) = tracked(foreground, correlation, &event.origin) else {
+            return;
+        };
+
+        let key = SessionKey::of(event);
+        match self.bindings.bind(&key, pid) {
+            Bind::Unchanged => {}
+            Bind::Bound => debug!(
+                agent = %key.agent,
+                session = %key.session,
+                pid,
+                "a session is running as the process in front of the terminal it spoke from"
+            ),
+            Bind::Rebound { from } => debug!(
+                agent = %key.agent,
+                session = %key.session,
+                pid,
+                previous = from,
+                "a session spoke from a terminal something else is now running in"
+            ),
+        }
+    }
+
+    /// Ends every session bound to a process that has left the process table.
+    ///
+    /// A session that is already over is left where it is, so that the moment it
+    /// finished stays the moment it finished and its retention is not extended
+    /// by its terminal outliving it.
+    fn reap(&mut self, pid: Pid, now: &Timestamp) {
+        for key in self.bindings.release(pid) {
+            let over = self
+                .table
+                .get(&key)
+                .is_none_or(|session| session.state.status == SessionStatus::Done);
+            if over {
+                continue;
+            }
+            self.table.process_gone(&key, now);
+            debug!(
+                agent = %key.agent,
+                session = %key.session,
+                pid,
+                "the process a session was running as has left the process table"
+            );
+        }
+    }
+}
+
+/// The process to follow for a session that spoke with `correlation` from
+/// `origin`, where the observations say what that is beyond doubt.
+///
+/// Beyond doubt is the whole of it. Two shells may carry one correlation, and
+/// then two processes are in front of two terminals a session might have spoken
+/// from; binding to either would be a guess, and a guess here ends a session
+/// that is still running. So an answer is given only where every observation
+/// agrees on it.
+///
+/// The origin decides which daemon's process table an observation belongs to, so
+/// a session whose events crossed a boundary is matched against observations
+/// made on the far side of that same boundary and never against a nearer view of
+/// the connection itself. A hop's `name` is a display string that several ids
+/// may share, and takes no part in it.
+fn tracked(
+    foreground: &BTreeMap<(String, Pid), ForegroundEntry>,
+    correlation: &str,
+    origin: &[OriginHop],
+) -> Option<Pid> {
+    let mut running = foreground
+        .values()
+        .filter(|entry| entry.correlation == correlation && same_path(&entry.origin, origin))
+        .filter(|entry| {
+            matches!(
+                entry.state,
+                Some(ForegroundState::Foreground | ForegroundState::Suspended)
+            )
+        })
+        .filter_map(|entry| Pid::try_from(entry.pid).ok());
+    let first = running.next()?;
+    running.all(|pid| pid == first).then_some(first)
+}
+
+/// Whether two chains of hops lead to the same place. `name` is display only and
+/// is not compared.
+fn same_path(left: &[OriginHop], right: &[OriginHop]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.kind == right.kind && left.id == right.id)
 }
 
 /// Reads one line as an event, along with the timestamp it reported if that
@@ -317,7 +473,7 @@ fn parse(line: &[u8]) -> Result<(UnstampedEvent, Option<Timestamp>), serde_json:
 mod tests {
     use super::*;
 
-    use agentbus_protocol::{Agent, ForegroundState, Kind, OriginHop, SessionStatus, Source};
+    use agentbus_protocol::{Agent, Kind, Source, observed_session_id};
     use serde_json::json;
 
     /// A bus that is watching a process table, as one with a monitor behind it
@@ -362,6 +518,39 @@ mod tests {
 
     fn tool_start() -> Value {
         json!({"v": 1, "agent": "claude", "session": "abc123", "kind": "tool_start"})
+    }
+
+    /// The same, for a process that is alive but no longer holds the terminal.
+    fn backgrounded(correlation: &str, shell: Pid, pid: u32, process: &str) -> Transition {
+        let mut transition = appeared(correlation, shell, pid, process);
+        if let Some(entry) = transition.foreground.as_mut() {
+            entry.state = Some(ForegroundState::Suspended);
+        }
+        transition
+    }
+
+    /// A line from `session`, carrying `correlation` where the emitter had one.
+    fn spoke(session: &str, correlation: Option<&str>) -> Vec<u8> {
+        let mut event = tool_start();
+        event["session"] = json!(session);
+        if let Some(correlation) = correlation {
+            event["correlation"] = json!(correlation);
+        }
+        line(&event)
+    }
+
+    fn key(session: &str) -> SessionKey {
+        SessionKey::new("claude", session)
+    }
+
+    /// What the bus says about one session, which it was expected to know.
+    fn status(bus: &Bus, session: &str) -> SessionStatus {
+        let sessions = bus.sessions();
+        sessions
+            .iter()
+            .find(|entry| entry.session == session)
+            .unwrap_or_else(|| panic!("{session} is not in {sessions:?}"))
+            .status
     }
 
     #[test]
@@ -628,6 +817,225 @@ mod tests {
 
         let (snapshot, _) = Bus::new().observing().subscribe();
         assert_eq!(snapshot.foreground, Some(Vec::new()));
+    }
+
+    #[test]
+    fn an_event_binds_its_session_to_what_is_running_in_front_of_its_terminal() {
+        let bus = watching();
+        bus.observed(&[appeared("w9:p3", 100, 4471, "claude")], &now());
+
+        bus.ingest(&spoke("abc123", Some("w9:p3")));
+
+        assert_eq!(bus.bound_to(&key("abc123")), Some(4471));
+    }
+
+    #[test]
+    fn a_process_that_ends_takes_every_session_bound_to_it_with_it() {
+        let bus = watching();
+        bus.observed(&[appeared("w9:p3", 100, 4471, "claude")], &now());
+        bus.ingest(&spoke("abc123", Some("w9:p3")));
+        bus.ingest(&spoke("sub456", Some("w9:p3")));
+
+        bus.observed(&[withdrawn("w9:p3", 100, Some(4471))], &now());
+
+        assert_eq!(status(&bus, "abc123"), SessionStatus::Done);
+        assert_eq!(status(&bus, "sub456"), SessionStatus::Done);
+        assert_eq!(bus.bound_to(&key("abc123")), None);
+        assert_eq!(bus.bound_to(&key("sub456")), None);
+    }
+
+    #[test]
+    fn a_session_is_reaped_without_anything_having_reported_it_over() {
+        let bus = watching();
+        bus.observed(&[appeared("w9:p3", 100, 4471, "claude")], &now());
+        bus.ingest(&spoke("abc123", Some("w9:p3")));
+        let published = bus.recent().len();
+
+        bus.observed(&[withdrawn("w9:p3", 100, Some(4471))], &now());
+
+        assert_eq!(status(&bus, "abc123"), SessionStatus::Done);
+        assert_eq!(
+            bus.recent().len(),
+            published,
+            "an event was invented to end the session"
+        );
+    }
+
+    #[test]
+    fn a_process_that_was_suspended_keeps_its_session() {
+        let bus = watching();
+        bus.observed(&[appeared("w9:p3", 100, 4471, "claude")], &now());
+        bus.ingest(&spoke("abc123", Some("w9:p3")));
+
+        // Suspended is a positive observation of a live process: it stops
+        // holding the terminal and goes on existing.
+        bus.observed(&[backgrounded("w9:p3", 100, 4471, "claude")], &now());
+        bus.ingest(&spoke("abc123", Some("w9:p3")));
+
+        assert_eq!(bus.bound_to(&key("abc123")), Some(4471));
+        assert_eq!(status(&bus, "abc123"), SessionStatus::Working);
+    }
+
+    #[test]
+    fn a_session_that_was_never_seen_running_is_never_reaped() {
+        let bus = watching();
+        bus.ingest(&spoke("abc123", Some("w9:p3")));
+        assert_eq!(bus.bound_to(&key("abc123")), None);
+
+        bus.observed(&[withdrawn("w9:p3", 100, Some(4471))], &now());
+
+        assert_eq!(
+            status(&bus, "abc123"),
+            SessionStatus::Working,
+            "a session nothing was ever observed for was ended anyway"
+        );
+    }
+
+    #[test]
+    fn a_session_that_named_no_terminal_is_never_bound() {
+        let bus = watching();
+        bus.observed(&[appeared("w9:p3", 100, 4471, "claude")], &now());
+
+        bus.ingest(&spoke("abc123", None));
+        bus.ingest(&spoke("empty", Some("")));
+
+        assert_eq!(bus.bound_to(&key("abc123")), None);
+        assert_eq!(bus.bound_to(&key("empty")), None);
+        bus.observed(&[withdrawn("w9:p3", 100, Some(4471))], &now());
+        assert_eq!(status(&bus, "abc123"), SessionStatus::Working);
+        assert_eq!(status(&bus, "empty"), SessionStatus::Working);
+    }
+
+    #[test]
+    fn a_session_nobody_reported_an_id_for_is_bound_and_reaped_like_any_other() {
+        let bus = watching();
+        bus.observed(&[appeared("w9:p3", 100, 4471, "claude")], &now());
+        let mut event = tool_start();
+        event["agent"] = json!(Agent::UNKNOWN);
+        event["session"] = json!(observed_session_id("w9:p3"));
+        event["source"] = json!("observed");
+        event["correlation"] = json!("w9:p3");
+        bus.ingest(&line(&event));
+        let observed = SessionKey::new(Agent::UNKNOWN, observed_session_id("w9:p3"));
+        assert_eq!(bus.bound_to(&observed), Some(4471));
+
+        bus.observed(&[withdrawn("w9:p3", 100, Some(4471))], &now());
+
+        assert_eq!(
+            status(&bus, &observed_session_id("w9:p3")),
+            SessionStatus::Done
+        );
+    }
+
+    #[test]
+    fn a_session_binds_to_whatever_is_running_when_it_last_spoke() {
+        let bus = watching();
+        bus.observed(&[appeared("w9:p3", 100, 4471, "claude")], &now());
+        bus.ingest(&spoke("abc123", Some("w9:p3")));
+
+        bus.observed(&[appeared("w9:p3", 100, 5512, "claude")], &now());
+        bus.ingest(&spoke("abc123", Some("w9:p3")));
+        assert_eq!(bus.bound_to(&key("abc123")), Some(5512));
+
+        bus.observed(&[withdrawn("w9:p3", 100, Some(4471))], &now());
+        assert_eq!(
+            status(&bus, "abc123"),
+            SessionStatus::Working,
+            "the process the session had left ended it"
+        );
+
+        bus.observed(&[withdrawn("w9:p3", 100, Some(5512))], &now());
+        assert_eq!(status(&bus, "abc123"), SessionStatus::Done);
+    }
+
+    #[test]
+    fn a_terminal_two_shells_answer_for_binds_nothing() {
+        let bus = watching();
+        bus.observed(
+            &[
+                appeared("w9:p3", 100, 4471, "claude"),
+                appeared("w9:p3", 200, 5512, "claude"),
+            ],
+            &now(),
+        );
+
+        bus.ingest(&spoke("abc123", Some("w9:p3")));
+
+        assert_eq!(
+            bus.bound_to(&key("abc123")),
+            None,
+            "one of two possible processes was picked"
+        );
+    }
+
+    #[test]
+    fn an_observation_made_somewhere_else_does_not_bind_a_session_from_here() {
+        let bus = watching();
+        let mut transition = appeared("w9:p3", 100, 4471, "claude");
+        if let Some(entry) = transition.foreground.as_mut() {
+            entry.origin = vec![OriginHop::new(OriginHop::SSH, "9f3c:1000", "fileserver")];
+        }
+        bus.observed(&[transition], &now());
+
+        // The event crossed nothing to get here, so the process it names is a
+        // process on this machine, and the one that was observed is not.
+        bus.ingest(&spoke("abc123", Some("w9:p3")));
+
+        assert_eq!(bus.bound_to(&key("abc123")), None);
+    }
+
+    #[test]
+    fn a_bus_that_is_not_watching_binds_nothing() {
+        let bus = Bus::new();
+
+        bus.ingest(&spoke("abc123", Some("w9:p3")));
+        bus.observed(&[withdrawn("w9:p3", 100, Some(4471))], &now());
+
+        assert_eq!(bus.bound_to(&key("abc123")), None);
+        assert_eq!(status(&bus, "abc123"), SessionStatus::Working);
+    }
+
+    #[test]
+    fn a_session_that_had_already_finished_is_left_where_it_was() {
+        let bus = watching();
+        bus.observed(&[appeared("w9:p3", 100, 4471, "claude")], &now());
+        let mut ended = tool_start();
+        ended["kind"] = json!("session_end");
+        ended["correlation"] = json!("w9:p3");
+        ended["ts"] = json!("2026-08-17T10:32:01.412Z");
+        bus.ingest(&line(&ended));
+        let finished = bus.sessions()[0].since.clone();
+
+        bus.observed(
+            &[withdrawn("w9:p3", 100, Some(4471))],
+            &at("2026-08-17T10:40:00.000Z"),
+        );
+
+        assert_eq!(status(&bus, "abc123"), SessionStatus::Done);
+        assert_eq!(
+            bus.sessions()[0].since,
+            finished,
+            "the moment the session finished moved when its terminal closed"
+        );
+    }
+
+    #[test]
+    fn a_session_the_table_has_forgotten_leaves_no_binding_behind() {
+        let bus = watching();
+        bus.observed(&[appeared("w9:p3", 100, 4471, "claude")], &now());
+        // The session says it is over itself, so its binding outlives it: the
+        // process it was running as is still there, running something else.
+        let mut ended = tool_start();
+        ended["kind"] = json!("session_end");
+        ended["correlation"] = json!("w9:p3");
+        ended["ts"] = json!("2026-08-17T10:32:01.412Z");
+        bus.ingest(&line(&ended));
+        assert_eq!(bus.bound_to(&key("abc123")), Some(4471));
+
+        bus.tick(&at("2026-08-17T12:00:00.000Z"));
+
+        assert!(bus.sessions().is_empty(), "the session was still reported");
+        assert_eq!(bus.bound_to(&key("abc123")), None);
     }
 
     #[test]
