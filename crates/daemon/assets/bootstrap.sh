@@ -2,6 +2,7 @@
 # this machine is so that one can be put here.
 #
 #   sh -s -- <version> <command...>
+#   sh -s -- <version>
 #
 # The candidates are the places a person's own installation plausibly lives,
 # tried before anything is written: finding a copy is cheaper and far less
@@ -14,8 +15,17 @@
 # them is ever executed. It is also what makes provisioning idempotent — a far
 # end that is already current costs this one round-trip and no writes.
 #
+# With no command to run, the search is the whole point: the accepted candidate
+# is named on stdout as `found=<path>` and nothing is executed. That is what
+# somebody asking "is a copy already here, and where" gets, as against somebody
+# who wants one to take over the connection.
+#
 # Exit 42 means "nothing here is right"; the line before it names the operating
-# system and architecture, which is what decides the binary to send.
+# system and architecture, which is what decides the binary to send. Whatever was
+# passed over on the way there is named on stderr, one `other=<path><tab><what it
+# said>` per candidate, so that a caller about to write can say which
+# installations it is leaving alone. It goes to stderr because stdout belongs to
+# whatever takes the connection over.
 
 set -eu
 ver="$1"
@@ -28,8 +38,12 @@ for cand in ${AGENTBUS_REMOTE_BINARY:-} \
             "$HOME/.nix-profile/bin/agentbus" \
             "/tmp/agentbus-$ver"; do
   [ -n "$cand" ] && [ -x "$cand" ] || continue
-  [ "$("$cand" --version 2>/dev/null)" = "agentbus $ver" ] || continue
-  exec "$cand" "$@"
+  said=$("$cand" --version 2>/dev/null || true)
+  if [ "$said" = "agentbus $ver" ]; then
+    [ "$#" -gt 0 ] || { echo "found=$cand"; exit 0; }
+    exec "$cand" "$@"
+  fi
+  printf 'other=%s\t%s\n' "$cand" "$(printf '%s' "$said" | head -n 1)" >&2
 done
 echo "need=$(uname -s)/$(uname -m)"
 exit 42

@@ -233,27 +233,7 @@ impl Bootstrap {
             Attempt::Needs(platform) => platform,
         };
 
-        let triple = platform.triple().ok_or_else(|| Error::UnknownPlatform {
-            label: label.clone(),
-            platform: platform.clone(),
-        })?;
-
-        // Sending what is already here needs no network and no release to have
-        // been published, so it is preferred wherever the far end could run it;
-        // fetching is for the far ends this machine simply does not contain.
-        let local = match platform.runs(&self.target) {
-            true => self.here(&label)?,
-            false => self
-                .release
-                .binary(triple)
-                .map_err(|source| Error::NoBinaryFor {
-                    label: label.clone(),
-                    triple: triple.to_owned(),
-                    target: self.target.clone(),
-                    version: self.version.clone(),
-                    source: Box::new(source),
-                })?,
-        };
+        let local = self.supply(&label, &platform)?;
         let remote = transport.install_path(&self.version);
         info!(
             endpoint = label,
@@ -278,6 +258,37 @@ impl Bootstrap {
                 path: remote,
                 version: self.version.clone(),
             }),
+        }
+    }
+
+    /// A copy of this program that a machine like `platform` can run, ready to
+    /// be sent to one.
+    ///
+    /// Sending what is already here needs no network and no release to have
+    /// been published, so it is preferred wherever the far end could run it;
+    /// fetching is for the far ends this machine simply does not contain.
+    ///
+    /// Exposed because where a copy is *put* is a policy of whoever is doing
+    /// the putting — a throwaway path for an endpoint that will be rebuilt, a
+    /// permanent one for a machine somebody keeps — while which copy to send is
+    /// the same question every time.
+    pub fn supply(&self, label: &str, platform: &Platform) -> Result<PathBuf, Error> {
+        let triple = platform.triple().ok_or_else(|| Error::UnknownPlatform {
+            label: label.to_owned(),
+            platform: platform.clone(),
+        })?;
+        match platform.runs(&self.target) {
+            true => self.here(label),
+            false => self
+                .release
+                .binary(triple)
+                .map_err(|source| Error::NoBinaryFor {
+                    label: label.to_owned(),
+                    triple: triple.to_owned(),
+                    target: self.target.clone(),
+                    version: self.version.clone(),
+                    source: Box::new(source),
+                }),
         }
     }
 

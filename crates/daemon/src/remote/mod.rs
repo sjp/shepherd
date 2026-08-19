@@ -18,6 +18,11 @@
 //! protecting: another kind of endpoint should be a new implementation of one
 //! trait and nothing else.
 //!
+//! [`Provision`] is the same job with the opposite policy, for the far ends
+//! that are somebody's own machine rather than something rebuilt from an image:
+//! one permanent copy, written only where this program has a record of having
+//! written before, and nothing else touched unless it was asked for.
+//!
 //! # What reaching an endpoint does not mean
 //!
 //! Every connection here is made outward, by this daemon, to something that
@@ -82,6 +87,7 @@ pub mod attachments;
 pub mod bootstrap;
 pub mod discover;
 pub mod docker;
+pub mod provision;
 pub mod reconcile;
 pub mod release;
 pub mod ssh;
@@ -100,6 +106,7 @@ pub use attach::Attachment;
 pub use attachments::Attachments;
 pub use bootstrap::{Bootstrap, SCRIPT, TARGET};
 pub use discover::{Discovery, Found};
+pub use provision::Provision;
 pub use reconcile::{Plan, Reconciling};
 pub use release::Release;
 pub use targets::{Target, Targets};

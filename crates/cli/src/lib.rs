@@ -35,12 +35,16 @@ use std::ffi::OsString;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agentbus_daemon::remote::attachments::Attachments;
 use agentbus_daemon::remote::bootstrap::Bootstrap;
 use agentbus_daemon::remote::docker::Docker;
-use agentbus_daemon::remote::targets::{CONFIG_DIR_VAR, DOCKER, Targets};
+use agentbus_daemon::remote::provision::{Hooks, Provision};
+use agentbus_daemon::remote::ssh;
+use agentbus_daemon::remote::targets::{CONFIG_DIR_VAR, DOCKER, SSH, Targets};
+use agentbus_daemon::remote::transport::Transport;
 use agentbus_daemon::{Daemon, Settings, SocketPaths, clock, paths::DIR_VAR};
 use agentbus_install::{Agent, Environment, Mode, UnknownAgent};
 use agentbus_protocol::ForegroundEntry;
@@ -100,6 +104,21 @@ const ATTACH: &str = "agentbus attach";
 const DETACH: &str = "agentbus detach";
 const TARGETS: &str = "agentbus targets";
 
+/// What is said after a machine has been provisioned and its agents have been
+/// left alone, which is what happens unless somebody asks for the other half.
+const UNTOUCHED: &str =
+    "the coding agents there were not touched; pass --with-hooks to wire them up";
+
+/// What is said after a failure nothing will retry its way out of.
+///
+/// Every connection this makes is asked for with `BatchMode`, so ssh fails
+/// rather than prompting: a command that sat waiting for a passphrase nobody is
+/// there to type would be worse than one that says so. What to do about it is
+/// the same thing whichever credential is missing — open the connection by hand
+/// once, and let the multiplexed connection that leaves behind carry this.
+const ATTENTION: &str = "if that machine wants a passphrase or a confirmation, \
+                         connect to it by hand once with the same words and run this again";
+
 /// How long `--recent` follows the stream when it is given no number.
 ///
 /// Long enough to catch the event someone is waiting to see, short enough that
@@ -128,7 +147,7 @@ enum Command {
     Foreground(ForegroundArgs),
     /// Read a payload on stdin, normalize it, and send it to the bus.
     Emit(EmitArgs),
-    /// Put the hooks that emit events into the coding agents on this machine, or into a container.
+    /// Put the hooks that emit events into the coding agents on this machine, or put this program somewhere that is not it.
     Install(InstallArgs),
     /// Take those hooks back out again.
     Uninstall(InstallArgs),
@@ -345,6 +364,49 @@ enum Endpoint {
     /// A container on this machine: put a copy of this program in it, wire up
     /// whichever agents are in there, and keep it attached
     Docker(ContainerArgs),
+    /// A machine reached over ssh: install a copy of this program on it, or
+    /// take it back off, leaving everything else on it alone unless asked
+    Ssh(HostArgs),
+}
+
+/// Which machine, and how much of it to touch.
+#[derive(Debug, Args)]
+struct HostArgs {
+    #[command(flatten)]
+    config: Config,
+
+    /// Also wire up the coding agents on that machine, or take that wiring back out
+    #[arg(long)]
+    with_hooks: bool,
+
+    /// The words that would reach the machine with ssh, after `--`
+    #[arg(
+        value_name = "ARGS",
+        required = true,
+        num_args = 1..,
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+    )]
+    args: Vec<String>,
+}
+
+impl HostArgs {
+    /// The words to reach the machine with, without the separator that kept
+    /// this command's own options away from them.
+    fn words(&self) -> &[String] {
+        match self.args.first().map(String::as_str) {
+            Some("--") => &self.args[1..],
+            _ => &self.args,
+        }
+    }
+
+    /// Whether the agents on that machine are part of what was asked for.
+    fn hooks(&self) -> Hooks {
+        match self.with_hooks {
+            true => Hooks::Included,
+            false => Hooks::Untouched,
+        }
+    }
 }
 
 /// Which container, and where the declaration about it is kept.
@@ -754,6 +816,8 @@ fn elsewhere(args: &InstallArgs, direction: install::Direction) -> ExitCode {
     match (endpoint, direction) {
         (Endpoint::Docker(container), install::Direction::Install) => provision(container),
         (Endpoint::Docker(container), install::Direction::Uninstall) => strip(container),
+        (Endpoint::Ssh(host), install::Direction::Install) => settle(host),
+        (Endpoint::Ssh(host), install::Direction::Uninstall) => unsettle(host),
     }
 }
 
@@ -824,6 +888,108 @@ fn strip(args: &ContainerArgs) -> ExitCode {
         Ok(false) => said(UNINSTALL, &there),
         Err(error) => fail(UNINSTALL, &error),
     }
+}
+
+/// Installs a copy of this program on a machine reached over ssh.
+///
+/// Everything about this is the opposite of what a container gets, and for one
+/// reason: this is somebody's own machine. The copy is permanent, because
+/// re-sending it down a link that may be slow every time something reconnects
+/// is waste; it goes to one path and over nothing this program did not write;
+/// and the agents on that machine are left exactly as they are unless the
+/// command line says otherwise in so many words.
+///
+/// The machine is not declared here either. Declaring is `attach`, it is a
+/// separate decision, and somebody may well want a binary on a machine whose
+/// events they do not want merged into this bus.
+fn settle(args: &HostArgs) -> ExitCode {
+    let Some(host) = reached(INSTALL, args.words()) else {
+        return ExitCode::FAILURE;
+    };
+    let bootstrap = Bootstrap::new(agentbus_daemon::VERSION);
+    let mut out = std::io::stdout();
+    let code = match Provision::new(&bootstrap).install(host.as_ref(), args.hooks(), &mut out) {
+        // Said here rather than by the provisioning, because how to ask for the
+        // other half is this command line's business and not its.
+        Ok(()) if args.hooks() == Hooks::Untouched => said(INSTALL, UNTOUCHED),
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => refused(INSTALL, host.as_ref(), &error),
+    };
+    shared(host.as_ref());
+    code
+}
+
+/// Takes this program back off a machine reached over ssh.
+fn unsettle(args: &HostArgs) -> ExitCode {
+    let Some(host) = reached(UNINSTALL, args.words()) else {
+        return ExitCode::FAILURE;
+    };
+    let bootstrap = Bootstrap::new(agentbus_daemon::VERSION);
+    let mut out = std::io::stdout();
+    let code = match Provision::new(&bootstrap).uninstall(host.as_ref(), args.hooks(), &mut out) {
+        Ok(()) => remaining(args),
+        Err(error) => refused(UNINSTALL, host.as_ref(), &error),
+    };
+    shared(host.as_ref());
+    code
+}
+
+/// The machine those words reach, or nothing when they reach none — in which
+/// case what ssh made of them has been said.
+fn reached(context: &str, words: &[String]) -> Option<Arc<dyn Transport>> {
+    let resolver = ssh::Resolver::new();
+    let masters = ssh::Masters::resolve();
+    match ssh::Host::declared(words, &resolver, &masters) {
+        Ok(host) => Some(host),
+        Err(problem) => {
+            eprintln!("{context}: {problem}");
+            None
+        }
+    }
+}
+
+/// Lets go of the machine without closing the connection to it.
+///
+/// A daemon serving this machine keeps its multiplexed connections in the same
+/// place under the same names, which is what lets a command like this one reach
+/// a host without paying for an authentication. The other side of that bargain
+/// is that letting go here must not take down a connection something else is in
+/// the middle of using.
+fn shared(host: &dyn Transport) {
+    host.keep_open();
+}
+
+/// Reminds whoever asked that the machine is still declared, which is a
+/// different thing from having this program on it.
+fn remaining(args: &HostArgs) -> ExitCode {
+    let words = args.words();
+    let still = match args.config.targets().list() {
+        Ok(targets) => targets.iter().any(|target| target.is(SSH, words)),
+        // A declarations file that cannot be read says nothing about whether
+        // this machine is in it. This is a reminder rather than the thing that
+        // was asked for, and what was asked for has already happened.
+        Err(_) => false,
+    };
+    match still {
+        true => said(
+            UNINSTALL,
+            &format!(
+                "it is still declared: `agentbus detach -- {}` stops this bus attaching to it",
+                words.join(" ")
+            ),
+        ),
+        false => ExitCode::SUCCESS,
+    }
+}
+
+/// Reports why provisioning did not happen, and says the one thing the failure
+/// itself cannot: that this one needs a person.
+fn refused(context: &str, host: &dyn Transport, error: &dyn std::error::Error) -> ExitCode {
+    report(context, error);
+    if !host.recoverable(error) {
+        eprintln!("{context}: {ATTENTION}");
+    }
+    ExitCode::FAILURE
 }
 
 /// Declares an endpoint, so that whichever daemon serves this machine attaches

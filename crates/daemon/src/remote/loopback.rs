@@ -57,6 +57,11 @@ impl Loopback {
         self
     }
 
+    /// The far end's home directory, which is the whole of the far end.
+    pub fn home(&self) -> &Path {
+        self.root.path()
+    }
+
     /// The directory that comes first on the far end's `PATH`.
     pub fn bin(&self) -> PathBuf {
         self.root.path().join("bin")
@@ -101,12 +106,23 @@ impl Loopback {
     }
 
     /// The environment a command runs in over there.
+    ///
+    /// The far end is a machine with a home directory and nothing else said
+    /// about it. Every variable that would otherwise point a program at a
+    /// directory of this machine's — where a user's configuration is, where
+    /// their state goes, where a session's runtime files are — is taken away,
+    /// because a far end that quietly inherited one of those would be a test
+    /// writing into whoever is running it.
     fn environment(&self, command: &mut Command) {
         command
             .env("PATH", self.path())
             .env("HOME", self.root.path())
             .env("AGENTBUS_DIR", self.root.path().join("bus"))
-            .env_remove("AGENTBUS_REMOTE_BINARY");
+            .env_remove("AGENTBUS_REMOTE_BINARY")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_DATA_HOME")
+            .env_remove("XDG_STATE_HOME")
+            .env_remove("XDG_RUNTIME_DIR");
     }
 
     /// The far end's `PATH`: its own directory, then this machine's, so that the
