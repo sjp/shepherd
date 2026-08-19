@@ -41,7 +41,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -73,11 +73,33 @@ const INSTALL_DIR: &str = "/tmp";
 /// The prefix every copy this program writes onto a host shares.
 const INSTALL_PREFIX: &str = "agentbus-";
 
-/// The suffix a copy is written under before it is moved into place.
+/// The substring every partial write carries, wherever the rest of its name
+/// came from.
+///
+/// A sweep of [`INSTALL_DIR`] uses this to recognize an unfinished copy and
+/// leave it alone without knowing which attempt is writing it or how far it
+/// has got.
+const PARTIAL_MARK: &str = ".tmp.";
+
+/// A name for the file a copy is written under before it is moved into place,
+/// unique to this attempt.
 ///
 /// The move is a rename at the far end, which is atomic there, so nothing ever
-/// executes a file that is half of one.
-const PARTIAL: &str = ".tmp";
+/// executes a file that is half of one — but two hosts that turn out to be one
+/// endpoint, or two daemons provisioning it at once, would otherwise pour into
+/// the *same* half-written name and interleave. A process id and a counter
+/// that only grows are enough to make that impossible without asking the far
+/// end for anything or leaving a lock file behind: a lock is a name that
+/// outlives the write it guards whenever the write does not finish, and a
+/// later attempt that finds one has no way to tell "somebody is still writing"
+/// from "somebody was, and stopped" — which is exactly the deadlock a stale
+/// lock produces. A name nobody else will ever generate needs no such
+/// judgement call: it is either finished and moved, or abandoned and inert.
+fn partial(remote: &str) -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let attempt = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("{remote}{PARTIAL_MARK}{}.{attempt}", std::process::id())
+}
 
 /// How long to wait before reaching a host again after the last attempt broke.
 ///
@@ -191,6 +213,9 @@ pub struct Host {
     checked: Mutex<bool>,
     /// Whether it has been told to close.
     closed: AtomicBool,
+    /// Whether superseded copies at [`INSTALL_DIR`] have been cleared since
+    /// this host was made.
+    swept: AtomicBool,
 }
 
 impl Host {
@@ -243,6 +268,7 @@ impl Host {
             way_in: format!("{user}@{hostname}:{port}"),
             checked: Mutex::new(false),
             closed: AtomicBool::new(false),
+            swept: AtomicBool::new(false),
         }
     }
 
@@ -455,9 +481,13 @@ impl Transport for Host {
     /// `cat` rather than `scp` or `sftp` because both of those are a subsystem
     /// the far end may not have enabled, and a shell that can run `cat` is the
     /// least this transport can already assume — it is about to run a daemon
-    /// over there. The write lands beside the final name and is moved onto it,
-    /// so the path a hook may execute at any moment is either the previous copy
-    /// or the whole new one and never part of one.
+    /// over there. It is also one thing that can time out instead of two: a
+    /// transfer riding the connection this daemon is already holding open has
+    /// nothing separate left to hang, whereas a second subsystem is a second
+    /// place for a slow or half-open link to leave a copy stuck partway with
+    /// no sign of whether it is still coming. The write lands beside the final
+    /// name and is moved onto it, so the path a hook may execute at any moment
+    /// is either the previous copy or the whole new one and never part of one.
     ///
     /// The far end's shell parses this, so the paths are quoted and reach it
     /// exactly as they are written: nothing in them is expanded, and a `~` in
@@ -470,7 +500,7 @@ impl Transport for Host {
             remote: remote.to_owned(),
             source,
         })?;
-        let partial = format!("{remote}{PARTIAL}");
+        let partial = partial(remote);
         let script = format!(
             "mkdir -p {} && cat > {} && chmod +x {} && mv -f {} {}",
             quoted(holding(remote)),
@@ -484,6 +514,40 @@ impl Transport for Host {
         // having succeeded, because what matters is that the path is runnable
         // now, and only the machine it is on can say so.
         self.ran(&[&format!("test -x {}", quoted(remote))], None)
+    }
+
+    /// Clears every copy at `/tmp` this program put there that is not
+    /// `version`.
+    ///
+    /// A container is thrown away and rebuilt, so nothing left in it ever
+    /// matters again; a host reached over ssh is not, and is often one a
+    /// person merely has an account on rather than owns outright, so a copy
+    /// from every upgrade this daemon has ever made left sitting in `/tmp`
+    /// is exactly the kind of thing somebody notices against a disk quota
+    /// and cannot explain. Once per host is enough — nothing that happens
+    /// between one attach and the next changes what counts as superseded —
+    /// so a sweep that has already run is not asked to run again.
+    fn established(&self, version: &str) {
+        if self.swept.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let keep = self.install_path(version);
+        let script = format!(
+            "for f in {}/{}*; do case \"$f\" in \
+             {}) continue ;; \
+             *{}*) continue ;; \
+             esac; [ -e \"$f\" ] || continue; rm -f -- \"$f\"; done",
+            INSTALL_DIR,
+            INSTALL_PREFIX,
+            quoted(&keep),
+            PARTIAL_MARK,
+        );
+        // Housekeeping, not the thing that was asked for: an attachment that
+        // came up fine has nothing to gain from failing over a directory it
+        // could not tidy, so trouble here is logged and left at that.
+        if let Err(error) = self.ran(&[&script], None) {
+            debug!(host = self.label, %error, "cannot sweep superseded copies");
+        }
     }
 
     fn backoff(&self) -> Backoff {

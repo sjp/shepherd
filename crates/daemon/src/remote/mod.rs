@@ -18,6 +18,19 @@
 //! protecting: another kind of endpoint should be a new implementation of one
 //! trait and nothing else.
 //!
+//! # What reaching an endpoint does not mean
+//!
+//! Every connection here is made outward, by this daemon, to something that
+//! already trusts whatever is on this machine — ssh's own agent, Docker's own
+//! socket. Nothing in this module listens: there is no port opened for
+//! anything to dial in on, and no credential lives in it that was not already
+//! on the machine before it ran. That is what tells this apart from a bastion
+//! host, which sits in the path of *somebody else's* connection and decides
+//! whether to let it through. Delegating entirely to the system `ssh`
+//! ([`ssh`]) is what keeps that true: it inherits the traversal a user's own
+//! configuration already does — a jump host among them — rather than becoming
+//! a second hop somebody has to be let through.
+//!
 //! The copy that gets sent is normally this running executable, which needs
 //! nothing but a filesystem. [`Release`] is where the other copies come from:
 //! the far end is often a machine this one does not contain a binary for, and

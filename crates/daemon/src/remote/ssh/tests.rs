@@ -165,6 +165,21 @@ fn shell(word: &str) -> String {
     format!("'{}'", word.replace('\'', r"'\''"))
 }
 
+/// The path a copy script wrote to before moving it into place, read back out
+/// of the script itself rather than predicted, since what makes it safe is
+/// that nothing but the script that generated it knows it in advance.
+fn partial_name_in(script: &str) -> String {
+    let after = script
+        .split("cat > '")
+        .nth(1)
+        .expect("no partial name in the script");
+    after
+        .split('\'')
+        .next()
+        .expect("no closing quote")
+        .to_owned()
+}
+
 /// A resolver that answers with `RESOLUTION` and never runs anything.
 fn resolver() -> Resolver {
     Resolver::new().watching([]).running(|_argv: &[String]| {
@@ -467,10 +482,15 @@ fn a_copy_is_poured_down_the_connection_and_moved_into_place_over_there() {
 
     let sent = ssh.asked_about("mkdir");
     assert_eq!(sent.len(), 1);
+    let script = sent[0].last().expect("no command");
+    let partial = partial_name_in(script);
+    assert!(partial.starts_with("/tmp/agentbus-1.2.3.tmp."), "{script}");
     assert_eq!(
-        sent[0].last().expect("no command"),
-        "mkdir -p '/tmp' && cat > '/tmp/agentbus-1.2.3.tmp' && chmod +x '/tmp/agentbus-1.2.3.tmp' \
-         && mv -f '/tmp/agentbus-1.2.3.tmp' '/tmp/agentbus-1.2.3'"
+        *script,
+        format!(
+            "mkdir -p '/tmp' && cat > '{partial}' && chmod +x '{partial}' \
+             && mv -f '{partial}' '/tmp/agentbus-1.2.3'"
+        )
     );
     assert_eq!(
         *ssh.poured.lock().unwrap_or_else(PoisonError::into_inner),
@@ -483,6 +503,30 @@ fn a_copy_is_poured_down_the_connection_and_moved_into_place_over_there() {
     assert_eq!(
         checked[0].last().expect("no command"),
         "test -x '/tmp/agentbus-1.2.3'"
+    );
+}
+
+#[test]
+fn two_copies_to_one_host_at_once_write_under_different_partial_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let ssh = Fake::new();
+    let host = host(dir.path(), &ssh);
+    let local = dir.path().join("agentbus");
+    fs::write(&local, "a whole binary").unwrap();
+
+    // Not actually concurrent — the fake records synchronously — but what
+    // matters is that nothing about a second attempt reuses the first one's
+    // name, which holds however the two are interleaved.
+    host.copy_in(&local, "/tmp/agentbus-1.2.3").unwrap();
+    host.copy_in(&local, "/tmp/agentbus-1.2.3").unwrap();
+
+    let sent = ssh.asked_about("mkdir");
+    assert_eq!(sent.len(), 2);
+    let first = partial_name_in(sent[0].last().unwrap());
+    let second = partial_name_in(sent[1].last().unwrap());
+    assert_ne!(
+        first, second,
+        "two attempts wrote under the same partial name"
     );
 }
 
@@ -614,4 +658,58 @@ fn a_far_end_that_complains_at_length_is_quoted_at_the_end_and_not_at_all_of_it(
     assert!(said.len() < 6000, "{} bytes were kept", said.len());
     // The end is the part that says what went wrong, so it is the part kept.
     assert!(said.contains("Permission denied"), "{said}");
+}
+
+#[test]
+fn being_established_sweeps_every_superseded_copy_and_keeps_the_current_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let ssh = Fake::new();
+    let host = host(dir.path(), &ssh);
+
+    host.established("1.2.3");
+
+    let sweeps = ssh.asked_about("rm -f");
+    assert_eq!(sweeps.len(), 1);
+    let script = sweeps[0].last().expect("no command");
+    assert!(
+        script.starts_with("for f in /tmp/agentbus-*; do case \"$f\" in"),
+        "{script}"
+    );
+    // The version this host was just told is running is kept, not removed...
+    assert!(
+        script.contains("'/tmp/agentbus-1.2.3') continue"),
+        "{script}"
+    );
+    // ...and so is anything still being written by another attempt, which a
+    // sweep run mid-write must not mistake for something superseded.
+    assert!(script.contains("*.tmp.*) continue"), "{script}");
+}
+
+#[test]
+fn being_established_a_second_time_sweeps_nothing_more() {
+    let dir = tempfile::tempdir().unwrap();
+    let ssh = Fake::new();
+    let host = host(dir.path(), &ssh);
+
+    host.established("1.2.3");
+    host.established("1.2.3");
+
+    assert_eq!(
+        ssh.asked_about("rm -f").len(),
+        1,
+        "a host that had already been swept was swept again"
+    );
+}
+
+#[test]
+fn trouble_sweeping_is_not_trouble_establishing() {
+    let dir = tempfile::tempdir().unwrap();
+    let ssh = Fake::new().answering("rm -f", Answer::refused("no such directory"));
+    let host = host(dir.path(), &ssh);
+
+    // Nothing here is a `Result`: a caller that has just confirmed the far
+    // end is running the right version has nothing useful to do with a
+    // housekeeping failure except be told about it, which is what the log
+    // line inside `established` is for.
+    host.established("1.2.3");
 }

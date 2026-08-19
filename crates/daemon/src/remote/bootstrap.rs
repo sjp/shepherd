@@ -30,6 +30,24 @@
 //! this program does not own; when theirs is the wrong version the script skips
 //! it and a copy is put alongside instead. Replacing it would be taking over a
 //! machine to save a few megabytes.
+//!
+//! # Why a mismatched machine is fetched here rather than fetched there
+//!
+//! When the far end cannot run what this build is, [`Release::binary`] pulls
+//! the matching one to this machine before [`Transport::copy_in`] sends it on
+//! — paying for the same bytes twice on a link that is usually asymmetric,
+//! since this machine typically reaches a release far faster than it reaches
+//! an arbitrary remote box. The other order is real and was considered: have
+//! the far end fetch its own copy directly, which is one transfer instead of
+//! two. It is not what happens, on purpose. That would mean depending on
+//! `curl` or `wget` being present over there, on that machine having its own
+//! egress to fetch from, and on a URL this daemon did not choose being reached
+//! from a network it does not control — one more thing to get right,
+//! unattended, on somebody else's machine, for a saving that only shows up on
+//! the one path this design already treats as the exception rather than the
+//! rule ([`Platform::runs`] is true for most attachments; a release is
+//! fetched at all only when it is not). Paying twice for the bytes buys asking
+//! nothing new of the far end beyond what it already has to provide.
 
 use std::path::PathBuf;
 use std::process::ExitStatus;
