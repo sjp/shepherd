@@ -28,6 +28,7 @@ use std::process::ExitStatus;
 use thiserror::Error;
 use tracing::{debug, info};
 
+use super::release::{self, Release};
 use super::transport::{self, Platform, Running, Transport};
 
 /// The script that finds a usable copy at the far end or says what the far end
@@ -89,16 +90,28 @@ pub enum Error {
         /// What it said it was.
         platform: Platform,
     },
-    /// The far end needs a binary this machine does not have. Somewhere else has
-    /// to supply it.
-    #[error("{label} needs an agentbus for {triple}; this one was built for {target}")]
-    NoLocalBinaryFor {
+    /// The far end needs a binary this machine is not, and the release it would
+    /// have come from could not supply one.
+    #[error(
+        "{label} needs an agentbus for {triple} and this one was built for {target}, \
+         so it had to be fetched; if {label} already has an agentbus {version} for \
+         {triple}, set AGENTBUS_REMOTE_BINARY there to point at it"
+    )]
+    NoBinaryFor {
         /// The endpoint, as a person would name it.
         label: String,
         /// The triple the far end needs.
         triple: String,
         /// What this build is for.
         target: String,
+        /// The version that is wanted at the far end.
+        version: String,
+        /// What went wrong fetching it.
+        ///
+        /// Boxed because it is much the largest thing any of these variants
+        /// carries, and every call in this module returns this type.
+        #[source]
+        source: Box<release::Error>,
     },
     /// This executable could not be found, so there was nothing to send.
     #[error("cannot find this executable to send to {label}")]
@@ -136,14 +149,17 @@ pub struct Bootstrap {
     version: String,
     local: Option<PathBuf>,
     target: String,
+    release: Release,
 }
 
 impl Bootstrap {
-    /// Provisions `version`, sending this running executable when one has to be
-    /// sent.
+    /// Provisions `version`, sending this running executable to every far end
+    /// that could run it and fetching from the published release for the rest.
     pub fn new(version: impl Into<String>) -> Self {
+        let version = version.into();
         Self {
-            version: version.into(),
+            release: Release::published(&version),
+            version,
             local: None,
             target: TARGET.to_owned(),
         }
@@ -156,6 +172,16 @@ impl Bootstrap {
     pub fn sending(mut self, path: impl Into<PathBuf>, target: impl Into<String>) -> Self {
         self.local = Some(path.into());
         self.target = target.into();
+        self
+    }
+
+    /// Fetches from `release` rather than from where this version was
+    /// published.
+    ///
+    /// For a caller pointed at a mirror, and for tests, which have a release of
+    /// their own in a directory.
+    pub fn fetching(mut self, release: Release) -> Self {
+        self.release = release;
         self
     }
 
@@ -181,20 +207,22 @@ impl Bootstrap {
             label: label.clone(),
             platform: platform.clone(),
         })?;
-        if !platform.runs(&self.target) {
-            return Err(Error::NoLocalBinaryFor {
-                label,
-                triple: triple.to_owned(),
-                target: self.target.clone(),
-            });
-        }
 
-        let local = match &self.local {
-            Some(path) => path.clone(),
-            None => std::env::current_exe().map_err(|source| Error::NoLocalBinary {
-                label: label.clone(),
-                source,
-            })?,
+        // Sending what is already here needs no network and no release to have
+        // been published, so it is preferred wherever the far end could run it;
+        // fetching is for the far ends this machine simply does not contain.
+        let local = match platform.runs(&self.target) {
+            true => self.here(&label)?,
+            false => self
+                .release
+                .binary(triple)
+                .map_err(|source| Error::NoBinaryFor {
+                    label: label.clone(),
+                    triple: triple.to_owned(),
+                    target: self.target.clone(),
+                    version: self.version.clone(),
+                    source: Box::new(source),
+                })?,
         };
         let remote = transport.install_path(&self.version);
         info!(
@@ -216,6 +244,18 @@ impl Bootstrap {
                 label,
                 path: remote,
                 version: self.version.clone(),
+            }),
+        }
+    }
+
+    /// The copy of this program on this machine, which is the one that was
+    /// named or the one that is running.
+    fn here(&self, label: &str) -> Result<PathBuf, Error> {
+        match &self.local {
+            Some(path) => Ok(path.clone()),
+            None => std::env::current_exe().map_err(|source| Error::NoLocalBinary {
+                label: label.to_owned(),
+                source,
             }),
         }
     }

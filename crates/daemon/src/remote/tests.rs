@@ -12,6 +12,8 @@ use std::time::Duration;
 
 use super::bootstrap::{self, Bootstrap, TARGET};
 use super::loopback::Loopback;
+use super::published::Published;
+use super::release::Release;
 use super::transport::{Backoff, Platform, Transport};
 use crate::VERSION;
 
@@ -93,9 +95,15 @@ impl Local {
 }
 
 /// A provisioner that sends `local` rather than whatever executable the tests
-/// themselves are running from.
+/// themselves are running from, and that has nowhere to fetch from.
+///
+/// Every test that is about the push path is given a release that is not there,
+/// so that a test which unexpectedly reaches the fetch path fails locally
+/// instead of going to the network.
 fn sending(local: &Local) -> Bootstrap {
-    Bootstrap::new(VERSION).sending(local.path(), TARGET)
+    Bootstrap::new(VERSION)
+        .sending(local.path(), TARGET)
+        .fetching(Release::at("file:///no/such/release", VERSION))
 }
 
 /// The far end's first line, which is what the command that was started there
@@ -236,20 +244,61 @@ fn a_copy_that_arrived_truncated_is_reported_rather_than_run() {
 }
 
 #[test]
-fn a_far_end_this_build_cannot_supply_is_named_and_nothing_is_sent() {
+fn a_far_end_this_build_cannot_supply_is_fetched_for_and_provisioned() {
+    let transport = Loopback::new().unwrap();
+    let wanted = elsewhere();
+    let triple = wanted.triple().unwrap();
+    transport.plant("uname", &uname(&wanted)).unwrap();
+    let local = Local::answering("0.0.1-would-not-do");
+    let site = Published::of(VERSION, &[triple], &agentbus(VERSION)).write();
+    let cache = tempfile::tempdir().unwrap();
+
+    let mut running = Bootstrap::new(VERSION)
+        .sending(local.path(), TARGET)
+        .fetching(Release::at(site.base(), VERSION).caching_in(cache.path()))
+        .run(&transport, &["subscribe"])
+        .expect("the far end was not started");
+
+    assert_eq!(first_line(&mut running), "ran: subscribe");
+    let copied = transport.copied();
+    assert_eq!(copied.len(), 1, "{copied:?}");
+    assert_eq!(copied[0].1, transport.install_path(VERSION));
+    assert_ne!(
+        copied[0].0,
+        local.path(),
+        "the binary this build happens to hold was sent to a machine that cannot run it"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&copied[0].0).unwrap(),
+        agentbus(VERSION),
+        "what was sent is not what the release published"
+    );
+}
+
+#[test]
+fn a_far_end_nothing_can_supply_a_binary_for_is_named_and_nothing_is_sent() {
     let transport = Loopback::new().unwrap();
     let wanted = elsewhere();
     transport.plant("uname", &uname(&wanted)).unwrap();
     let local = Local::answering(VERSION);
+    let site = Published::of(VERSION, &[], "").write();
+    let cache = tempfile::tempdir().unwrap();
 
-    let error = sending(&local)
+    let error = Bootstrap::new(VERSION)
+        .sending(local.path(), TARGET)
+        .fetching(Release::at(site.base(), VERSION).caching_in(cache.path()))
         .run(&transport, &["subscribe"])
         .expect_err("a binary for another kind of machine was sent anyway");
 
     assert!(
-        matches!(&error, bootstrap::Error::NoLocalBinaryFor { triple, target, .. }
+        matches!(&error, bootstrap::Error::NoBinaryFor { triple, target, .. }
             if triple == wanted.triple().unwrap() && target == TARGET),
         "{error:?}"
+    );
+    let said = error.to_string();
+    assert!(
+        said.contains("AGENTBUS_REMOTE_BINARY"),
+        "the way out is not named: {said}"
     );
     assert!(transport.copied().is_empty(), "{:?}", transport.copied());
 }

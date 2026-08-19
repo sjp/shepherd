@@ -669,3 +669,81 @@ immediately afterwards. Connecting, then starting one, then waiting for the
 socket to answer covers that case and the race between two callers with the same
 code, since the loser of the race for the lock exits at once and both callers
 wait for the same socket.
+
+## 2026-08-19 — fetching a binary this machine has not got
+
+### The http client is `ureq`, and its cryptography is Graviola
+
+**`ureq` with rustls, and `rustls-graviola` in place of the usual provider.**
+A blocking client is what this needs — the fetch happens once, on the way to
+provisioning an endpoint, on a thread that has nothing else to do — and `ureq`
+is the smallest one that speaks TLS.
+
+The provider is the interesting half. rustls' default, *ring*, and its other
+mainstream provider, `aws-lc-rs`, are both C, and taking either would break the
+rule recorded above: `cargo build --target x86_64-unknown-linux-musl` on any
+machine that is not already an x86_64 Linux one stops at `failed to find tool
+"x86_64-linux-musl-gcc"`, which is a release that cannot be cut rather than a
+warning. Graviola is Rust and assembly with no build script, it covers exactly
+the architectures a release is built for, and with it both musl targets still
+cross-compile from a checkout and a `rustup target add`. It is a young library
+and that is the price: the alternative was a C toolchain per architecture on
+every machine that builds a release, which is the thing that decision set out to
+avoid.
+
+The provider is installed as the process default on the first fetch rather than
+configured per request, because that is the stable, documented way to do it —
+`ureq`'s per-agent hook is explicitly outside its semver promise — and because
+one process here has exactly one TLS user.
+
+### A release is one base, and everything is read from beside the manifest
+
+**`<base>/manifest.json` and `<base>/<asset>`, where `<base>` defaults to where
+this version was published and `AGENTBUS_RELEASE_BASE` replaces it.** The
+manifest's own `url` field says where its publisher put each asset, and what is
+actually read is the copy beside the manifest that was just read — the same
+location when nobody has overridden anything, and the mirror's copy when
+somebody has. That is what makes a mirror a copy of a directory rather than a
+service to stand up, and it is why a `file://` base works at all: an air-gapped
+site copies four files and a directory, and an offline test is the same thing in
+a temporary directory. The `url` is still what names the asset, so a later
+release may rename its assets without anything here being taught the new scheme.
+
+### The repository is one constant, and it is expected to move
+
+**`release::REPOSITORY` is the only place the publishing location is written
+down.** The default base, the manifest's location and every asset's location are
+derived from it and the version, so moving the releases is that line plus a
+release that puts the assets in the new place. Anyone who has not moved them can
+still point a single run elsewhere with `AGENTBUS_RELEASE_BASE`, which is the
+supported way to use a mirror without rebuilding.
+
+### The manifest is cached beside the binaries it describes
+
+**A verified asset and the manifest it was verified against are kept together
+under `<XDG_CACHE_HOME>/agentbus/<version>/`, and a second run makes no request
+at all.** The cached binary has to be checked before it is sent — a cache is a
+directory anyone can write to, and what comes out of it is about to be executed
+somewhere else — and checking it means knowing what it should hash to, which is
+what the manifest says. Fetching the manifest again to learn that would make
+"already fetched" cost a round trip, and a release's description of itself does
+not change once published, so the copy taken at the time is the copy to check
+against. It is kept verbatim rather than rewritten from what was parsed, so a
+later build reading the same cache sees what the publisher actually wrote.
+
+Anything that fails that check — a truncated binary, a manifest for another
+version, a file somebody edited — is removed and fetched again, once. The
+download itself lands under a `.part` name and is renamed only after its length
+and hash match, so a run that is killed halfway leaves nothing a later run could
+mistake for a binary.
+
+### Fetching is what happens when pushing cannot, and never instead of it
+
+**A far end whose operating system and architecture this build could run keeps
+getting this running executable; only the rest are fetched for.** Pushing needs
+no network, no release to have been published and no cache, and it is the path
+that works on a laptop with no connectivity provisioning a container on the same
+machine. The fetch exists for the case the push cannot cover at all — an arm64
+Mac has no x86_64 Linux binary inside it — and what it produces is checked twice:
+against the manifest here, and by `--version` over there, which is the same
+check a pushed copy faces.
