@@ -25,19 +25,19 @@
 //!
 //! # What is never written over
 //!
-//! Everything an installation touches is under the far end's home directory,
-//! and one path in it is ever written: `~/.local/bin/agentbus`. Somebody's own
-//! installation, wherever a package manager put it, is looked at and left —
-//! reported by name and version so they can see what was passed over, and never
-//! replaced, because replacing it would be taking over a machine to save a few
-//! megabytes.
+//! One path is ever written, and the machine it is on says which: ordinarily
+//! `~/.local/bin/agentbus`, or wherever that machine's own `AGENTBUS_REMOTE_BINARY`
+//! or `XDG_BIN_HOME` says instead. Somebody's own installation, wherever a
+//! package manager put it, is looked at and left — reported by name and version
+//! so they can see what was passed over, and never replaced, because replacing
+//! it would be taking over a machine to save a few megabytes.
 //!
 //! Even that one path is not taken by force. A binary there that this program
 //! has no record of putting there is somebody else's, and provisioning stops
-//! rather than overwrite it. The record ([`MARKER`]) is a file this writes when
-//! it installs and reads when it is asked to uninstall, and it is the whole of
-//! what makes removing anything safe: no record means nothing here is this
-//! program's to remove.
+//! rather than overwrite it. The record is a file this writes when it installs
+//! and reads when it is asked to uninstall, and it is the whole of what makes
+//! removing anything safe: no record means nothing here is this program's to
+//! remove.
 //!
 //! # Why the hooks are not part of it
 //!
@@ -60,30 +60,28 @@ use super::bootstrap::{self, Bootstrap, NOTHING_USABLE};
 use super::transport::{self, Platform, Running, Transport};
 
 /// The script that says what an earlier installation left at the far end.
-const FIND: &str = include_str!("../../assets/find-installation.sh");
+///
+/// Each of the three carries the same fragment in front of it, which is what
+/// works out where an installation lives on the machine it is about to run on.
+/// The answer is the far end's to give — the variables that move these paths
+/// are that machine's, readable only by a shell running there — which is why
+/// nothing here composes a path out of a home directory it was told about.
+const FIND: &str = concat!(
+    include_str!("../../assets/where.sh"),
+    include_str!("../../assets/find-installation.sh")
+);
 
 /// The script that makes the copy that has just been sent the one that runs.
-const PLACE: &str = include_str!("../../assets/put-in-place.sh");
+const PLACE: &str = concat!(
+    include_str!("../../assets/where.sh"),
+    include_str!("../../assets/put-in-place.sh")
+);
 
 /// The script that takes an installation away again.
-const AWAY: &str = include_str!("../../assets/take-away.sh");
-
-/// Where an installed copy is run from, below the far end's home directory.
-///
-/// The same path the three scripts build from `$HOME`, and one of the places
-/// the shared bootstrap looks: what is installed here is what the next
-/// attachment finds, which is the whole point of installing it rather than
-/// pushing one.
-const BINARY: &str = ".local/bin/agentbus";
-
-/// Where a copy is written before it is moved onto that name.
-const PARTIAL: &str = ".local/bin/.agentbus.tmp";
-
-/// Where the record of what was installed is kept.
-///
-/// Named here because the message about a path this program will not write to
-/// has to be able to say what would make it writable.
-const MARKER: &str = ".local/share/agentbus/installed";
+const AWAY: &str = concat!(
+    include_str!("../../assets/where.sh"),
+    include_str!("../../assets/take-away.sh")
+);
 
 /// What the scripts are called when saying which of them went wrong.
 const FINDING: &str = "looking for an installation";
@@ -141,10 +139,16 @@ pub enum Error {
         /// Whatever it wrote to stderr.
         said: String,
     },
-    /// The far end would not say where its home directory is, and every path an
-    /// installation uses is below it.
-    #[error("cannot tell where the home directory at {label} is")]
-    Homeless {
+    /// The far end ran the script that says where an installation goes and did
+    /// not say.
+    ///
+    /// Not the same as a machine that has nowhere to put one: that is refused
+    /// over there, in a sentence naming the variables that would answer it, and
+    /// arrives here as a script that failed. This is the far end answering
+    /// something neither of them agreed on, which nothing can be done about
+    /// from this side.
+    #[error("cannot tell where an agentbus goes at {label}")]
+    Nowhere {
         /// The endpoint, as a person would name it.
         label: String,
     },
@@ -261,7 +265,7 @@ impl<'a> Provision<'a> {
                 label,
                 path: there.binary(),
                 said: said.to_owned(),
-                record: there.below(MARKER),
+                record: there.record(),
             });
         }
 
@@ -360,7 +364,7 @@ impl<'a> Provision<'a> {
     /// What an earlier installation left at the far end.
     fn installation(&self, transport: &dyn Transport) -> Result<Installation, Error> {
         let done = self.script(transport, FIND, &[], FINDING)?;
-        Installation::read(&done.printed).ok_or_else(|| Error::Homeless {
+        Installation::read(&done.printed).ok_or_else(|| Error::Nowhere {
             label: transport.label(),
         })
     }
@@ -496,11 +500,27 @@ impl Other {
     }
 }
 
-/// What an earlier installation of this program left at the far end.
+/// Where an installation of this program goes at the far end, and what is
+/// already there.
+///
+/// Every path in here was worked out by the machine it names and read back,
+/// never composed on this side. That is not fastidiousness: which paths those
+/// are depends on variables only a shell over there can read, and a second
+/// answer computed here would be free to disagree with the one the scripts
+/// that do the writing will use.
+///
+/// String work rather than [`std::path::Path`] work, and deliberately: these
+/// are paths on a machine whose filesystem this process cannot see, and
+/// treating one as a local path is how code that tries to look at it gets
+/// written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Installation {
-    /// The far end's home directory, as it says it is.
-    home: String,
+    /// Where an installed copy goes.
+    binary: String,
+    /// Where a copy is written before it is moved onto that name.
+    partial: String,
+    /// Where the record of what was installed is kept.
+    record: String,
     /// What the file at the installed path answered, if anything is there.
     binary_said: Option<String>,
     /// The version the record says was installed, if there is a record.
@@ -511,42 +531,54 @@ struct Installation {
 
 impl Installation {
     /// One read out of what the far end printed, or nothing if it did not say
-    /// where home is.
+    /// where an installation goes.
     fn read(printed: &str) -> Option<Self> {
-        let mut found = Self {
-            home: String::new(),
-            binary_said: None,
-            recorded_version: None,
-            recorded_path: None,
-        };
-        let mut homed = false;
+        let mut binary = None;
+        let mut partial = None;
+        let mut record = None;
+        let mut binary_said = None;
+        let mut recorded_version = None;
+        let mut recorded_path = None;
         for line in printed.lines() {
-            if let Some(home) = line.strip_prefix(HOME) {
-                found.home = home.to_owned();
-                homed = true;
+            if let Some(path) = line.strip_prefix(BINARY_AT) {
+                binary = Some(path.to_owned());
+            } else if let Some(path) = line.strip_prefix(PARTIAL_AT) {
+                partial = Some(path.to_owned());
+            } else if let Some(path) = line.strip_prefix(RECORD_AT) {
+                record = Some(path.to_owned());
             } else if let Some(said) = line.strip_prefix(BINARY_SAID) {
-                found.binary_said = Some(said.to_owned());
+                binary_said = Some(said.to_owned());
             } else if let Some(recorded) = line.strip_prefix(RECORD) {
                 match recorded.split_once('=') {
-                    Some(("version", version)) => {
-                        found.recorded_version = Some(version.to_owned());
-                    }
-                    Some(("path", path)) => found.recorded_path = Some(path.to_owned()),
+                    Some(("version", version)) => recorded_version = Some(version.to_owned()),
+                    Some(("path", path)) => recorded_path = Some(path.to_owned()),
                     _ => {}
                 }
             }
         }
-        homed.then_some(found)
+        Some(Self {
+            binary: binary?,
+            partial: partial?,
+            record: record?,
+            binary_said,
+            recorded_version,
+            recorded_path,
+        })
     }
 
     /// Where an installed copy goes.
     fn binary(&self) -> String {
-        self.below(BINARY)
+        self.binary.clone()
     }
 
     /// Where a copy is written before it is moved onto that name.
     fn partial(&self) -> String {
-        self.below(PARTIAL)
+        self.partial.clone()
+    }
+
+    /// Where the record of what was installed is kept.
+    fn record(&self) -> String {
+        self.record.clone()
     }
 
     /// What is at the installed path that this program has no record of putting
@@ -559,23 +591,13 @@ impl Installation {
     /// is the one path it owns — or somebody else's, which may not.
     fn occupier(&self) -> Option<&str> {
         let said = self.binary_said.as_deref()?;
-        match self.recorded_path.as_deref() == Some(&self.binary()) {
+        match self.recorded_path.as_deref() == Some(self.binary.as_str()) {
             true => None,
             false => Some(match said.trim() {
                 "" => "something that does not say what it is",
                 said => said,
             }),
         }
-    }
-
-    /// One of this installation's paths, below the far end's home directory.
-    ///
-    /// String work rather than [`std::path::Path`] work, and deliberately: this
-    /// is a path on a machine whose filesystem this process cannot see, and
-    /// treating it as a local one is how code that tries to look at it gets
-    /// written.
-    fn below(&self, path: &str) -> String {
-        format!("{}/{path}", self.home.trim_end_matches('/'))
     }
 }
 
@@ -588,8 +610,10 @@ const NEEDS: &str = "need=";
 /// The prefix the search names an installation it passed over with.
 const OTHER: &str = "other=";
 
-/// The prefix the far end names its home directory with.
-const HOME: &str = "home=";
+/// The prefixes the far end names an installation's three paths with.
+const BINARY_AT: &str = "bin=";
+const PARTIAL_AT: &str = "partial=";
+const RECORD_AT: &str = "record=";
 
 /// The prefix carrying what the file at the installed path answered.
 const BINARY_SAID: &str = "binary=";

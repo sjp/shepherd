@@ -69,6 +69,17 @@ fn sending(local: &Local) -> Bootstrap {
         .fetching(Release::at("file:///no/such/release", VERSION))
 }
 
+/// The three paths a far end that says nothing about where it wants a copy
+/// resolves for itself, relative to its home directory.
+///
+/// Written down on this side so that the default cannot move without a test
+/// saying so. Nothing but these tests composes a path this way: what the
+/// provisioner uses is what the far end reported, whatever that turned out to
+/// be.
+const BINARY: &str = ".local/bin/agentbus";
+const PARTIAL: &str = ".local/bin/.agentbus.tmp";
+const MARKER: &str = ".local/share/agentbus/installed";
+
 /// Everything the far end has to say about itself, as paths on this machine.
 struct Machine {
     far: Loopback,
@@ -81,19 +92,29 @@ impl Machine {
         }
     }
 
+    /// A far end that says for itself where an installation of this program
+    /// should go, out of one of the variables it reads to decide that.
+    fn saying(name: &str, value: &Path) -> Self {
+        Self {
+            far: Loopback::new()
+                .expect("cannot make a far end")
+                .told(name, value),
+        }
+    }
+
     /// Where an installed copy goes.
     fn binary(&self) -> PathBuf {
-        self.far.home().join(super::BINARY)
+        self.far.home().join(BINARY)
     }
 
     /// Where a copy is written before it is moved onto that name.
     fn partial(&self) -> PathBuf {
-        self.far.home().join(super::PARTIAL)
+        self.far.home().join(PARTIAL)
     }
 
     /// Where the record of what was installed is kept.
     fn marker(&self) -> PathBuf {
-        self.far.home().join(super::MARKER)
+        self.far.home().join(MARKER)
     }
 
     /// Puts a runnable `agentbus` of `version` at `path`, as somebody else's
@@ -102,8 +123,14 @@ impl Machine {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).expect("cannot make the directory");
         }
-        fs::write(path, agentbus(version)).expect("cannot write it");
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("cannot make it run");
+        // Renamed onto the name rather than written onto it, for the reason
+        // the installation itself is: a file open for writing in one thread is
+        // a file another thread's `exec` can be refused for.
+        let writing = path.with_extension("writing");
+        fs::write(&writing, agentbus(version)).expect("cannot write it");
+        fs::set_permissions(&writing, fs::Permissions::from_mode(0o755))
+            .expect("cannot make it run");
+        fs::rename(&writing, path).expect("cannot put it in place");
     }
 
     /// Installs, and hands back everything that was said about it.
@@ -438,4 +465,99 @@ impl Drop for Sleeper {
         let _: io::Result<()> = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+#[test]
+fn a_machine_that_says_where_it_wants_one_gets_it_there() {
+    let elsewhere = tempfile::tempdir().expect("cannot make a temporary directory");
+    let machine = Machine::saying("XDG_BIN_HOME", elsewhere.path());
+    let local = Local::answering(VERSION);
+
+    let printed = machine
+        .install(&local, Hooks::Untouched)
+        .expect("nothing was installed");
+
+    let there = elsewhere.path().join("agentbus");
+    assert!(printed.contains(&there.display().to_string()), "{printed}");
+    assert_eq!(mode(&there), 0o755);
+    // And nothing was put where a machine that said nothing would have got it.
+    assert!(!machine.binary().exists(), "a copy went to the default too");
+    // The record names the copy that was actually made, which is what makes
+    // taking it away again safe.
+    let record = fs::read_to_string(machine.marker()).expect("nothing was recorded");
+    assert!(
+        record.contains(&format!("path={}\n", there.display())),
+        "{record}"
+    );
+}
+
+#[test]
+fn a_machine_that_names_the_copy_it_wants_used_gets_one_written_there() {
+    let elsewhere = tempfile::tempdir().expect("cannot make a temporary directory");
+    let there = elsewhere.path().join("bin").join("ab");
+    let machine = Machine::saying("AGENTBUS_REMOTE_BINARY", &there);
+    let local = Local::answering(VERSION);
+
+    machine
+        .install(&local, Hooks::Untouched)
+        .expect("nothing was installed");
+
+    // The whole path, not a directory to put a copy in: the variable names a
+    // binary everywhere else it is read, and it means the same thing here.
+    assert_eq!(mode(&there), 0o755);
+    let printed = machine
+        .uninstall(&local, Hooks::Untouched)
+        .expect("nothing was taken away");
+    assert!(
+        printed.contains(&format!("removed {}", there.display())),
+        "{printed}"
+    );
+    assert!(!there.exists(), "the redirected copy was left behind");
+}
+
+#[test]
+fn a_machine_that_says_nothing_and_has_no_home_is_told_what_would_answer() {
+    let machine = Machine {
+        far: Loopback::new()
+            .expect("cannot make a far end")
+            .told("HOME", ""),
+    };
+    let local = Local::answering(VERSION);
+
+    let refused = machine
+        .install(&local, Hooks::Untouched)
+        .expect_err("that should not have installed anything");
+
+    let said = refused.to_string();
+    assert!(said.contains("no usable HOME"), "{said}");
+    assert!(said.contains("AGENTBUS_REMOTE_BINARY"), "{said}");
+    // And the way out that needs no home directory at all is named, because a
+    // machine like this is usually one somebody wants attached rather than
+    // installed on.
+    assert!(said.contains("attach"), "{said}");
+}
+
+#[test]
+fn a_machine_with_no_home_still_installs_where_it_said_to() {
+    let elsewhere = tempfile::tempdir().expect("cannot make a temporary directory");
+    let there = elsewhere.path().join("agentbus");
+    let record = elsewhere.path().join("record");
+    let machine = Machine {
+        far: Loopback::new()
+            .expect("cannot make a far end")
+            .told("HOME", "")
+            .told("AGENTBUS_REMOTE_BINARY", &there)
+            .told("XDG_DATA_HOME", &record),
+    };
+    let local = Local::answering(VERSION);
+
+    machine
+        .install(&local, Hooks::Untouched)
+        .expect("nothing was installed");
+
+    assert_eq!(mode(&there), 0o755);
+    assert!(
+        record.join("agentbus/installed").is_file(),
+        "nothing was recorded"
+    );
 }

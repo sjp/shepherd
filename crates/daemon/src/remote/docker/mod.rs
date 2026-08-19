@@ -41,12 +41,13 @@ use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use agentbus_protocol::OriginHop;
 use tracing::{debug, info, warn};
 
+use super::bootstrap;
 use super::transport::{Backoff, Error, Running, Transport};
 
 pub use containers::Containers;
@@ -73,12 +74,18 @@ pub const KIND: &str = OriginHop::CONTAINER;
 
 /// Where a copy of this program is written inside a container.
 ///
-/// `/tmp` because a container that was restarted needs a daemon restarted in it
-/// anyway, so there is nothing to gain by putting the copy anywhere that
-/// survives. The version in the name means a stale copy is never mistaken for a
-/// current one, and it makes the write atomic for nothing: nothing refers to
-/// that path until the file is whole, so a hook cannot exec half of one.
-const INSTALL_DIR: &str = "/tmp";
+/// A directory under `/tmp` because a container that was restarted needs a
+/// daemon restarted in it anyway, so there is nothing to gain by putting the
+/// copy anywhere that survives. The version in the name means a stale copy is
+/// never mistaken for a current one, and it makes the write atomic for nothing:
+/// nothing refers to that path until the file is whole, so a hook cannot exec
+/// half of one. Which directory exactly is the container's answer rather than
+/// this program's — see [`Container::landing`].
+///
+/// The name kept here is where copies used to go, flat and shared between
+/// whoever was inside: an image is often several users, and a container built
+/// from one that a release provisioned still has them lying about.
+const LEGACY_DIR: &str = "/tmp";
 
 /// The prefix every copy this program writes into a container shares.
 const INSTALL_PREFIX: &str = "agentbus-";
@@ -140,6 +147,7 @@ impl Docker {
             reference,
             id: Mutex::new(None),
             installed: Mutex::new(None),
+            landing: OnceLock::new(),
         }
     }
 
@@ -153,6 +161,7 @@ impl Docker {
             label: label.into(),
             id: Mutex::new(None),
             installed: Mutex::new(None),
+            landing: OnceLock::new(),
         }
     }
 
@@ -181,6 +190,9 @@ pub struct Container {
     id: Mutex<Option<String>>,
     /// The version whose hooks have been put inside it, once any have.
     installed: Mutex<Option<String>>,
+    /// Where it said a borrowed copy of this program goes, once it has been
+    /// asked.
+    landing: OnceLock<String>,
 }
 
 impl Container {
@@ -232,6 +244,52 @@ impl Container {
         }
     }
 
+    /// Where a borrowed copy of this program goes inside this container, made
+    /// sure of and remembered.
+    ///
+    /// Asked of the container rather than assumed, for the same reason its id
+    /// is: only the far end knows, and the answer does not change while it is
+    /// running. It is settled by the same fragment the search script is built
+    /// from, so what is written and what the next search looks for cannot come
+    /// apart — and the fragment makes the directory as well, which is what
+    /// lets `docker cp` be given a path whose parent it would not create.
+    ///
+    /// A container that will not answer gets the directory copies used to go
+    /// in. There is nowhere in the answer to put a failure; a copy that lands
+    /// where the search does not look still fails the version check, which is
+    /// the only thing that licenses running anything in there.
+    fn landing(&self) -> &str {
+        self.landing.get_or_init(|| {
+            let argv = self.exec("sh", &["-c", bootstrap::PROBE]);
+            let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+            match self.docker.output(&argv) {
+                Ok(output) if output.status.success() => {
+                    let said = String::from_utf8_lossy(&output.stdout);
+                    match said.trim() {
+                        "" => LEGACY_DIR.to_owned(),
+                        landing => landing.to_owned(),
+                    }
+                }
+                Ok(output) => {
+                    debug!(
+                        container = self.label,
+                        status = %output.status,
+                        said = %String::from_utf8_lossy(&output.stderr).trim(),
+                        "that container would not say where a copy of agentbus should go"
+                    );
+                    LEGACY_DIR.to_owned()
+                }
+                Err(error) => {
+                    debug!(
+                        container = self.label,
+                        %error, "cannot ask that container where a copy of agentbus should go"
+                    );
+                    LEGACY_DIR.to_owned()
+                }
+            }
+        })
+    }
+
     /// Puts this program's hooks into the agents inside the container, so that
     /// what they do is reported by the daemon now running in there.
     ///
@@ -280,7 +338,11 @@ impl Container {
     /// there, and only the container knows which those are.
     pub fn uninstall(&self, version: &str) -> Result<(), Error> {
         let path = self.install_path(version);
-        let removing = format!("rm -f {INSTALL_DIR}/{INSTALL_PREFIX}*");
+        let removing = format!(
+            "{}\nfor f in \"$landing\"/{INSTALL_PREFIX}* {LEGACY_DIR}/{INSTALL_PREFIX}*; do \
+             [ -f \"$f\" ] || continue; rm -f -- \"$f\"; done",
+            bootstrap::LANDING
+        );
         for argv in [
             self.exec(&path, &["uninstall"]),
             self.exec("sh", &["-c", &removing]),
@@ -321,7 +383,7 @@ impl Transport for Container {
     }
 
     fn install_path(&self, version: &str) -> String {
-        format!("{INSTALL_DIR}/{INSTALL_PREFIX}{version}")
+        format!("{}/{INSTALL_PREFIX}{version}", self.landing())
     }
 
     fn run(&self, command: &str, args: &[&str], stdin: Option<&str>) -> Result<Running, Error> {

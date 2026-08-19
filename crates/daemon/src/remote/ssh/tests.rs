@@ -77,7 +77,7 @@ impl Answer {
 #[derive(Debug, Default)]
 struct Fake {
     asked: Mutex<Vec<Vec<String>>>,
-    poured: Mutex<Vec<u8>>,
+    poured: Mutex<Vec<Vec<u8>>>,
     answers: Mutex<Vec<(String, Answer)>>,
 }
 
@@ -104,6 +104,24 @@ impl Fake {
             .clone()
     }
 
+    /// Everything ever poured down the connection, one entry per command that
+    /// was given something.
+    fn poured(&self) -> Vec<Vec<u8>> {
+        self.poured
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Every script poured down the connection that mentions `word`.
+    fn scripts_about(&self, word: &str) -> Vec<String> {
+        self.poured()
+            .into_iter()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .filter(|script| script.contains(word))
+            .collect()
+    }
+
     /// The argument lists whose words include `word`.
     fn asked_about(&self, word: &str) -> Vec<Vec<String>> {
         self.asked()
@@ -112,7 +130,22 @@ impl Fake {
             .collect()
     }
 
-    fn record(&self, argv: &[String]) -> Answer {
+    /// Answers as a host whose borrowing directory is `landing`.
+    ///
+    /// Where a copy goes is the far end's answer, so a fake far end has to have
+    /// one; without this every test would be asserting against the directory a
+    /// host that would not answer falls back to.
+    fn landing_at(self: &Arc<Self>, landing: &str) -> Arc<Self> {
+        self.answering("mkdir -m 700", Answer::printing(&format!("{landing}\n")))
+    }
+
+    /// Records one call and decides what it answers with.
+    ///
+    /// What a call *is* includes whatever was poured down it, not only its
+    /// words: the scripts this daemon runs at a far end go down the connection
+    /// on stdin, so a fake that only looked at the argument list could not tell
+    /// one of them from another.
+    fn record(&self, argv: &[String], poured: &str) -> Answer {
         self.asked
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -120,14 +153,17 @@ impl Fake {
         let answers = self.answers.lock().unwrap_or_else(PoisonError::into_inner);
         answers
             .iter()
-            .find(|(matching, _)| argv.iter().any(|token| token.contains(matching)))
+            .find(|(matching, _)| {
+                poured.contains(matching.as_str())
+                    || argv.iter().any(|token| token.contains(matching))
+            })
             .map_or_else(Answer::ok, |(_, answer)| answer.clone())
     }
 }
 
 impl Driver for Arc<Fake> {
-    fn start(&self, argv: &[String], _stdin: Option<&str>) -> io::Result<Running> {
-        let answer = self.record(argv);
+    fn start(&self, argv: &[String], stdin: Option<&str>) -> io::Result<Running> {
+        let answer = self.record(argv, stdin.unwrap_or_default());
         // A handle has to be a real process, so it is the one local command
         // every machine has: it says what the fake decided and stops.
         let mut command = std::process::Command::new("sh");
@@ -143,15 +179,15 @@ impl Driver for Arc<Fake> {
     }
 
     fn collect(&self, argv: &[String], stdin: Option<&mut dyn Read>) -> io::Result<Output> {
+        let mut poured = Vec::new();
         if let Some(bytes) = stdin {
-            let mut poured = Vec::new();
             bytes.read_to_end(&mut poured)?;
             self.poured
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .extend(poured);
+                .push(poured.clone());
         }
-        let answer = self.record(argv);
+        let answer = self.record(argv, &String::from_utf8_lossy(&poured));
         Ok(Output {
             status: answer.status,
             stdout: answer.stdout.into_bytes(),
@@ -492,10 +528,7 @@ fn a_copy_is_poured_down_the_connection_and_moved_into_place_over_there() {
              && mv -f '{partial}' '/tmp/agentbus-1.2.3'"
         )
     );
-    assert_eq!(
-        *ssh.poured.lock().unwrap_or_else(PoisonError::into_inner),
-        b"a whole binary".to_vec()
-    );
+    assert_eq!(ssh.poured().concat(), b"a whole binary".to_vec());
     // And the far end is asked whether what arrived is runnable, rather than it
     // being concluded from the commands having succeeded.
     let checked = ssh.asked_about("test -x");
@@ -544,7 +577,7 @@ fn a_copy_that_did_not_arrive_runnable_is_a_failure() {
 #[test]
 fn a_host_is_what_it_was_declared_as_and_where_ssh_says_that_is() {
     let dir = tempfile::tempdir().unwrap();
-    let ssh = Fake::new();
+    let ssh = Fake::new().landing_at("/run/user/7/agentbus");
 
     let host = host(dir.path(), &ssh);
 
@@ -555,7 +588,11 @@ fn a_host_is_what_it_was_declared_as_and_where_ssh_says_that_is() {
     // what is at the other end of it, and the daemon over there is the party
     // that settles that.
     assert_eq!(host.identity(), None);
-    assert_eq!(host.install_path("1.2.3"), "/tmp/agentbus-1.2.3");
+    // Where a borrowed copy goes is the host's answer, not this side's guess.
+    assert_eq!(
+        host.install_path("1.2.3"),
+        "/run/user/7/agentbus/agentbus-1.2.3"
+    );
     // Its own schedule, and a slower one than a container on this machine gets.
     assert_eq!(host.backoff().initial, std::time::Duration::from_secs(5));
     assert_eq!(host.backoff().max, std::time::Duration::from_secs(60));
@@ -668,21 +705,37 @@ fn being_established_sweeps_every_superseded_copy_and_keeps_the_current_one() {
 
     host.established("1.2.3");
 
-    let sweeps = ssh.asked_about("rm -f");
+    let sweeps = ssh.scripts_about("rm -f");
     assert_eq!(sweeps.len(), 1);
-    let script = sweeps[0].last().expect("no command");
+    let script = &sweeps[0];
+    // Worked out over there, so a host that already had the right copy is not
+    // written to on the way past: the directory is named, never created.
     assert!(
-        script.starts_with("for f in /tmp/agentbus-*; do case \"$f\" in"),
+        script.contains("landing=/tmp/agentbus-$(id -u)"),
+        "{script}"
+    );
+    assert!(
+        !script
+            .lines()
+            .any(|line| line.trim_start().starts_with("mkdir")),
+        "{script}"
+    );
+    // Both the directory copies go in now and the one they used to go in
+    // flat, so a host provisioned by an earlier release is tidied too.
+    assert!(
+        script.contains("for f in \"$landing\"/agentbus-* /tmp/agentbus-*"),
         "{script}"
     );
     // The version this host was just told is running is kept, not removed...
-    assert!(
-        script.contains("'/tmp/agentbus-1.2.3') continue"),
-        "{script}"
-    );
+    assert!(script.contains("\"agentbus-$ver\") continue"), "{script}");
     // ...and so is anything still being written by another attempt, which a
     // sweep run mid-write must not mistake for something superseded.
     assert!(script.contains("*.tmp.*) continue"), "{script}");
+    // A per-user directory matches the pattern that used to match only files,
+    // and removing it is not what this is for.
+    assert!(script.contains("[ -f \"$f\" ] || continue"), "{script}");
+    let asked = ssh.asked_about("sh");
+    assert_eq!(asked[asked.len() - 1].last().expect("no version"), "1.2.3");
 }
 
 #[test]
@@ -695,7 +748,7 @@ fn being_established_a_second_time_sweeps_nothing_more() {
     host.established("1.2.3");
 
     assert_eq!(
-        ssh.asked_about("rm -f").len(),
+        ssh.scripts_about("rm -f").len(),
         1,
         "a host that had already been swept was swept again"
     );
@@ -704,7 +757,7 @@ fn being_established_a_second_time_sweeps_nothing_more() {
 #[test]
 fn trouble_sweeping_is_not_trouble_establishing() {
     let dir = tempfile::tempdir().unwrap();
-    let ssh = Fake::new().answering("rm -f", Answer::refused("no such directory"));
+    let ssh = Fake::new().answering("sh", Answer::refused("no such directory"));
     let host = host(dir.path(), &ssh);
 
     // Nothing here is a `Result`: a caller that has just confirmed the far

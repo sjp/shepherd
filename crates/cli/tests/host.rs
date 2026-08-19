@@ -67,15 +67,36 @@ impl Fake {
             "ssh" => self.dir.path().join("bin").join(name),
             _ => self.far().join("bin").join(name),
         };
-        fs::write(&path, body).expect("cannot write the stand-in");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+        // Renamed onto its name rather than written onto it: a file open for
+        // writing when something forks is a file the fork holds open, and
+        // `exec` of one is refused with `ETXTBSY`.
+        let writing = path.with_extension("writing");
+        fs::write(&writing, body).expect("cannot write the stand-in");
+        fs::set_permissions(&writing, fs::Permissions::from_mode(0o700))
             .expect("cannot make the stand-in runnable");
+        fs::rename(&writing, &path).expect("cannot put the stand-in in place");
         path
     }
 
     /// The home directory of the machine on the other side of that `ssh`.
     fn far(&self) -> PathBuf {
         self.dir.path().join("home")
+    }
+
+    /// Makes the machine over there say something about itself.
+    ///
+    /// Where an installation goes is worked out on that machine out of
+    /// variables only a shell running there can read, so a test that wants it
+    /// somewhere else says so to the far end and not to the command being run.
+    fn far_end_says(&self, name: &str, value: &Path) {
+        use std::io::Write;
+        let mut env = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.path().join("env"))
+            .expect("cannot write what the far end says about itself");
+        writeln!(env, "{name}='{}'; export {name}", value.display())
+            .expect("cannot write what the far end says about itself");
     }
 
     /// Where a copy of this program is installed over there.
@@ -125,14 +146,19 @@ case "$*" in
 esac
 while [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done
 [ $# -gt 0 ] && shift
-HOME="$root/home" \
-PATH="$root/home/bin:/usr/bin:/bin" \
-AGENTBUS_DIR= \
-AGENTBUS_REMOTE_BINARY= \
-XDG_CONFIG_HOME= \
-XDG_DATA_HOME= \
-XDG_STATE_HOME= \
-XDG_RUNTIME_DIR= \
+HOME="$root/home"
+PATH="$root/home/bin:/usr/bin:/bin"
+AGENTBUS_DIR=
+AGENTBUS_REMOTE_BINARY=
+XDG_CONFIG_HOME=
+XDG_DATA_HOME=
+XDG_STATE_HOME=
+XDG_RUNTIME_DIR=
+export HOME PATH AGENTBUS_DIR AGENTBUS_REMOTE_BINARY XDG_CONFIG_HOME XDG_DATA_HOME \
+       XDG_STATE_HOME XDG_RUNTIME_DIR
+# Whatever the test decided this particular machine says about itself, last, so
+# that it beats the clearing above.
+if [ -f "$root/env" ]; then . "$root/env"; fi
 exec sh -c "$*"
 "#,
         root = root.display()
@@ -252,6 +278,42 @@ fn the_agents_are_wired_up_to_the_installed_copy_when_that_is_asked_for() {
     assert!(!fake.hooks().exists(), "the hooks were left behind");
     assert!(!fake.binary().exists(), "the copy was left behind");
     assert!(!fake.marker().exists(), "the record was left behind");
+}
+
+#[test]
+fn a_machine_that_says_where_it_wants_a_copy_gets_it_there_and_is_wired_up_to_it() {
+    let fake = Fake::new();
+    fake.command("claude", CLAUDE);
+    let elsewhere = fake.far().join("opt/bin");
+    fs::create_dir_all(&elsewhere).expect("cannot make the directory");
+    fake.far_end_says("XDG_BIN_HOME", &elsewhere);
+
+    let installed = agentbus(&fake, &["install", "ssh", "--with-hooks", "--", HOST]);
+
+    assert!(installed.status.success(), "{}", said(&installed));
+    let there = elsewhere.join("agentbus");
+    assert!(
+        there.is_file(),
+        "nothing was installed where it was asked for"
+    );
+    assert!(
+        !fake.binary().exists(),
+        "a copy went to the ordinary place as well"
+    );
+    // The hooks name the copy that was actually made, absolutely, which is the
+    // whole reason the far end gets to decide where it went.
+    let hooks = fs::read_to_string(fake.hooks()).expect("no hooks were written");
+    assert!(
+        hooks.contains(&format!("{} emit --agent claude", there.display())),
+        "{hooks}"
+    );
+    assert!(!hooks.contains("\"agentbus emit"), "{hooks}");
+
+    let removed = agentbus(&fake, &["uninstall", "ssh", "--with-hooks", "--", HOST]);
+
+    assert!(removed.status.success(), "{}", said(&removed));
+    assert!(!there.exists(), "the copy was left behind");
+    assert!(!fake.hooks().exists(), "the hooks were left behind");
 }
 
 #[test]

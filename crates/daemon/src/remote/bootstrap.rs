@@ -58,12 +58,35 @@ use tracing::{debug, info};
 use super::release::{self, Release};
 use super::transport::{self, Platform, Running, Transport};
 
+/// How the far end works out where a borrowed copy of this program goes, and
+/// whether that place is its own.
+///
+/// A fragment rather than a script: it is prepended to everything that has to
+/// name that directory, so that the search below and the transport that writes
+/// there cannot come to different answers about it.
+pub const LANDING: &str = include_str!("../../assets/landing.sh");
+
+/// The script that makes sure the far end has that directory and says which it
+/// is.
+///
+/// Its own script rather than a few lines built where they are used, because
+/// two transports send it and both have to be asking the same question — and
+/// because a shell fragment assembled in Rust is a shell fragment nothing can
+/// read as shell.
+pub const PROBE: &str = concat!(
+    include_str!("../../assets/landing.sh"),
+    include_str!("../../assets/make-landing.sh")
+);
+
 /// The script that finds a usable copy at the far end or says what the far end
 /// is.
 ///
 /// Embedded rather than read from disk because the executable that runs it is
 /// routinely a copy that was pushed onto a machine with no checkout of anything.
-pub const SCRIPT: &str = include_str!("../../assets/bootstrap.sh");
+pub const SCRIPT: &str = concat!(
+    include_str!("../../assets/landing.sh"),
+    include_str!("../../assets/bootstrap.sh")
+);
 
 /// The status the script exits with when nothing over there is usable.
 ///

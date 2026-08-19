@@ -470,3 +470,166 @@ fn a_backoff_without_jitter_is_the_delay_itself() {
     assert_eq!(backoff.delay(1, 0.0), backoff.base(1));
     assert_eq!(backoff.delay(1, 1.0), backoff.base(1));
 }
+
+/// Runs the search at a far end that is a directory this test made, with the
+/// environment it chose, and says what the script printed and how it ended.
+///
+/// Straight at the script rather than through a transport, because what is
+/// being asked about is a decision the script makes out of the far end's own
+/// environment — which directory it will borrow, and whether it will touch what
+/// is in one — and a transport exists to keep this end from having an opinion
+/// about that.
+fn searched(home: &Path, runtime: &Path) -> (String, Option<i32>) {
+    let mut script = std::process::Command::new("sh");
+    script
+        .args(["-s", "--", VERSION])
+        .env("HOME", home)
+        .env("XDG_RUNTIME_DIR", runtime)
+        .env_remove("AGENTBUS_REMOTE_BINARY")
+        .env_remove("XDG_BIN_HOME")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = script.spawn().expect("cannot run a shell");
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().expect("stdin was asked for");
+        stdin
+            .write_all(bootstrap::SCRIPT.as_bytes())
+            .expect("cannot pour the script down");
+    }
+    let done = child.wait_with_output().expect("cannot read what it said");
+    (
+        String::from_utf8_lossy(&done.stdout).trim().to_owned(),
+        done.status.code(),
+    )
+}
+
+/// Puts a runnable `agentbus` of this version in `dir`, under the name a
+/// borrowed copy is given, and leaves the directory at `mode`.
+fn borrowed(dir: &Path, mode: u32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let copy = dir.join(format!("agentbus-{VERSION}"));
+    std::fs::create_dir_all(dir).expect("cannot make the directory");
+    let writing = copy.with_extension("writing");
+    std::fs::write(&writing, agentbus(VERSION)).expect("cannot write it");
+    std::fs::set_permissions(&writing, std::fs::Permissions::from_mode(0o755))
+        .expect("cannot make it run");
+    std::fs::rename(&writing, &copy).expect("cannot put it in place");
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
+        .expect("cannot set the directory's mode");
+    copy
+}
+
+#[test]
+fn a_copy_in_a_directory_this_user_keeps_to_itself_is_the_one_that_is_run() {
+    let far = tempfile::tempdir().unwrap();
+    let home = far.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let copy = borrowed(&far.path().join("run/agentbus"), 0o700);
+
+    let (printed, status) = searched(&home, &far.path().join("run"));
+
+    assert_eq!(status, Some(0));
+    assert_eq!(printed, format!("found={}", copy.display()));
+}
+
+#[test]
+fn a_copy_in_a_directory_anybody_can_write_to_is_not_run() {
+    let far = tempfile::tempdir().unwrap();
+    let home = far.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    borrowed(&far.path().join("run/agentbus"), 0o777);
+
+    let (printed, status) = searched(&home, &far.path().join("run"));
+
+    // Not found, and not merely passed over: a directory anybody may write to
+    // is a directory anybody may have written that copy into, and the version
+    // it answers with proves nothing about who put it there.
+    assert_eq!(status, Some(bootstrap::NOTHING_USABLE));
+    assert!(printed.starts_with("need="), "{printed}");
+}
+
+#[test]
+fn looking_for_a_copy_creates_nothing() {
+    let far = tempfile::tempdir().unwrap();
+    let home = far.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let runtime = far.path().join("run");
+    std::fs::create_dir_all(&runtime).unwrap();
+
+    let (_, status) = searched(&home, &runtime);
+
+    // A far end that is already current has to cost one round trip and no
+    // writes, which it cannot if looking for a copy makes somewhere to put one.
+    assert_eq!(status, Some(bootstrap::NOTHING_USABLE));
+    assert!(
+        !runtime.join("agentbus").exists(),
+        "the search made a directory"
+    );
+}
+
+/// Runs the script that makes the borrowing directory, at a far end with the
+/// environment this test chose, and says what it printed and how it ended.
+fn made(runtime: &Path) -> (String, Option<i32>) {
+    use std::io::Write;
+    let mut child = std::process::Command::new("sh")
+        .arg("-s")
+        .env("XDG_RUNTIME_DIR", runtime)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("cannot run a shell");
+    child
+        .stdin
+        .take()
+        .expect("stdin was asked for")
+        .write_all(bootstrap::PROBE.as_bytes())
+        .expect("cannot pour the script down");
+    let done = child.wait_with_output().expect("cannot read what it said");
+    (
+        String::from_utf8_lossy(&done.stdout).trim().to_owned(),
+        done.status.code(),
+    )
+}
+
+#[test]
+fn the_directory_a_copy_is_borrowed_into_is_made_for_this_user_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let far = tempfile::tempdir().unwrap();
+    let runtime = far.path().join("run");
+    std::fs::create_dir_all(&runtime).unwrap();
+
+    let (printed, status) = made(&runtime);
+
+    assert_eq!(status, Some(0));
+    let landing = runtime.join("agentbus");
+    assert_eq!(printed, landing.display().to_string());
+    assert_eq!(
+        std::fs::metadata(&landing).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+}
+
+#[test]
+fn a_directory_somebody_else_left_lying_there_is_refused_rather_than_written_to() {
+    use std::os::unix::fs::PermissionsExt;
+    let far = tempfile::tempdir().unwrap();
+    let runtime = far.path().join("run");
+    let landing = runtime.join("agentbus");
+    std::fs::create_dir_all(&landing).unwrap();
+    std::fs::set_permissions(&landing, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    let (printed, status) = made(&runtime);
+
+    // Refused rather than tightened: this user may not own it, in which case
+    // the chmod that would tighten it fails and says nothing about having.
+    assert_eq!(status, Some(1));
+    assert!(printed.is_empty(), "{printed}");
+    assert_eq!(
+        std::fs::metadata(&landing).unwrap().permissions().mode() & 0o777,
+        0o777,
+        "somebody else's directory was changed"
+    );
+}

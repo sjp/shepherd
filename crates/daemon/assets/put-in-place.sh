@@ -15,16 +15,20 @@
 
 set -eu
 ver="$1"
-bin=$HOME/.local/bin/agentbus
-partial=$HOME/.local/bin/.agentbus.tmp
-marker=$HOME/.local/share/agentbus/installed
 
+mkdir -p "${bin%/*}"
 chmod 755 "$partial"
 said=$("$partial" --version 2>/dev/null || true)
 if [ "$said" != "agentbus $ver" ]; then
   rm -f "$partial"
-  printf 'the copy that arrived answers "%s" rather than "agentbus %s"\n' \
-    "$(printf '%s' "$said" | head -n 1)" "$ver" >&2
+  # A copy that arrived whole and still will not answer is usually one of three
+  # things, and the last is the one nobody thinks of: a truncated transfer, a
+  # binary for another machine, or a filesystem mounted `noexec`, which refuses
+  # to run a file it is perfectly happy to have been given.
+  printf 'the copy that arrived at %s answers "%s" rather than "agentbus %s"; a \
+truncated transfer, a binary for another machine and a filesystem mounted \
+noexec all look like this\n' \
+    "${bin%/*}" "$(printf '%s' "$said" | head -n 1)" "$ver" >&2
   exit 1
 fi
 
@@ -36,6 +40,6 @@ if [ "$said" != "agentbus $ver" ]; then
   exit 1
 fi
 
-mkdir -p "$(dirname "$marker")"
+mkdir -p "${marker%/*}"
 printf 'version=%s\npath=%s\n' "$ver" "$bin" > "$marker"
 printf 'installed=%s\n' "$bin"

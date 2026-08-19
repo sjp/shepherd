@@ -42,7 +42,7 @@ use std::io::{self, Read};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use agentbus_protocol::OriginHop;
@@ -51,6 +51,7 @@ use tracing::{debug, warn};
 use super::control::{Masters, PERSIST};
 use super::resolve::{self, Resolved, Resolver, Ssh};
 use super::trouble::Trouble;
+use crate::remote::bootstrap;
 use crate::remote::transport::{Backoff, Error, Made, Running, Transport};
 
 /// The word a declaration uses for one of these endpoints.
@@ -61,14 +62,23 @@ pub const NAME: &str = crate::remote::targets::SSH;
 /// read rather than one this module is free to choose.
 pub const KIND: &str = OriginHop::SSH;
 
-/// Where a copy of this program is put on a host that has not got one.
+/// Where a copy of this program used to be put on a host that had not got one.
+///
+/// Nothing is written here any more — the host says where a borrowed copy goes
+/// ([`Host::landing`]) and it is somewhere only that user can write. What keeps
+/// the name is the sweep, which has to be able to clear the copies a release
+/// that did write here left behind.
+const LEGACY_DIR: &str = "/tmp";
+
+/// Where a copy of this program is put on a host that has not got one, when the
+/// host will not say.
 ///
 /// A throwaway path, versioned, and not the place somebody's own installation
 /// would live. Putting a binary somewhere permanent on a machine a person owns
 /// is a thing to be asked for rather than done by a daemon that has just
-/// connected, and the shared bootstrap looks here last, after every place an
-/// installation of theirs plausibly is.
-const INSTALL_DIR: &str = "/tmp";
+/// connected, and the shared bootstrap looks in the borrowing directory last,
+/// after every place an installation of theirs plausibly is.
+const FALLBACK_DIR: &str = LEGACY_DIR;
 
 /// The prefix every copy this program writes onto a host shares.
 const INSTALL_PREFIX: &str = "agentbus-";
@@ -76,7 +86,7 @@ const INSTALL_PREFIX: &str = "agentbus-";
 /// The substring every partial write carries, wherever the rest of its name
 /// came from.
 ///
-/// A sweep of [`INSTALL_DIR`] uses this to recognize an unfinished copy and
+/// A sweep uses this to recognize an unfinished copy and
 /// leave it alone without knowing which attempt is writing it or how far it
 /// has got.
 const PARTIAL_MARK: &str = ".tmp.";
@@ -213,9 +223,11 @@ pub struct Host {
     checked: Mutex<bool>,
     /// Whether it has been told to close.
     closed: AtomicBool,
-    /// Whether superseded copies at [`INSTALL_DIR`] have been cleared since
-    /// this host was made.
+    /// Whether superseded copies have been cleared since this host was made.
     swept: AtomicBool,
+    /// Where the host said a borrowed copy of this program goes, once it has
+    /// been asked.
+    landing: OnceLock<String>,
 }
 
 impl Host {
@@ -269,6 +281,7 @@ impl Host {
             checked: Mutex::new(false),
             closed: AtomicBool::new(false),
             swept: AtomicBool::new(false),
+            landing: OnceLock::new(),
         }
     }
 
@@ -378,6 +391,11 @@ impl Host {
     /// Runs one command that answers and finishes, and complains in this
     /// transport's terms if it did not.
     fn ran(&self, words: &[&str], stdin: Option<&mut dyn Read>) -> Result<(), Error> {
+        self.answered(words, stdin).map(|_| ())
+    }
+
+    /// The same, keeping what it printed.
+    fn answered(&self, words: &[&str], stdin: Option<&mut dyn Read>) -> Result<String, Error> {
         let argv = self.asking(words);
         let said = words.join(" ");
         let output = self
@@ -389,7 +407,7 @@ impl Host {
                 source,
             })?;
         match output.status.success() {
-            true => Ok(()),
+            true => Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned()),
             false => Err(Error::Failed {
                 label: self.label.clone(),
                 command: said,
@@ -397,6 +415,43 @@ impl Host {
                 said: tail(&output.stderr),
             }),
         }
+    }
+
+    /// Where a borrowed copy of this program goes on this host.
+    ///
+    /// Asked of the host rather than worked out here, because the answer is a
+    /// fact about the machine — whether this login has a session runtime
+    /// directory, and what uid it is — and asked once, because nothing between
+    /// one attach and the next changes it. It is settled by the same fragment
+    /// the search script is built from, so the place a copy is written is the
+    /// place the next search looks by construction, rather than by two
+    /// constants being kept in step by hand.
+    ///
+    /// A host that will not say gets the directory copies used to go in. There
+    /// is nowhere in the answer to put a failure and an attachment must not end
+    /// over one; a copy that lands where the search does not look still fails
+    /// the version check, which is the only thing that licenses running
+    /// anything over there at all.
+    fn landing(&self) -> &str {
+        self.landing.get_or_init(|| {
+            match self.answered(&["sh", "-s"], Some(&mut bootstrap::PROBE.as_bytes())) {
+                Ok(said) if !said.is_empty() => said,
+                Ok(_) => {
+                    debug!(
+                        host = self.label,
+                        "that host would not say where a copy of agentbus should go"
+                    );
+                    FALLBACK_DIR.to_owned()
+                }
+                Err(error) => {
+                    debug!(
+                        host = self.label,
+                        %error, "cannot ask that host where a copy of agentbus should go"
+                    );
+                    FALLBACK_DIR.to_owned()
+                }
+            }
+        })
     }
 }
 
@@ -459,7 +514,7 @@ impl Transport for Host {
     }
 
     fn install_path(&self, version: &str) -> String {
-        format!("{INSTALL_DIR}/{INSTALL_PREFIX}{version}")
+        format!("{}/{INSTALL_PREFIX}{version}", self.landing())
     }
 
     fn run(&self, command: &str, args: &[&str], stdin: Option<&str>) -> Result<Running, Error> {
@@ -516,36 +571,49 @@ impl Transport for Host {
         self.ran(&[&format!("test -x {}", quoted(remote))], None)
     }
 
-    /// Clears every copy at `/tmp` this program put there that is not
-    /// `version`.
+    /// Clears every copy this program put on the host that is not `version`.
     ///
     /// A container is thrown away and rebuilt, so nothing left in it ever
     /// matters again; a host reached over ssh is not, and is often one a
     /// person merely has an account on rather than owns outright, so a copy
-    /// from every upgrade this daemon has ever made left sitting in `/tmp`
-    /// is exactly the kind of thing somebody notices against a disk quota
-    /// and cannot explain. Once per host is enough — nothing that happens
-    /// between one attach and the next changes what counts as superseded —
-    /// so a sweep that has already run is not asked to run again.
+    /// from every upgrade this daemon has ever made left sitting in a
+    /// temporary directory is exactly the kind of thing somebody notices
+    /// against a disk quota and cannot explain. Once per host is enough —
+    /// nothing that happens between one attach and the next changes what
+    /// counts as superseded — so a sweep that has already run is not asked to
+    /// run again.
+    ///
+    /// Two places are swept, not one. Copies used to go straight into `/tmp`
+    /// under a name every user on the machine shared, and a host provisioned by
+    /// a release that did that still has them; nothing here will ever run one
+    /// again, so leaving them would be leaving litter nobody can account for.
+    /// Somebody else's file of the same name simply refuses to be removed,
+    /// which is the right outcome and not worth reporting.
     fn established(&self, version: &str) {
         if self.swept.swap(true, Ordering::SeqCst) {
             return;
         }
-        let keep = self.install_path(version);
         let script = format!(
-            "for f in {}/{}*; do case \"$f\" in \
-             {}) continue ;; \
-             *{}*) continue ;; \
-             esac; [ -e \"$f\" ] || continue; rm -f -- \"$f\"; done",
-            INSTALL_DIR,
-            INSTALL_PREFIX,
-            quoted(&keep),
-            PARTIAL_MARK,
+            "{}\nver=$1\n\
+             for f in \"$landing\"/{prefix}* {legacy}/{prefix}*; do \
+             case ${{f##*/}} in \
+             \"{prefix}$ver\") continue ;; \
+             *{partial}*) continue ;; \
+             esac; [ -f \"$f\" ] || continue; rm -f -- \"$f\"; done\n",
+            bootstrap::LANDING,
+            prefix = INSTALL_PREFIX,
+            legacy = LEGACY_DIR,
+            partial = PARTIAL_MARK,
         );
+        // Worked out over there rather than here, so that a host which already
+        // had the right copy is not written to on the way past: the directory
+        // is named without being created, and a pattern that matches nothing
+        // leaves nothing behind.
+        //
         // Housekeeping, not the thing that was asked for: an attachment that
         // came up fine has nothing to gain from failing over a directory it
         // could not tidy, so trouble here is logged and left at that.
-        if let Err(error) = self.ran(&[&script], None) {
+        if let Err(error) = self.ran(&["sh", "-s", "--", version], Some(&mut script.as_bytes())) {
             debug!(host = self.label, %error, "cannot sweep superseded copies");
         }
     }

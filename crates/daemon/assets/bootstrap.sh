@@ -9,11 +9,21 @@
 # intrusive than pushing one over it. AGENTBUS_REMOTE_BINARY comes first so that
 # somebody who knows where theirs is can say so.
 #
+# The last candidate is the only one this program ever writes, and it is the
+# only one that has to earn its place: a directory under /tmp is a directory
+# anybody may create, so a copy found there is considered only when the
+# directory turns out to belong to this user and to nobody else. Everything
+# before it is a path somebody chose on purpose.
+#
 # A candidate is accepted only when `--version` answers with exactly the wanted
 # line. That comparison is the whole verification: a truncated copy, a copy for
 # another architecture and a copy of a different release all fail it, and none of
 # them is ever executed. It is also what makes provisioning idempotent — a far
 # end that is already current costs this one round-trip and no writes.
+#
+# Nothing here writes anything, including the directory the last candidate is
+# in: a search that found what it was looking for has to be able to say it
+# changed nothing at all.
 #
 # With no command to run, the search is the whole point: the accepted candidate
 # is named on stdout as `found=<path>` and nothing is executed. That is what
@@ -30,13 +40,20 @@
 set -eu
 ver="$1"
 shift
+
+borrowed=
+if mine "$landing"; then
+  borrowed=$landing/agentbus-$ver
+fi
+
 for cand in ${AGENTBUS_REMOTE_BINARY:-} \
             "$(command -v agentbus 2>/dev/null || true)" \
-            "$HOME/.local/bin/agentbus" \
-            "$HOME/.linuxbrew/bin/agentbus" "/opt/homebrew/bin/agentbus" \
-            "$HOME/.local/share/mise/shims/agentbus" \
-            "$HOME/.nix-profile/bin/agentbus" \
-            "/tmp/agentbus-$ver"; do
+            "${XDG_BIN_HOME:+$XDG_BIN_HOME/agentbus}" \
+            "${HOME:+$HOME/.local/bin/agentbus}" \
+            "${HOME:+$HOME/.linuxbrew/bin/agentbus}" "/opt/homebrew/bin/agentbus" \
+            "${HOME:+$HOME/.local/share/mise/shims/agentbus}" \
+            "${HOME:+$HOME/.nix-profile/bin/agentbus}" \
+            "$borrowed"; do
   [ -n "$cand" ] && [ -x "$cand" ] || continue
   said=$("$cand" --version 2>/dev/null || true)
   if [ "$said" = "agentbus $ver" ]; then

@@ -11,6 +11,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -38,13 +39,54 @@ use crate::remote::attach;
 const VERSION: &str = "9.9.9-for-tests";
 
 /// Where a copy of that version is put inside a container.
-const INSTALLED: &str = "/tmp/agentbus-9.9.9-for-tests";
+/// The word every script that asks a container where a copy should go carries,
+/// and nothing else does.
+const PROBE: &str = "mkdir -m 700";
 
 /// How long a test waits for something that should happen almost at once.
 const PATIENCE: Duration = Duration::from_secs(10);
 
 /// The word the fake `agentbus` replaces with the container it is running in.
 const WHERE: &str = "the-container";
+
+/// Waits until `path` can actually be run, and says so if it never can.
+///
+/// A file this process has just written is a file another of its threads may
+/// have forked while it was open for writing, and a fork holds that handle
+/// until it execs — during which the kernel refuses to run the file at all.
+/// The condition passes on its own in microseconds; what it cannot do is be
+/// assumed away, because these tests run commands on every thread at once.
+fn runnable(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match Command::new(path).arg("--ready").status() {
+            Ok(status) if status.success() => return,
+            _ if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            other => panic!("the stand-in at {} will not run: {other:?}", path.display()),
+        }
+    }
+}
+
+/// Every copy of this program anywhere below `dir`, however deep.
+fn copies(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(copies(&path));
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("agentbus-"))
+        {
+            found.push(path);
+        }
+    }
+    found
+}
 
 /// A `docker` that is a script.
 ///
@@ -61,9 +103,16 @@ impl Fake {
     fn new() -> Self {
         let dir = tempfile::tempdir().expect("cannot make a temporary directory");
         let binary = dir.path().join("docker");
-        fs::write(&binary, script(dir.path())).expect("cannot write the stand-in");
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
+        // Renamed onto its name rather than written onto it. These tests run
+        // on several threads and each of them runs commands, and a fork that
+        // happens while this file is open for writing inherits that handle —
+        // which is `ETXTBSY` for whoever tries to run it next.
+        let writing = binary.with_extension("writing");
+        fs::write(&writing, script(dir.path())).expect("cannot write the stand-in");
+        fs::set_permissions(&writing, fs::Permissions::from_mode(0o700))
             .expect("cannot make the stand-in runnable");
+        fs::rename(&writing, &binary).expect("cannot put the stand-in in place");
+        runnable(&binary);
         Self { dir, binary }
     }
 
@@ -94,6 +143,37 @@ impl Fake {
         self.argv().iter().map(|argv| argv.join(" ")).collect()
     }
 
+    /// The same, without the one that asks a container where a copy should go.
+    ///
+    /// That question is asked once per container and its answer is a whole
+    /// shell fragment, so leaving it in would make every assertion about a
+    /// sequence of commands an assertion about the wording of that fragment.
+    /// It is asserted about on its own instead.
+    fn calls_beside_the_probe(&self) -> Vec<String> {
+        self.calls()
+            .into_iter()
+            .filter(|call| !call.contains(PROBE))
+            .collect()
+    }
+
+    /// Where a copy of this program goes inside `container`, as the container
+    /// itself answered.
+    ///
+    /// Read back out of what was asked rather than written down, because the
+    /// directory is per-user and the answer belongs to the far end.
+    fn installed(&self, container: &str) -> String {
+        let copied = self
+            .calls()
+            .into_iter()
+            .find(|call| call.starts_with("cp "))
+            .expect("nothing was ever copied in");
+        copied
+            .rsplit_once(&format!("{container}:"))
+            .expect("the copy went nowhere nameable")
+            .1
+            .to_owned()
+    }
+
     /// What is inside one of its containers.
     fn inside(&self, container: &str) -> PathBuf {
         self.dir.path().join("fs").join(container)
@@ -110,6 +190,7 @@ fn script(root: &Path) -> String {
     format!(
         r#"#!/bin/sh
 root='{root}'
+case ${{1:-}} in --ready) exit 0 ;; esac
 printf '%s\n' "$@" >> "$root/argv"
 printf '%s\n' '<end>' >> "$root/argv"
 case "$1" in
@@ -122,7 +203,14 @@ case "$1" in
   cp)
     ref=${{3%%:*}}
     path=${{3#*:}}
-    dst="$root/fs/$ref$path"
+    fs="$root/fs/$ref"
+    # A path the container worked out for itself has already been rewritten
+    # into this filesystem by the `exec` branch below, and prefixing it again
+    # would nest it inside itself.
+    case $path in
+      "$fs"/*) dst=$path ;;
+      *) dst="$fs$path" ;;
+    esac
     mkdir -p "$(dirname "$dst")"
     cp "$2" "$dst"
     ;;
@@ -138,11 +226,16 @@ case "$1" in
     while [ $i -lt $n ]; do
       a=$1
       shift
-      set -- "$@" "$(printf '%s' "$a" | sed "s#/tmp/#$fs/tmp/#g")"
+      # Rewriting has to survive being applied to a path it has already been
+      # applied to: the container's filesystem lives under a temporary
+      # directory that is itself below /tmp, so a second pass over an answer
+      # this stand-in gave earlier would nest it inside itself.
+      set -- "$@" "$(printf '%s' "$a" \
+        | sed "s#$fs/tmp/#@FSTMP@#g; s#/tmp/#@FSTMP@#g; s#@FSTMP@#$fs/tmp/#g")"
       i=$((i+1))
     done
     remote=
-    for candidate in "$fs"/tmp/agentbus-*; do
+    for candidate in "$fs"/tmp/agentbus-* "$fs"/tmp/*/agentbus-*; do
       if [ -x "$candidate" ]; then remote=$candidate; fi
     done
     AGENTBUS_FAKE_CONTAINER="$ref" \
@@ -509,7 +602,13 @@ fn a_docker_that_comes_back_is_watched_again_at_the_ordinary_cadence() {
     let containers = Containers::through(Docker::named(fake.dir.path().join("not-yet")));
     assert!(containers.sweep(&nothing()).is_none());
 
-    fs::copy(&fake.binary, fake.dir.path().join("not-yet")).expect("cannot put it there");
+    // Pointed at the stand-in rather than copied onto the name. A copy is a
+    // file open for writing for as long as it takes, and these tests run
+    // commands on several threads: a fork that happens inside that window
+    // inherits the handle, and whoever tries to run the file next is refused
+    // with `ETXTBSY`. A symbolic link opens nothing.
+    std::os::unix::fs::symlink(&fake.binary, fake.dir.path().join("not-yet"))
+        .expect("cannot put it there");
 
     assert!(
         containers
@@ -529,7 +628,8 @@ fn provisioning_a_container_pushes_a_copy_starts_it_and_wires_up_the_agents_insi
         .run(&container, &attach::FAR_END)
         .expect("nothing was started");
 
-    let calls = fake.calls();
+    let installed = fake.installed("eager_mclean");
+    let calls = fake.calls_beside_the_probe();
     assert_eq!(
         calls,
         vec![
@@ -538,17 +638,34 @@ fn provisioning_a_container_pushes_a_copy_starts_it_and_wires_up_the_agents_insi
             // Asked before anything is written, because a container that
             // already has the right copy is not written to at all.
             format!("exec -i eager_mclean sh -s -- {VERSION} subscribe --ensure-daemon"),
-            format!("cp {} eager_mclean:{INSTALLED}", local.path.display()),
-            format!("exec -i eager_mclean chmod +x {INSTALLED}"),
+            format!("cp {} eager_mclean:{installed}", local.path.display()),
+            format!("exec -i eager_mclean chmod +x {installed}"),
             format!("exec -i eager_mclean sh -s -- {VERSION} subscribe --ensure-daemon"),
-            format!("exec -i eager_mclean {INSTALLED} install"),
+            format!("exec -i eager_mclean {installed} install"),
         ],
         "{calls:#?}"
     );
+    // The container was asked where a copy goes, once, and the copy went to a
+    // directory of its own rather than straight into the one everybody in
+    // there shares.
+    let asked: Vec<String> = fake
+        .calls()
+        .into_iter()
+        .filter(|call| call.contains(PROBE))
+        .collect();
+    assert_eq!(asked.len(), 1, "{asked:#?}");
+    assert!(
+        installed.ends_with(&format!("/agentbus-{VERSION}")),
+        "{installed}"
+    );
+    assert!(
+        Path::new(&installed)
+            .parent()
+            .is_some_and(|dir| dir.file_name().is_some_and(|name| name != "tmp")),
+        "{installed}"
+    );
     // Which is a copy of what was sent, at exactly that path and runnable.
-    let copy = fake
-        .inside("eager_mclean")
-        .join("tmp/agentbus-9.9.9-for-tests");
+    let copy = PathBuf::from(&installed);
     assert_eq!(
         fs::read(&copy).expect("nothing was written"),
         fs::read(&local.path).expect("cannot read the stand-in")
@@ -581,7 +698,7 @@ fn a_container_that_already_has_the_right_copy_is_not_written_to_again() {
         .run(&container, &attach::FAR_END)
         .expect("nothing was started the second time");
 
-    let after: Vec<String> = fake.calls().split_off(6);
+    let after: Vec<String> = fake.calls_beside_the_probe().split_off(6);
     assert_eq!(
         after,
         vec![format!(
@@ -626,24 +743,33 @@ fn taking_it_back_out_of_a_container_removes_every_copy_that_was_put_there() {
     let _ = running.kill();
     let _ = running.wait();
     let inside = fake.inside("eager_mclean");
-    fs::write(inside.join("tmp/agentbus-0.0.1"), "an older one").expect("cannot write it");
+    let installed = fake.installed("eager_mclean");
+    // Two older ones: where a copy goes now, and where copies used to go
+    // before that directory was made a per-user one.
+    let beside = PathBuf::from(&installed)
+        .parent()
+        .expect("the copy has no directory")
+        .join("agentbus-0.0.1");
+    fs::write(&beside, "an older one").expect("cannot write it");
+    fs::write(inside.join("tmp/agentbus-0.0.2"), "an older one still").expect("cannot write it");
 
     container.uninstall(VERSION).expect("cannot take it out");
 
-    let last: Vec<String> = fake.calls().split_off(6);
+    let last: Vec<String> = fake.calls_beside_the_probe().split_off(6);
+    assert_eq!(last.len(), 2, "{last:#?}");
     assert_eq!(
-        last,
-        vec![
-            format!("exec -i eager_mclean {INSTALLED} uninstall"),
-            "exec -i eager_mclean sh -c rm -f /tmp/agentbus-*".to_owned(),
-        ],
+        last[0],
+        format!("exec -i eager_mclean {installed} uninstall")
+    );
+    assert!(
+        last[1].contains("for f in \"$landing\"/agentbus-* /tmp/agentbus-*"),
         "{last:#?}"
     );
-    let left: Vec<PathBuf> = fs::read_dir(inside.join("tmp"))
-        .expect("cannot look inside")
-        .map(|entry| entry.expect("cannot read it").path())
-        .collect();
-    assert!(left.is_empty(), "{left:?}");
+    assert!(
+        copies(&inside.join("tmp")).is_empty(),
+        "{:?}",
+        copies(&inside.join("tmp"))
+    );
 }
 
 /// A daemon's worth of state, and a reconciler over it.

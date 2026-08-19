@@ -989,3 +989,84 @@ something else is still reaching through it, which is what `Transport::keep_open
 is for. The same rule now applies to ordinary detaching, where two attachments
 happened to overlap: a session is ended when no attachment is reporting it, not
 when the first of two goes away.
+
+## 2026-08-19 — where a copy of this program lands on somebody else's machine
+
+### The far end decides, and says so; this end composes no paths at all
+
+**Two shell fragments are prepended to every script that names a path over
+there, and what they resolve is read back.** Where an installation goes depends
+on `AGENTBUS_REMOTE_BINARY`, `XDG_BIN_HOME`, `XDG_DATA_HOME` and `HOME` — every
+one of them a variable only a shell running on that machine can read — so a
+second answer worked out on this side would be free to disagree with the one the
+script that does the writing will use. It very nearly did: the same three paths
+were written out in four places that had to be kept in step by hand, and the
+search's candidate list was a fifth. Now `find-installation.sh` reports the
+paths it resolved and the provisioner uses those, whatever they turned out to
+be.
+
+`AGENTBUS_REMOTE_BINARY` names the whole path rather than a directory, because
+that is what it already meant everywhere else: it is the head of the search's
+candidate list, and it is what the refusal for an occupied path tells somebody
+to set. Letting it decide the write as well is what makes it impossible for the
+search and the installation to disagree about where the copy is.
+
+The default is unchanged and is not a thing to change: `~/.local/bin` is the
+per-user executable directory in systemd's `file-hierarchy(7)`, it is what a
+stock `~/.profile` on Debian and the profile scripts on Fedora put on the `PATH`
+when it exists, and the alternative that needs no variable — `/usr/local/bin` —
+needs root on a machine somebody may only have an account on.
+
+### A copy that is only being borrowed goes somewhere per-user
+
+**`$XDG_RUNTIME_DIR/agentbus`, then `/tmp/agentbus-$(id -u)`, which is the rule
+this program's own socket directory already follows.** The old answer was
+`/tmp/agentbus-<version>`, flat, and shared by everyone on the machine, which is
+wrong twice over on exactly the multi-user hosts this is aimed at. It is wrong
+about ownership: the second user to provision a host at a different version
+cannot rename onto the first user's file, and cannot sweep it either, because
+`/tmp` is sticky. And it is wrong about trust: the only gate before the script
+`exec`s a candidate is that it answers `agentbus <version>`, and at a fully
+predictable path under a world-writable directory that is a file anybody on the
+machine can put there first.
+
+So the directory is per-user, and being per-user is checked rather than assumed
+— **the candidate is considered only when the directory turns out to be a
+directory this user owns that nobody else may write.** `mkdir -p` succeeds
+against a directory somebody else created, and a `chmod` on one fails without
+saying so, which is why resolving the name is not on its own worth anything. The
+owner is read out of `ls -ldn`'s numeric third field rather than asked for with
+`find -user`, which takes a name or a uid and prefers the name, so on a machine
+with a user called `1000` it answers a different question than the one being
+asked.
+
+**The search still writes nothing, including that directory.** A far end that is
+already current has to cost one round trip and no writes at all, and a search
+that made somewhere to put a copy would break that for every attachment. The
+directory is created by whatever is about to put a file in it, and the sweep of
+superseded copies is worked out over there for the same reason — it runs on the
+path where a copy was found, and must not be the thing that leaves a mark.
+
+`AGENTBUS_DIR` is deliberately not consulted for this. It moves the sockets, and
+a caller may point it anywhere for a test or a second bus; a binary that moved
+with it would be a surprise nobody asked for.
+
+### A transport asks its far end where that is, once, and remembers
+
+**The same shape as a container's id: asked when the first command is sent, kept
+for the life of the transport.** `install_path` is called from places that have
+made no round trip — the sweep, and the two commands a container is sent after
+it is established — so the directory cannot be an argument threaded down from
+the bootstrap's answer, and asking every time would put a round trip inside a
+loop that runs all day.
+
+A far end that will not answer gets the directory copies used to go in, and the
+failure is logged rather than raised: the answer has nowhere to put one, and an
+attachment must not end over housekeeping. Nothing is lost by being wrong here,
+because a copy that lands where the search does not look still fails the version
+check, which is the only thing that licenses running anything over there.
+
+The sweep clears both the directory copies go in now and the flat names they
+used to go in, so a host provisioned by an earlier release is not left with
+litter nobody can account for. It skips directories, because the old pattern now
+matches the new directory.

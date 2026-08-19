@@ -19,8 +19,6 @@
 # happened rather than being left to infer it from silence.
 
 set -eu
-bin=$HOME/.local/bin/agentbus
-marker=$HOME/.local/share/agentbus/installed
 
 dir=${AGENTBUS_DIR:-}
 if [ -z "$dir" ]; then

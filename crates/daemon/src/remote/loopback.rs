@@ -32,6 +32,7 @@ pub struct Loopback {
     root: tempfile::TempDir,
     copying: bool,
     copied: Mutex<Vec<(PathBuf, String)>>,
+    told: Vec<(String, OsString)>,
 }
 
 impl Loopback {
@@ -43,7 +44,20 @@ impl Loopback {
             root,
             copying: true,
             copied: Mutex::new(Vec::new()),
+            told: Vec::new(),
         })
+    }
+
+    /// The same far end, with one more variable set on it.
+    ///
+    /// Where an installation of this program goes is worked out over there, out
+    /// of variables only a shell running there can read, so a test that wants
+    /// it somewhere else says so to the far end rather than to the code being
+    /// tested. Applied after the variables this machine's are taken away, so a
+    /// value said here is the far end's own however this machine is set up.
+    pub fn told(mut self, name: &str, value: impl Into<OsString>) -> Self {
+        self.told.push((name.to_owned(), value.into()));
+        self
     }
 
     /// The same far end, but where a file copied to it arrives empty.
@@ -71,8 +85,15 @@ impl Loopback {
     /// the directory that comes first on its `PATH`.
     pub fn plant(&self, name: &str, script: &str) -> io::Result<PathBuf> {
         let path = self.bin().join(name);
-        fs::write(&path, script)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(RUNNABLE))?;
+        // Written beside the name and renamed onto it, never onto it: this
+        // process runs commands on several threads, and a fork that happens
+        // while a file is open for writing inherits that handle — so a name
+        // written in place is a name another thread's `exec` can be refused
+        // with `ETXTBSY` for as long as the write is open.
+        let writing = path.with_extension("writing");
+        fs::write(&writing, script)?;
+        fs::set_permissions(&writing, fs::Permissions::from_mode(RUNNABLE))?;
+        fs::rename(&writing, &path)?;
         Ok(path)
     }
 
@@ -123,6 +144,9 @@ impl Loopback {
             .env_remove("XDG_DATA_HOME")
             .env_remove("XDG_STATE_HOME")
             .env_remove("XDG_RUNTIME_DIR");
+        for (name, value) in &self.told {
+            command.env(name, value);
+        }
     }
 
     /// The far end's `PATH`: its own directory, then this machine's, so that the
