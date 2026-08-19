@@ -29,10 +29,24 @@
 //! that reaches it, and merges them into this daemon's own stream — so that
 //! something reading one socket on this machine is told about agents running on
 //! all of them.
+//!
+//! # Being told which endpoints to reach
+//!
+//! An endpoint reached over a network is one somebody has to name, because
+//! there is no register of "the machines that matter" to read one off. So they
+//! are declared, in a file that outlives every daemon ([`Targets`]), and a
+//! daemon keeps its attachments in step with it and writes down what came of
+//! each ([`Attachments`]). [`Reconciling`] is the loop that does the keeping in
+//! step, and [`Registry`] is how a name in a declaration becomes a way of
+//! reaching something.
 
 pub mod attach;
+pub mod attachments;
 pub mod bootstrap;
+pub mod reconcile;
 pub mod release;
+pub mod store;
+pub mod targets;
 pub mod transport;
 
 #[cfg(test)]
@@ -43,6 +57,9 @@ mod published;
 mod tests;
 
 pub use attach::Attachment;
+pub use attachments::Attachments;
 pub use bootstrap::{Bootstrap, SCRIPT, TARGET};
+pub use reconcile::{Plan, Reconciling};
 pub use release::Release;
-pub use transport::{Backoff, Platform, Running, Transport};
+pub use targets::{Target, Targets};
+pub use transport::{Backoff, Platform, Registry, Running, Transport};

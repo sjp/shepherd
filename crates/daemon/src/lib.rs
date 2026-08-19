@@ -38,6 +38,15 @@
 //! daemon that was killed outright, and it means a machine never needs a human
 //! to clear a stale socket by hand.
 //!
+//! # Endpoints somebody asked for
+//!
+//! Which other endpoints to attach to is not a property of a running daemon but
+//! of what somebody wants, so it is kept in a file that outlives every daemon
+//! and is watched rather than sent. A daemon reads it as it starts, looks again
+//! on a couple of seconds' cadence, and looks immediately when it is sent a
+//! `SIGHUP`; and it writes down what came of each declaration beside its
+//! sockets, where the file is as ephemeral as the daemon is. See [`remote`].
+//!
 //! There is one code path, wherever this runs. Nothing in this crate asks what
 //! kind of machine, session or container it is in, or what started it; the
 //! socket directory rules in [`paths`] cover those differences by construction.
@@ -65,6 +74,8 @@ use agentbus_protocol::{DEFAULT_DONE_RETENTION, DEFAULT_STALE_AFTER, Fold, Sessi
 use bus::Published;
 use foreground::Monitor;
 use procfs::ProcFs;
+use remote::reconcile::{self, Plan, Reconciling, Wake};
+use remote::{Attachments, Bootstrap, Registry, Targets, attach};
 use subscribe::DEFAULT_HEARTBEAT;
 use thiserror::Error;
 use tokio::signal::unix::{Signal, SignalKind, signal};
@@ -119,6 +130,13 @@ pub struct Settings {
     pub done_retention: Duration,
     /// How often each subscriber is sent a heartbeat.
     pub heartbeat: Duration,
+    /// How often the declared endpoints are looked at.
+    ///
+    /// Settable for the same reason the process table's root is: what a test
+    /// about the control path needs is for nothing to happen except when it
+    /// asks, and an interval it cannot lengthen would mean every such test was
+    /// really a measurement of how long a pass takes to come round.
+    pub reconcile_every: Duration,
     /// Where the process table is read from.
     ///
     /// Every machine this runs on answers `/proc`, which is the default. It is
@@ -134,6 +152,7 @@ impl Default for Settings {
             stale_after: DEFAULT_STALE_AFTER,
             done_retention: DEFAULT_DONE_RETENTION,
             heartbeat: DEFAULT_HEARTBEAT,
+            reconcile_every: reconcile::INTERVAL,
             proc_root: PathBuf::from(procfs::DEFAULT_ROOT),
         }
     }
@@ -176,10 +195,10 @@ pub enum Error {
         #[source]
         source: io::Error,
     },
-    /// A socket left behind by an earlier run could not be cleared away.
-    #[error("cannot remove the stale socket {}", path.display())]
+    /// A file left behind by an earlier run could not be cleared away.
+    #[error("cannot remove {}, left by an earlier run", path.display())]
     Stale {
-        /// The socket that could not be removed.
+        /// The file that could not be removed.
         path: PathBuf,
         /// What the filesystem said.
         #[source]
@@ -228,6 +247,8 @@ pub struct Daemon {
     monitor: Option<Monitor>,
     lock: InstanceLock,
     signals: Option<Signals>,
+    targets: Targets,
+    transports: Registry,
 }
 
 impl Daemon {
@@ -266,7 +287,7 @@ impl Daemon {
                 source,
             },
         })?;
-        clear_stale_sockets(&paths)?;
+        clear_stale_files(&paths)?;
         let emit = EmitListener::bind(paths.emit()).map_err(|source| Error::Bind {
             path: paths.emit().to_owned(),
             source,
@@ -294,7 +315,24 @@ impl Daemon {
             lock,
             signals,
             settings,
+            targets: Targets::resolve(),
+            transports: Registry::standard(),
         })
+    }
+
+    /// The same daemon, reading its declared endpoints from `targets`.
+    #[must_use]
+    pub fn declaring(mut self, targets: Targets) -> Self {
+        self.targets = targets;
+        self
+    }
+
+    /// The same daemon, able to reach an endpoint by any transport in
+    /// `transports` and by no other.
+    #[must_use]
+    pub fn reaching(mut self, transports: Registry) -> Self {
+        self.transports = transports;
+        self
     }
 
     /// The state behind the sockets.
@@ -305,6 +343,11 @@ impl Daemon {
     /// Where this daemon is listening.
     pub fn paths(&self) -> &SocketPaths {
         &self.paths
+    }
+
+    /// Where this daemon reads its declared endpoints from.
+    pub fn targets(&self) -> &Targets {
+        &self.targets
     }
 
     /// What this daemon was started with.
@@ -330,21 +373,39 @@ impl Daemon {
             monitor,
             lock,
             signals,
+            targets,
+            transports,
         } = self;
         info!(socket = %emit.path().display(), "listening for events");
         info!(socket = %subscribe.path().display(), "publishing the stream");
+        info!(declarations = %targets.path().display(), "watching for declared endpoints");
+
+        let reconciling = Reconciling::start(Plan {
+            targets,
+            attachments: Attachments::in_dir(paths.dir()),
+            transports,
+            bus: Arc::clone(&bus),
+            bootstrap: Bootstrap::new(VERSION),
+            attach: attach::Settings::default(),
+            every: settings.reconcile_every,
+        });
+        let (stops, hangups) = split(signals);
 
         let stopped = tokio::select! {
-            stopped = terminated(signals) => stopped,
+            stopped = terminated(stops) => stopped,
             // Serving never finishes on its own; it is here to be run, and to be
             // dropped the moment the signal arrives.
-            () = serve(bus, emit, subscribe, monitor, settings.heartbeat) => {
+            () = serve(bus, emit, subscribe, monitor, settings.heartbeat, hangups, reconciling.wake()) => {
                 unreachable!("the bus stops only when it is told to")
             }
         };
 
-        for socket in paths.sockets() {
-            remove_if_present(socket);
+        // Before the files are removed, because detaching is what withdraws the
+        // sessions the far ends were speaking for, and because it is what takes
+        // the record of them away.
+        drop(reconciling);
+        for file in paths.ephemeral() {
+            remove_if_present(file);
         }
         drop(lock);
         stopped
@@ -359,12 +420,34 @@ async fn serve(
     subscribe: SubscribeListener,
     monitor: Option<Monitor>,
     heartbeat: Duration,
+    hangups: Option<Signal>,
+    wake: Arc<Wake>,
 ) {
     let ticking = tick(Arc::clone(&bus));
     let watching = watch(Arc::clone(&bus), monitor);
     let receiving = emit.serve(Arc::clone(&bus));
     let publishing = subscribe.serve(bus, heartbeat);
-    tokio::join!(ticking, watching, receiving, publishing);
+    let reloading = reload(hangups, wake);
+    tokio::join!(ticking, watching, receiving, publishing, reloading);
+}
+
+/// Asks for the declared endpoints to be looked at again every time this
+/// process is told to reload, forever.
+///
+/// What `SIGHUP` means to a daemon by long convention is "read your
+/// configuration again", and that is exactly what it is taken to mean here.
+/// Anything that has just written a declaration and does not want to wait out
+/// the ordinary interval sends one; nothing else about the daemon is affected,
+/// because there is nothing else it reads from a file.
+async fn reload(hangups: Option<Signal>, wake: Arc<Wake>) {
+    let Some(mut hangups) = hangups else {
+        return std::future::pending().await;
+    };
+    while hangups.recv().await.is_some() {
+        debug!("asked to look at the declared endpoints again");
+        wake.now();
+    }
+    std::future::pending().await
 }
 
 /// Moves every session's clock forward, forever.
@@ -467,6 +550,7 @@ fn wanted(
 struct Signals {
     term: Signal,
     interrupt: Signal,
+    hangup: Signal,
 }
 
 impl Signals {
@@ -481,9 +565,14 @@ impl Signals {
         match (
             signal(SignalKind::terminate()),
             signal(SignalKind::interrupt()),
+            signal(SignalKind::hangup()),
         ) {
-            (Ok(term), Ok(interrupt)) => Some(Self { term, interrupt }),
-            (Err(error), _) | (_, Err(error)) => {
+            (Ok(term), Ok(interrupt), Ok(hangup)) => Some(Self {
+                term,
+                interrupt,
+                hangup,
+            }),
+            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
                 error!(%error, "cannot listen for termination signals; shutdown will not be orderly");
                 None
             }
@@ -491,14 +580,23 @@ impl Signals {
     }
 }
 
+/// The signals that stop a daemon, and the one that asks it to read its
+/// declarations again, as two things that are waited for in different places.
+fn split(signals: Option<Signals>) -> (Option<(Signal, Signal)>, Option<Signal>) {
+    match signals {
+        Some(Signals {
+            term,
+            interrupt,
+            hangup,
+        }) => (Some((term, interrupt)), Some(hangup)),
+        None => (None, None),
+    }
+}
+
 /// Resolves when this process is asked to stop, or never, for a daemon that
 /// could not listen for the asking.
-async fn terminated(signals: Option<Signals>) -> Stopped {
-    let Some(Signals {
-        mut term,
-        mut interrupt,
-    }) = signals
-    else {
+async fn terminated(stops: Option<(Signal, Signal)>) -> Stopped {
+    let Some((mut term, mut interrupt)) = stops else {
         return std::future::pending().await;
     };
     tokio::select! {
@@ -507,19 +605,22 @@ async fn terminated(signals: Option<Signals>) -> Stopped {
     }
 }
 
-/// Removes any socket file left in a directory this daemon has just claimed.
+/// Removes anything left in a directory this daemon has just claimed by a run
+/// that did not get to clean up after itself.
 ///
 /// Holding the lock is what makes this safe: no live daemon owns anything here,
-/// so a socket file is the remains of one that died without cleaning up, and
-/// binding over it is impossible while it exists.
-fn clear_stale_sockets(paths: &SocketPaths) -> Result<(), Error> {
-    for socket in paths.sockets() {
-        match std::fs::remove_file(socket) {
-            Ok(()) => info!(path = %socket.display(), "removed a socket left by an earlier run"),
+/// so what is found is the remains of one that died without cleaning up. For the
+/// sockets it is also necessary — binding over a file that exists is impossible
+/// — and for the rest it is what keeps something reading the directory from
+/// being told about a state of the world that ended when that daemon did.
+fn clear_stale_files(paths: &SocketPaths) -> Result<(), Error> {
+    for file in paths.ephemeral() {
+        match std::fs::remove_file(file) {
+            Ok(()) => info!(path = %file.display(), "removed a file left by an earlier run"),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(source) => {
                 return Err(Error::Stale {
-                    path: socket.to_owned(),
+                    path: file.to_owned(),
                     source,
                 });
             }

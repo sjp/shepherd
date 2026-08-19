@@ -38,6 +38,7 @@ pub const PATIENCE: Duration = Duration::from_secs(10);
 /// The environment variables that would otherwise decide, behind a test's back,
 /// which bus a command talks to and how it behaves.
 const INHERITED: &[&str] = &[
+    "AGENTBUS_CONFIG_DIR",
     "AGENTBUS_DIR",
     "AGENTBUS_LOG",
     "AGENTBUS_PANE",

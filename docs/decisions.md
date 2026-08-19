@@ -747,3 +747,102 @@ machine. The fetch exists for the case the push cannot cover at all — an arm64
 Mac has no x86_64 Linux binary inside it — and what it produces is checked twice:
 against the manifest here, and by `--version` over there, which is the same
 check a pushed copy faces.
+
+## 2026-08-19 — being told which endpoints to attach to
+
+### The control path is a watched file, not a third socket
+
+**A daemon polls `targets.json`'s modification time every two seconds, and
+`SIGHUP` brings the next look forward.** The bus has two sockets and they are
+deliberately single-purpose — one takes events in, one sends the stream out —
+so there is no channel on which a client could ask a running daemon to do
+something, and adding one would mean designing a request protocol, versioning
+it, and answering what a half-applied request means. A file needs none of that
+and is better suited to what is actually being said: which endpoints somebody
+wants attached is a fact that outlives every daemon, so the machine that was
+switched off last night is still wanted when it comes back, and a daemon
+starting from nothing finds out what to do by reading rather than by being told
+again. It also settles the question of who may declare one: a person at a
+shell, a configuration management system, and a program that noticed one of its
+terminals go somewhere else all leave the same three fields behind, and nothing
+in the daemon can tell which of them wrote it.
+
+`SIGHUP` is what it has meant to a daemon since long before this one: read your
+configuration again. Installing the handler changes it from the default
+disposition, which would have ended the process.
+
+### Two files, in two directories, meaning two different things
+
+**`targets.json` under the user's configuration directory says what somebody
+asked for; `attachments.json` beside the sockets says what a daemon is doing
+about it.** They are separated because they have different lifetimes and
+different owners. A declaration is edited by a person and survives reboots; what
+came of it is made by one daemon as it starts, rewritten whenever an attachment
+changes state, and taken away when that daemon stops. That last property is what
+lets `agentbus targets` answer without a daemon running and without connecting
+to anything: no file means no daemon, an empty list means a daemon attached to
+nothing, and the two are genuinely different answers. A daemon killed outright
+leaves the file behind exactly as it leaves its sockets behind, and the next
+daemon to claim the directory clears both.
+
+Both are `{"v": 1, …}` and the version is read before the shape, so a file a
+later build wrote is reported and left alone rather than overwritten — which
+matters most for the declarations, because overwriting them would discard what
+somebody asked for.
+
+### A declaration is a transport's name and its words, kept verbatim
+
+**Two declarations are the same one when the transport and every word match,
+element for element.** Nothing above the transport parses what it was given: what
+`ssh` accepts is settled by the `ssh` on the machine that will run it, and a
+daemon that tried to normalize an argument vector would be re-implementing
+somebody else's command line badly. Deduplicating two names that turn out to
+reach one machine is a different question, answered by whichever transport can
+answer it, and reflected in the aliases it reports rather than by rewriting the
+file.
+
+On the command line the one thing that has to be decided is which word is the
+transport. A first word naming one names it (`attach docker eager_mclean`,
+`attach ssh -- fileserver`); anything else is the arguments of the transport
+that needs naming least (`attach -- -p 2222 bob@host`). The cost is a host whose
+entire argument vector is the word `docker`, which is declared as `attach ssh --
+docker`, and it buys a command line nobody has to read the manual for.
+
+### Reconciling is a thread, and it is the thing that owns the attachments
+
+**One thread, sleeping between passes, holding every attachment it started.** A
+pass reads a file, may start an attachment, and may stop one — and stopping one
+waits for the thread reading that endpoint to finish — so none of it belongs on
+a runtime worker, where the cost of being wrong is a hook waiting on a
+connection nobody is accepting. Holding the attachments there rather than in the
+daemon's async state is what makes the shutdown order obvious: the reconciler is
+dropped first, which detaches everything and withdraws the sessions those far
+ends were speaking for, and only then are the files removed.
+
+A pass is a comparison rather than a sequence of edits: start what is declared
+and not attached, stop what is attached and no longer declared, leave the rest.
+It depends on nothing it did last time, so it is safe to run at any moment, and
+a file that cannot be read at all leaves every attachment exactly as it was —
+somebody halfway through editing their declarations is not a reason to tear down
+a connection that is working.
+
+### A transport is built from a name through a registry, and an unknown name is ignored
+
+**`Registry` maps the name in a declaration to a function that builds a
+transport, and answers "nothing" for a name it has never heard of.** A
+declaration may have been written by a later build or by somebody who guessed,
+and the only sensible response is to leave that one alone, say so once, and
+carry on with the rest. A name it does know that cannot be turned into a
+transport is a different answer — a state to report, carrying the transport's
+own sentence about what is wrong with the declaration, and not a thing to retry
+every two seconds, because nothing will be different until somebody changes what
+they declared.
+
+### `tempfile` and `serde` join two more crates, for the same reasons as before
+
+**`tempfile` is a dependency of the daemon rather than only of its tests**,
+because both of these files are written as a whole file renamed over the target
+and the temporary one has to be made in the target's own directory — the same
+rule, and the same reasoning, as the installer's. **`agentbus-cli` takes `serde`
+directly** for the `Serialize` on the merged structure `agentbus targets --json`
+prints, which is a shape this crate owns rather than one the protocol defines.

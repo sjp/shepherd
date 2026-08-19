@@ -189,6 +189,15 @@ impl Attachment {
         self.transport.label()
     }
 
+    /// What the far end turned out to be.
+    ///
+    /// Nothing until it has been reached, for a transport that cannot know
+    /// before then — which is why it is asked each time rather than remembered
+    /// from when the attachment was started.
+    pub fn identity(&self) -> Option<String> {
+        self.transport.identity()
+    }
+
     /// Stops reading the far end and withdraws everything it reported.
     pub fn detach(mut self) {
         self.stop();

@@ -17,6 +17,7 @@ dependencies = [
  "agentbus-protocol",
  "clap",
  "libc",
+ "serde",
  "serde_json",
  "socket2",
  "tempfile",

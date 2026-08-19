@@ -92,6 +92,7 @@ async fn the_settings_a_daemon_was_started_with_are_readable_from_it() {
         stale_after: Duration::from_secs(7),
         done_retention: Duration::from_secs(11),
         heartbeat: Duration::from_secs(13),
+        reconcile_every: Duration::from_secs(17),
         proc_root: PathBuf::from("/proc/somewhere/else"),
     };
 

@@ -42,14 +42,16 @@ pub const DIR_MODE: u32 = 0o700;
 /// The mode both sockets are kept at, for the same reason.
 pub const SOCKET_MODE: u32 = 0o600;
 
-/// The directory the bus uses and the files inside it: the two sockets and
-/// the lock a daemon holds while it is serving them.
+/// The directory the bus uses and the files inside it: the two sockets, the
+/// lock a daemon holds while it is serving them, and what it says about the
+/// other endpoints it has attached.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SocketPaths {
     dir: PathBuf,
     emit: PathBuf,
     sub: PathBuf,
     lock: PathBuf,
+    attachments: PathBuf,
 }
 
 impl SocketPaths {
@@ -69,6 +71,7 @@ impl SocketPaths {
             emit: dir.join(EMIT_SOCKET),
             sub: dir.join(SUB_SOCKET),
             lock: dir.join(LOCK_FILE),
+            attachments: dir.join(crate::remote::attachments::FILE_NAME),
             dir,
         }
     }
@@ -93,6 +96,11 @@ impl SocketPaths {
         &self.lock
     }
 
+    /// The file saying which other endpoints this daemon is attached to.
+    pub fn attachments(&self) -> &Path {
+        &self.attachments
+    }
+
     /// Both sockets, in no particular order.
     ///
     /// Every operation that treats the sockets as a set rather than as two
@@ -101,6 +109,18 @@ impl SocketPaths {
     /// cannot leave one of those half-done.
     pub fn sockets(&self) -> [&Path; 2] {
         [&self.emit, &self.sub]
+    }
+
+    /// Everything in the directory that belongs to whichever daemon is serving
+    /// it, and to no other.
+    ///
+    /// These are the files a daemon makes as it starts and takes away as it
+    /// stops, so one found in a directory a daemon has just claimed is the
+    /// remains of a run that did not get to stop, and is cleared. The lock is
+    /// not among them: it is what says the directory has been claimed, and it
+    /// is released by the kernel rather than by unlinking it.
+    pub fn ephemeral(&self) -> [&Path; 3] {
+        [&self.emit, &self.sub, &self.attachments]
     }
 
     /// Creates the directory if it is absent, and puts it at [`DIR_MODE`] either
@@ -130,6 +150,17 @@ fn resolve_dir(explicit: Option<OsString>, runtime_dir: Option<OsString>, uid: u
     if let Some(runtime_dir) = runtime_dir.filter(|value| !value.is_empty()) {
         return PathBuf::from(runtime_dir).join(DIR_NAME);
     }
+    per_user(uid)
+}
+
+/// The directory this program falls back to on a machine that names nowhere
+/// else to put its files.
+pub(crate) fn per_user_dir() -> PathBuf {
+    per_user(current_uid())
+}
+
+/// The per-user directory under `/tmp` for `uid`.
+fn per_user(uid: u32) -> PathBuf {
     PathBuf::from(format!("/tmp/{DIR_NAME}-{uid}"))
 }
 
@@ -199,8 +230,16 @@ mod tests {
             paths.lock(),
             Path::new("/run/user/1000/agentbus/daemon.lock")
         );
+        assert_eq!(
+            paths.attachments(),
+            Path::new("/run/user/1000/agentbus/attachments.json")
+        );
         assert_eq!(paths.dir(), Path::new("/run/user/1000/agentbus"));
         assert_eq!(paths.sockets(), [paths.emit(), paths.sub()]);
+        assert_eq!(
+            paths.ephemeral(),
+            [paths.emit(), paths.sub(), paths.attachments()]
+        );
     }
 
     #[test]

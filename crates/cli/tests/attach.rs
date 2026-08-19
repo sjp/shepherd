@@ -32,6 +32,7 @@ const SLOT: &str = "w9:p3";
 /// The environment variables that would otherwise decide, behind a test's back,
 /// which bus the far end is.
 const INHERITED: &[&str] = &[
+    "AGENTBUS_CONFIG_DIR",
     "AGENTBUS_DIR",
     "AGENTBUS_LOG",
     "AGENTBUS_PANE",

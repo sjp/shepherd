@@ -29,6 +29,7 @@ pub mod install;
 pub mod status;
 pub mod stream;
 pub mod table;
+pub mod targets;
 
 use std::ffi::OsString;
 use std::io::{IsTerminal, Write};
@@ -36,6 +37,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use agentbus_daemon::remote::attachments::Attachments;
+use agentbus_daemon::remote::targets::{CONFIG_DIR_VAR, Targets};
 use agentbus_daemon::{Daemon, Settings, SocketPaths, clock, paths::DIR_VAR};
 use agentbus_install::{Agent, Environment, Mode, UnknownAgent};
 use agentbus_protocol::ForegroundEntry;
@@ -83,6 +86,9 @@ const STATUS: &str = "agentbus status";
 const FOREGROUND: &str = "agentbus foreground";
 const INSTALL: &str = "agentbus install";
 const UNINSTALL: &str = "agentbus uninstall";
+const ATTACH: &str = "agentbus attach";
+const DETACH: &str = "agentbus detach";
+const TARGETS: &str = "agentbus targets";
 
 /// How long `--recent` follows the stream when it is given no number.
 ///
@@ -116,6 +122,12 @@ enum Command {
     Install(InstallArgs),
     /// Take those hooks back out again.
     Uninstall(InstallArgs),
+    /// Declare another endpoint whose events should be merged into this bus.
+    Attach(DeclarationArgs),
+    /// Stop wanting one attached.
+    Detach(DeclarationArgs),
+    /// Print what has been declared and what the bus is doing about it, once.
+    Targets(TargetsArgs),
 }
 
 /// Which bus a command is about.
@@ -144,11 +156,41 @@ impl Location {
     }
 }
 
+/// Where the declared endpoints are kept.
+///
+/// Separate from [`Location`] because the two directories answer different
+/// questions and are resolved by different rules: one holds a running daemon's
+/// sockets and is as short-lived as the session, and this one holds what
+/// somebody has asked for and outlives every daemon that reads it.
+#[derive(Debug, Args)]
+struct Config {
+    /// Directory holding the declared endpoints [default: the user's configuration directory]
+    #[arg(long, value_name = "PATH", env = CONFIG_DIR_VAR)]
+    config_dir: Option<PathBuf>,
+}
+
+impl Config {
+    /// Where the declarations are.
+    fn targets(&self) -> Targets {
+        match self
+            .config_dir
+            .as_ref()
+            .filter(|dir| !dir.as_os_str().is_empty())
+        {
+            Some(dir) => Targets::in_dir(dir),
+            None => Targets::resolve(),
+        }
+    }
+}
+
 /// How to run the bus.
 #[derive(Debug, Args)]
 struct DaemonArgs {
     #[command(flatten)]
     location: Location,
+
+    #[command(flatten)]
+    config: Config,
 
     /// Seconds a session may go quiet before it is reported stale
     #[arg(
@@ -293,6 +335,42 @@ impl InstallArgs {
     }
 }
 
+/// Which endpoint is being declared, or undeclared.
+///
+/// The words are taken as they were typed and handed on unexamined: what they
+/// mean is the business of the transport that will be given them, and this
+/// command has no way of knowing what a version of `ssh` on another machine
+/// accepts. So the only thing checked here is that there are some.
+#[derive(Debug, Args)]
+struct DeclarationArgs {
+    #[command(flatten)]
+    config: Config,
+
+    /// The transport and what it needs: `docker <container>`, or ssh arguments after `--`
+    #[arg(
+        value_name = "ARGS",
+        required = true,
+        num_args = 1..,
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+    )]
+    args: Vec<String>,
+}
+
+/// What to report about the declared endpoints, and how.
+#[derive(Debug, Args)]
+struct TargetsArgs {
+    #[command(flatten)]
+    location: Location,
+
+    #[command(flatten)]
+    config: Config,
+
+    /// Print the merged structure as JSON instead of as a table
+    #[arg(long)]
+    json: bool,
+}
+
 /// Parses `args` (including the program name at position zero) and runs the
 /// requested command, returning the process exit code.
 ///
@@ -317,6 +395,9 @@ where
             Command::Emit(args) => emit(&args, started),
             Command::Install(args) => hooks(&args, install::Direction::Install),
             Command::Uninstall(args) => hooks(&args, install::Direction::Uninstall),
+            Command::Attach(args) => attach(&args),
+            Command::Detach(args) => detach(&args),
+            Command::Targets(args) => targets(&args),
         },
         // `--version` and `--help` arrive here too: clap reports them as errors
         // that carry the rendered text, a zero exit code and stdout as their
@@ -374,7 +455,9 @@ fn daemon(args: &DaemonArgs) -> ExitCode {
         Err(error) => return fail(DAEMON, &error),
     };
     runtime.block_on(async {
-        match Daemon::bind(paths, args.settings()) {
+        match Daemon::bind(paths, args.settings())
+            .map(|daemon| daemon.declaring(args.config.targets()))
+        {
             Ok(daemon) => {
                 let stopped = daemon.run().await;
                 info!(signal = %stopped, "exiting");
@@ -612,6 +695,92 @@ fn hooks(args: &InstallArgs, direction: install::Direction) -> ExitCode {
     let report = install::render(&found, &outcomes, direction, mode);
     match std::io::stdout().write_all(report.as_bytes()) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(error) => fail(context, &error),
+    }
+}
+
+/// Declares an endpoint, so that whichever daemon serves this machine attaches
+/// to it and keeps doing so.
+///
+/// Only the file is touched. A declaration is a thing to remember rather than a
+/// thing to do, so it is written whether or not a daemon is running, and a
+/// daemon that is running notices within a couple of seconds — which is also
+/// what makes this the same operation on a machine somebody is setting up and
+/// on one that has been running for a week.
+fn attach(args: &DeclarationArgs) -> ExitCode {
+    let declaration = match targets::declared(&args.args) {
+        Ok(declaration) => declaration,
+        Err(problem) => return fail(ATTACH, &problem),
+    };
+    match args
+        .config
+        .targets()
+        .declare(declaration.transport, declaration.args, &clock::now())
+    {
+        Ok(true) => said(ATTACH, &format!("declared: {}", declaration.said())),
+        // Not a failure: what was asked for is what the file already says, and
+        // a second entry would only mean attaching to one endpoint twice.
+        Ok(false) => said(ATTACH, "already declared"),
+        Err(error) => fail(ATTACH, &error),
+    }
+}
+
+/// Takes a declaration back, so that the endpoint is no longer attached to.
+fn detach(args: &DeclarationArgs) -> ExitCode {
+    let declaration = match targets::declared(&args.args) {
+        Ok(declaration) => declaration,
+        Err(problem) => return fail(DETACH, &problem),
+    };
+    match args
+        .config
+        .targets()
+        .undeclare(declaration.transport, declaration.args)
+    {
+        Ok(true) => said(DETACH, "removed"),
+        Ok(false) => said(DETACH, "not declared"),
+        Err(error) => fail(DETACH, &error),
+    }
+}
+
+/// Prints what has been declared and what the daemon here is doing about it.
+///
+/// Both files are read and neither has to be there. A machine with nothing
+/// declared and no daemon running is not an error to report — it is the ordinary
+/// state of a machine nobody has attached anything to — and a declaration whose
+/// daemon is not running is reported as exactly that rather than as an
+/// attachment in some unknown state.
+fn targets(args: &TargetsArgs) -> ExitCode {
+    let declared = match args.config.targets().list() {
+        Ok(declared) => declared,
+        Err(error) => return fail(TARGETS, &error),
+    };
+    let attached = match Attachments::in_dir(args.location.paths().dir()).read() {
+        Ok(attached) => attached,
+        Err(error) => return fail(TARGETS, &error),
+    };
+    let known = targets::merge(&declared, attached.as_deref());
+
+    let stdout = std::io::stdout();
+    let styled = stdout.is_terminal();
+    let mut out = stdout.lock();
+    let text = match args.json {
+        true => targets::json(&known, attached.is_some()),
+        false => targets::render(&known, &clock::now(), styled),
+    };
+    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        Ok(()) => ExitCode::SUCCESS,
+        // Whoever was reading this has finished, which is how a pipe is supposed
+        // to end rather than something to complain about.
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(error) => fail(TARGETS, &error),
+    }
+}
+
+/// Prints one line on stdout and succeeds, or fails saying why it could not.
+fn said(context: &str, line: &str) -> ExitCode {
+    match writeln!(std::io::stdout(), "{line}") {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
         Err(error) => fail(context, &error),
     }
 }

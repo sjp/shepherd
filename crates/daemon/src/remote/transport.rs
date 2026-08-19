@@ -22,10 +22,12 @@
 //! wanted a word waits for the exit status immediately; a caller that is merging
 //! somebody else's event stream never does.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, ExitStatus, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -479,4 +481,81 @@ pub fn platform(mut running: Running, label: &str) -> Result<Platform, Error> {
         label: label.to_owned(),
         printed: printed.trim().to_owned(),
     })
+}
+
+/// What a transport is made out of: the words a declaration gave it, and either
+/// a way of reaching the endpoint they name or the reason there is not one.
+///
+/// The reason is a plain sentence rather than a type, because the things that
+/// can be wrong with a declaration are as varied as the transports that read
+/// one — an address that resolves to nothing, an argument this version of a
+/// tool does not accept, a container that is not there — and everything above
+/// this line does exactly one thing with it, which is to show it to whoever
+/// declared the target.
+pub type Made = Result<Arc<dyn Transport>, String>;
+
+/// How a transport is built from a declaration.
+type Maker = Box<dyn Fn(&[String]) -> Made + Send + Sync>;
+
+/// The ways this daemon knows of reaching another endpoint, by the name a
+/// declaration calls each of them.
+///
+/// A name it has never heard of is not an error: a declaration may have been
+/// written by a later build, or by a person who guessed, and either way the
+/// only sensible response is to leave that one alone and carry on with the
+/// rest. So the answer to an unknown name is "nothing", distinct from the
+/// answer to a known name that could not be made into a transport.
+pub struct Registry {
+    makers: BTreeMap<String, Maker>,
+}
+
+impl Registry {
+    /// A registry that knows of no transports at all.
+    pub fn new() -> Self {
+        Self {
+            makers: BTreeMap::new(),
+        }
+    }
+
+    /// Every way of reaching an endpoint that this build has.
+    ///
+    /// There are none yet. A transport is added here as it is written, which is
+    /// the whole of what a daemon has to be told about a new one.
+    pub fn standard() -> Self {
+        Self::new()
+    }
+
+    /// The same registry, also able to reach an endpoint declared under `name`.
+    #[must_use]
+    pub fn with(
+        mut self,
+        name: impl Into<String>,
+        make: impl Fn(&[String]) -> Made + Send + Sync + 'static,
+    ) -> Self {
+        self.makers.insert(name.into(), Box::new(make));
+        self
+    }
+
+    /// A transport reaching what `args` names, or nothing when no transport is
+    /// registered under `name`.
+    pub fn make(&self, name: &str, args: &[String]) -> Option<Made> {
+        self.makers.get(name).map(|make| make(args))
+    }
+
+    /// The names something may be declared under, in order.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.makers.keys().map(String::as_str)
+    }
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self::standard()
+    }
+}
+
+impl fmt::Debug for Registry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.names()).finish()
+    }
 }
