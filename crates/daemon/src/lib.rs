@@ -45,6 +45,7 @@
 pub mod bus;
 pub mod clock;
 pub mod emit;
+pub mod foreground;
 pub mod lock;
 pub mod paths;
 pub mod procfs;
