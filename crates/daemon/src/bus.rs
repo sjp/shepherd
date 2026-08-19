@@ -37,8 +37,8 @@ use std::fmt;
 use std::sync::{Mutex, PoisonError};
 
 use agentbus_protocol::{
-    Event, ForegroundChange, ForegroundEntry, ForegroundState, OriginHop, SessionEntry, SessionKey,
-    SessionStatus, SessionTable, Snapshot, Timestamp, UnstampedEvent,
+    DaemonIdentity, Event, ForegroundChange, ForegroundEntry, ForegroundState, OriginHop,
+    SessionEntry, SessionKey, SessionStatus, SessionTable, Snapshot, Timestamp, UnstampedEvent,
 };
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -115,6 +115,9 @@ struct Attached {
 pub struct Bus {
     state: Mutex<State>,
     events: broadcast::Sender<Published>,
+    /// Who this daemon is, for the snapshots it hands out, and nothing at all
+    /// for one that has not been told.
+    identity: Option<DaemonIdentity>,
 }
 
 /// The parts of the bus that only ever move together.
@@ -168,7 +171,26 @@ impl Bus {
                 attached: BTreeMap::new(),
             }),
             events,
+            identity: None,
         }
+    }
+
+    /// The same bus, saying who it belongs to on every snapshot it hands out.
+    ///
+    /// What a subscriber does with that is compare it with another daemon's:
+    /// two ways of reaching one machine are not two machines, and the daemon
+    /// itself is the only party that can settle which it is. A bus that has not
+    /// been told says nothing, which is what a reader of an older daemon's
+    /// stream finds too.
+    #[must_use]
+    pub fn identified(mut self, identity: DaemonIdentity) -> Self {
+        self.identity = Some(identity);
+        self
+    }
+
+    /// Who this bus says it is, where anything has told it.
+    pub fn identity(&self) -> Option<&DaemonIdentity> {
+        self.identity.as_ref()
     }
 
     /// The same bus, reporting foreground observations.
@@ -377,7 +399,9 @@ impl Bus {
             .collect();
 
         for key in &dropped {
-            state.table.ended(key, now);
+            if !state.still_reported(key) {
+                state.table.ended(key, now);
+            }
         }
         for correlation in withdrawn {
             state.seq += 1;
@@ -472,18 +496,34 @@ impl Bus {
             return;
         };
         for key in &attached.sessions {
-            state.table.ended(key, now);
+            if !state.still_reported(key) {
+                state.table.ended(key, now);
+            }
         }
         let withdrawn: BTreeSet<String> = attached
             .foreground
             .into_keys()
             .map(|(correlation, _)| correlation)
+            .filter(|correlation| !state.still_observed(correlation))
             .collect();
         for correlation in withdrawn {
             state.seq += 1;
             let line = ForegroundChange::withdrawn(state.seq, now.clone(), correlation);
             let _ = self.events.send(Published::Foreground(line));
         }
+    }
+
+    /// Lets go of an attachment without withdrawing anything it reported,
+    /// because another attachment is reporting the same daemon.
+    ///
+    /// The difference from [`Bus::detach`] is the whole of the point. Detaching
+    /// says "nobody can speak for these sessions any more", and that is a claim
+    /// about the daemon at the far end, not about the connection: where two ways
+    /// in turned out to reach one daemon, the sessions are still being reported,
+    /// by the other one, and ending them here would take away rows that are true
+    /// and that nothing would put back until the far end next said something.
+    pub fn forget(&self, id: AttachmentId) {
+        self.lock().attached.remove(&id);
     }
 
     /// A receiver of every line published from now on.
@@ -505,6 +545,10 @@ impl Bus {
         let snapshot = state.table.snapshot(state.seq);
         let snapshot = match state.watched() {
             Some(foreground) => snapshot.with_foreground(foreground),
+            None => snapshot,
+        };
+        let snapshot = match &self.identity {
+            Some(identity) => snapshot.with_daemon(identity.clone()),
             None => snapshot,
         };
         (snapshot, self.events.subscribe())
@@ -556,6 +600,31 @@ impl Bus {
 }
 
 impl State {
+    /// Whether any attachment is still reporting `key`.
+    ///
+    /// This is what decides whether a session learned from somewhere else is
+    /// over, and it is a question about the daemon that folds it rather than
+    /// about any one connection to it. Two attachments may be reading one daemon
+    /// — two names for one machine, before either has said which — and one of
+    /// them stopping is not news about what the other is still reporting.
+    fn still_reported(&self, key: &SessionKey) -> bool {
+        self.attached
+            .values()
+            .any(|attached| attached.sessions.contains(key))
+    }
+
+    /// Whether any attachment is still observing something in `correlation`,
+    /// which is the same question as above about the other half of what an
+    /// attached daemon reports.
+    fn still_observed(&self, correlation: &str) -> bool {
+        self.attached.values().any(|attached| {
+            attached
+                .foreground
+                .keys()
+                .any(|(reported, _)| reported == correlation)
+        })
+    }
+
     /// Every foreground observation this daemon would report, its own and those
     /// relayed from the daemons it is attached to, or nothing where nobody
     /// anywhere in the chain is watching a process table at all.
@@ -1040,6 +1109,90 @@ mod tests {
         assert_eq!(bus.foreground(), None);
         assert_eq!(bus.last_seq(), 0, "a line nobody was sent was numbered");
         assert!(published.try_recv().is_err());
+    }
+
+    /// One session as an attached daemon reports it.
+    fn relayed(session: &str) -> SessionEntry {
+        SessionEntry {
+            session: session.to_owned(),
+            agent: Agent::Claude,
+            status: SessionStatus::Blocked,
+            source: Source::Hook,
+            cwd: None,
+            correlation: None,
+            origin: vec![OriginHop::new(OriginHop::SSH, "9f3c:1000", "fileserver")],
+            since: now(),
+        }
+    }
+
+    #[test]
+    fn losing_one_way_in_to_a_daemon_leaves_what_another_is_still_reporting() {
+        // Two attachments reading one daemon, which is what two names for one
+        // machine gets you until something has said they are one.
+        let bus = Bus::new();
+        let one = bus.attach();
+        let other = bus.attach();
+        bus.seed(one, &[relayed("abc123")], None, &now());
+        bus.seed(other, &[relayed("abc123")], None, &now());
+
+        bus.detach(one, &now());
+
+        assert_eq!(status(&bus, "abc123"), SessionStatus::Blocked);
+        // And when the last of them goes, nothing can speak for it any more.
+        bus.detach(other, &now());
+        assert_eq!(status(&bus, "abc123"), SessionStatus::Done);
+    }
+
+    #[test]
+    fn two_names_for_one_daemon_relay_one_session_and_not_two() {
+        let bus = Bus::new();
+        let one = bus.attach();
+        let other = bus.attach();
+        let mut under_another_name = relayed("abc123");
+        under_another_name.origin =
+            vec![OriginHop::new(OriginHop::SSH, "9f3c:1000", "192.168.0.4")];
+
+        bus.seed(one, &[relayed("abc123")], None, &now());
+        bus.seed(other, &[under_another_name], None, &now());
+
+        // One session, because a chain leads to the same place when the hops
+        // have the same ids; what a hop is called is for whoever reads it.
+        let sessions = bus.sessions();
+        assert_eq!(sessions.len(), 1, "{sessions:?}");
+        assert_eq!(sessions[0].origin[0].name, "fileserver");
+    }
+
+    #[test]
+    fn letting_go_of_a_way_in_that_turned_out_to_be_another_withdraws_nothing() {
+        let bus = Bus::new();
+        let one = bus.attach();
+        bus.seed(one, &[relayed("abc123")], None, &now());
+
+        bus.forget(one);
+
+        // Nothing is reporting it here any more, and it is still not this
+        // daemon's place to say a session on somebody else's machine is over:
+        // what was let go of is a connection, not the daemon behind it.
+        assert_eq!(status(&bus, "abc123"), SessionStatus::Blocked);
+    }
+
+    #[test]
+    fn a_snapshot_says_which_daemon_it_is_the_account_of() {
+        let bus = Bus::new().identified(DaemonIdentity::new("9f3c1000:1000"));
+
+        let (snapshot, _) = bus.subscribe();
+
+        assert_eq!(snapshot.daemon, Some(DaemonIdentity::new("9f3c1000:1000")));
+        // And on the wire, which is where a daemon reading another one's stream
+        // finds it.
+        let written = serde_json::to_string(&snapshot).expect("cannot write a snapshot");
+        assert!(
+            written.contains(r#""daemon":{"id":"9f3c1000:1000"}"#),
+            "{written}"
+        );
+        // A bus nothing has told says nothing, rather than making something up.
+        let (anonymous, _) = Bus::new().subscribe();
+        assert_eq!(anonymous.daemon, None);
     }
 
     #[test]

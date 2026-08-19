@@ -58,6 +58,7 @@ pub mod bus;
 pub mod clock;
 pub mod emit;
 pub mod foreground;
+pub mod identity;
 pub mod lock;
 pub mod paths;
 pub mod procfs;
@@ -299,7 +300,7 @@ impl Daemon {
             source,
         })?;
         let monitor = Monitor::new(ProcFs::new(&settings.proc_root));
-        let mut bus = Bus::with_table(settings.table());
+        let mut bus = Bus::with_table(settings.table()).identified(identity::resolve());
         if monitor.available() {
             bus = bus.observing();
         } else {

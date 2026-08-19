@@ -191,11 +191,39 @@ impl Attachment {
 
     /// What the far end turned out to be.
     ///
-    /// Nothing until it has been reached, for a transport that cannot know
-    /// before then — which is why it is asked each time rather than remembered
-    /// from when the attachment was started.
+    /// Nothing until it has been reached, which is why it is asked each time
+    /// rather than remembered from when the attachment was started. Two answers
+    /// are possible and they are asked for in the order of how much they are
+    /// worth: what the transport knows it reached, and failing that what the
+    /// daemon over there says it is. A far end that says nothing about itself
+    /// leaves this empty rather than being given a name from this side, because
+    /// a name this side made up would compare equal to the one it made up for
+    /// somewhere else.
     pub fn identity(&self) -> Option<String> {
-        self.transport.identity()
+        self.transport.identity().or_else(|| self.shared.said())
+    }
+
+    /// The way in to the far end, as much of it as could be told without
+    /// reaching it.
+    pub fn way_in(&self) -> Option<String> {
+        self.transport.way_in()
+    }
+
+    /// Stops reading the far end because another attachment turned out to be
+    /// reading the same daemon, leaving everything it reported in place.
+    ///
+    /// Detaching would be wrong here in two ways, and this is the same operation
+    /// with both of them corrected. What this attachment reported is not over —
+    /// the other attachment is reporting the same sessions, from the same daemon
+    /// — so nothing is withdrawn. And `shared` says whether the way in belongs
+    /// to both of them, in which case it is left open: closing it would take
+    /// down the connection the surviving attachment is reading through.
+    pub fn superseded(mut self, shared: bool) {
+        if shared {
+            self.transport.keep_open();
+        }
+        self.shared.supersede();
+        self.stop();
     }
 
     /// Stops reading the far end and withdraws everything it reported.
@@ -241,7 +269,12 @@ struct Shared {
     /// The far-end process while there is one, so that stopping it is not the
     /// exclusive privilege of the thread that is blocked reading it.
     running: Mutex<Option<Running>>,
+    /// What the daemon over there said it is, once it has said.
+    said: Mutex<Option<String>>,
     stopping: Mutex<bool>,
+    /// Whether what this attachment reported is another attachment's too, which
+    /// decides whether stopping withdraws any of it.
+    superseded: Mutex<bool>,
     woken: Condvar,
 }
 
@@ -250,9 +283,42 @@ impl Shared {
         Self {
             state: Mutex::new(State::Connecting),
             running: Mutex::new(None),
+            said: Mutex::new(None),
             stopping: Mutex::new(false),
+            superseded: Mutex::new(false),
             woken: Condvar::new(),
         }
+    }
+
+    /// What the daemon at the far end says it is, once one has said.
+    fn said(&self) -> Option<String> {
+        self.said
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Remembers what the daemon at the far end says it is.
+    fn says(&self, id: Option<&str>) {
+        if let Some(id) = id {
+            *self.said.lock().unwrap_or_else(PoisonError::into_inner) = Some(id.to_owned());
+        }
+    }
+
+    /// Says that everything this attachment reported is another one's too.
+    fn supersede(&self) {
+        *self
+            .superseded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = true;
+    }
+
+    /// Whether stopping should leave what was reported where it is.
+    fn stays(&self) -> bool {
+        *self
+            .superseded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn state(&self) -> State {
@@ -374,7 +440,12 @@ fn supervise(
         }
         attempt = attempt.saturating_add(1);
     }
-    bus.detach(id, &clock::now());
+    // What was reported stays where it is when something else is reporting the
+    // same daemon; otherwise this end can no longer speak for any of it.
+    match shared.stays() {
+        true => bus.forget(id),
+        false => bus.detach(id, &clock::now()),
+    }
     shared.set(State::Detached);
     info!(endpoint = label, "detached");
 }
@@ -450,6 +521,7 @@ fn merging(
     };
 
     let hop = hop(transport, &snapshot);
+    shared.says(snapshot.daemon.as_ref().map(|daemon| daemon.id.as_str()));
     info!(endpoint = label, id = hop.id, "attached");
     seed(bus, id, &hop, snapshot);
     shared.set(State::Attached);

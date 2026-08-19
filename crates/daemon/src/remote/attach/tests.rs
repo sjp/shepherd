@@ -768,6 +768,45 @@ fn the_far_ends_own_account_of_what_it_is_settles_the_hop_when_nothing_else_can(
 }
 
 #[test]
+fn an_attachment_takes_the_far_ends_word_for_what_it_is_where_it_has_none_of_its_own() {
+    let bus = Arc::new(Bus::new());
+    let far = Canned::saying(&[line(
+        &Snapshot::new(
+            41,
+            vec![reported("abc123", SessionStatus::Working, Vec::new())],
+        )
+        .with_daemon(DaemonIdentity::new("9f3c1000:1000")),
+    )])
+    .anonymous("fileserver");
+    let attachment = attached(&bus, Arc::new(far));
+
+    // Nothing before it has been reached, because nothing has said anything.
+    until("nothing was seeded", || !bus.sessions().is_empty());
+
+    assert_eq!(attachment.identity().as_deref(), Some("9f3c1000:1000"));
+    // Which is what lets two of these be compared: what a transport was asked
+    // to reach is not what it found there.
+    assert_eq!(attachment.label(), "fileserver");
+}
+
+#[test]
+fn a_far_end_that_says_nothing_about_itself_leaves_an_attachment_with_no_identity() {
+    let bus = Arc::new(Bus::new());
+    let far = Canned::saying(&[line(&Snapshot::new(
+        41,
+        vec![reported("abc123", SessionStatus::Working, Vec::new())],
+    ))])
+    .anonymous("fileserver");
+    let attachment = attached(&bus, Arc::new(far));
+
+    until("nothing was seeded", || !bus.sessions().is_empty());
+
+    // Rather than a name from this side, which would compare equal to the name
+    // this side made up for somewhere else.
+    assert_eq!(attachment.identity(), None);
+}
+
+#[test]
 fn a_transport_that_knows_what_it_reached_is_not_told_otherwise() {
     let bus = Arc::new(Bus::new());
     let far = Canned::saying(&[line(

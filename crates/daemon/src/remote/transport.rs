@@ -1,13 +1,16 @@
 //! What reaching another endpoint takes, and nothing about how any particular
 //! one is reached.
 //!
-//! A transport is four capabilities and two facts. It can run a command over
+//! A transport is four capabilities and three facts. It can run a command over
 //! there and hand back its output as it arrives; it can put a file over there;
 //! it can say what kind of machine is over there; and it can say how long to
-//! wait before trying again after it breaks. The two facts are a name for people
-//! and an identity for programs, and they are deliberately separate: several
-//! names may point at one machine, and a name is the wrong thing to deduplicate
-//! two views of the same endpoint by.
+//! wait before trying again after it breaks. The facts are a name for people, an
+//! identity for programs, and — where anything can be told before the endpoint
+//! has been reached — a name for the way in. The first two are deliberately
+//! separate: several names may point at one machine, and a name is the wrong
+//! thing to deduplicate two views of the same endpoint by. The third is separate
+//! from both because it is a guess: it says that two declarations obviously mean
+//! one endpoint, and never that two of them do not.
 //!
 //! Everything here is written against a machine this process cannot see. That is
 //! why a far end's paths are text rather than [`std::path::Path`]s: they are
@@ -402,6 +405,36 @@ pub trait Transport: fmt::Debug + Send + Sync {
     /// Nothing until the endpoint has been reached, for a transport that cannot
     /// know before then.
     fn identity(&self) -> Option<String>;
+
+    /// A name for the way in to this endpoint, as far as it can be told without
+    /// reaching it.
+    ///
+    /// Two transports that answer alike are reaching one endpoint by one route.
+    /// That is worth two things. It is near enough to sameness to report them as
+    /// one until something authoritative settles it, which costs nothing and no
+    /// network. And for a transport that reuses a connection rather than opening
+    /// one per command — which is the case that matters, because it is the
+    /// expensive one — it is literally one connection, so letting go of one of
+    /// them must not take the other's with it.
+    ///
+    /// It is worth exactly what it costs and no more. Two declarations that
+    /// obviously mean one endpoint answer alike; two that mean one endpoint by a
+    /// route only somebody else could reconcile do not, because nothing here has
+    /// asked anybody. So it is good for spotting sameness and never for
+    /// concluding difference, and a transport with nothing cheap to say says
+    /// nothing.
+    fn way_in(&self) -> Option<String> {
+        None
+    }
+
+    /// Told that the way in this transport opened is still being used by
+    /// something else, so that letting go of this one leaves it alone.
+    ///
+    /// The case it exists for is two declarations that turned out to name one
+    /// endpoint: one of them stops being read, and the connection underneath
+    /// both of them has to survive that. Nothing is required of a transport
+    /// that has no such thing to hold on to.
+    fn keep_open(&self) {}
 
     /// Where a copy of this program is put at the far end when one has to be
     /// sent.

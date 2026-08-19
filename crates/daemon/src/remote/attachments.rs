@@ -63,6 +63,38 @@ impl std::fmt::Display for State {
     }
 }
 
+/// Whether every set of words reaching one endpoint reaches it the same way.
+///
+/// Two things a person reads off this. Where they are shared, the endpoint is
+/// costing one connection however many names it was declared under. Where they
+/// are separate, the names were only found to be one endpoint by asking the
+/// daemon over there, which is the answer that cost something and the one worth
+/// knowing about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Sharing {
+    /// One connection, reached by every name.
+    Shared,
+    /// A connection per name.
+    Separate,
+}
+
+impl Sharing {
+    /// The word this is written as.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::Separate => "separate",
+        }
+    }
+}
+
+impl std::fmt::Display for Sharing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One endpoint, as the daemon currently sees it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
@@ -71,9 +103,21 @@ pub struct Entry {
     /// What that transport was given: the declared words, or whatever the
     /// transport's own discovery used to name it.
     pub args: Vec<String>,
-    /// What it turned out to be, once anything has reached it.
+    /// What it turned out to be, once anything has reached it: the far end's own
+    /// account of itself, or whatever the transport knew it had reached.
     pub identity: Option<String>,
-    /// Every set of words that turned out to reach this same endpoint.
+    /// The way in to it, as much as could be told before anything reached it.
+    /// What stands in for an identity until there is one, and never as good as
+    /// one: it says two endpoints are obviously the same and never that they are
+    /// different.
+    #[serde(default)]
+    pub way_in: Option<String>,
+    /// Whether every set of words below reaches it the same way, where there is
+    /// more than one of them and the transport has a way in to compare.
+    #[serde(default)]
+    pub sharing: Option<Sharing>,
+    /// Every set of words that turned out to reach this same endpoint, in the
+    /// order they were declared in.
     pub aliases: Vec<Vec<String>>,
     /// What to call it when telling somebody about it.
     pub label: String,
@@ -158,6 +202,8 @@ mod tests {
             transport: "ssh".to_owned(),
             args: vec!["fileserver".to_owned()],
             identity: Some("9f3c:1000".to_owned()),
+            way_in: Some("bob@fileserver:22".to_owned()),
+            sharing: Some(Sharing::Shared),
             aliases: vec![vec!["fileserver".to_owned()]],
             label: "fileserver".to_owned(),
             state,

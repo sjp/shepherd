@@ -29,7 +29,7 @@
 
 use std::fmt;
 
-use agentbus_daemon::remote::attachments::{Entry, State};
+use agentbus_daemon::remote::attachments::{Entry, Sharing, State};
 use agentbus_daemon::remote::targets::{DOCKER, SSH, Target};
 use agentbus_protocol::Timestamp;
 use serde::{Serialize, Serializer};
@@ -38,14 +38,24 @@ use thiserror::Error;
 use crate::table::{self, ABSENT, Row};
 
 /// The column headings, in order.
-const HEADINGS: [&str; 6] = [
+const HEADINGS: [&str; 7] = [
     "IDENTITY",
     "TRANSPORT",
     "ALIASES",
+    "CONNECTION",
     "STATE",
     "SINCE",
     "ERROR",
 ];
+
+/// What stands in the identity column for an endpoint that has been worked out
+/// and not yet asked.
+///
+/// The words that reach a machine are not what is on it, so what is known before
+/// anything has answered is a guess — good enough to have stopped a second
+/// attachment being reported, and not good enough to print as though the far end
+/// had confirmed it.
+const PROVISIONAL: &str = "(provisional)";
 
 /// What is printed when nothing has been declared and nothing is attached.
 const NOTHING: &str = "no targets";
@@ -165,9 +175,13 @@ impl Serialize for Shown {
 pub struct Known {
     /// Which transport reaches it.
     pub transport: String,
-    /// What it turned out to be, once something reached it.
+    /// What it turned out to be, once the far end said so.
     pub identity: Option<String>,
-    /// Every set of words known to reach it.
+    /// The way in to it, as much as could be told without reaching it.
+    pub way_in: Option<String>,
+    /// Whether every set of words below reaches it the same way.
+    pub sharing: Option<Sharing>,
+    /// Every set of words known to reach it, in the order they were declared in.
     pub aliases: Vec<Vec<String>>,
     /// What the daemon calls it, where a daemon has met it.
     pub label: Option<String>,
@@ -212,6 +226,8 @@ pub fn merge(declared: &[Target], attached: Option<&[Entry]>) -> Vec<Known> {
             None => known.push(Known {
                 transport: target.transport.clone(),
                 identity: None,
+                way_in: None,
+                sharing: None,
                 aliases: vec![target.args.clone()],
                 label: None,
                 state: match attached {
@@ -246,6 +262,8 @@ fn from(entry: &Entry, declared: Option<&Target>) -> Known {
     Known {
         transport: entry.transport.clone(),
         identity: entry.identity.clone(),
+        way_in: entry.way_in.clone(),
+        sharing: entry.sharing,
         aliases: match entry.aliases.is_empty() {
             true => vec![entry.args.clone()],
             false => entry.aliases.clone(),
@@ -289,9 +307,12 @@ pub fn json(known: &[Known], daemon: bool) -> String {
 /// One endpoint's row, in the order of [`HEADINGS`].
 fn row(known: &Known, now: &Timestamp) -> Row {
     Row::new(vec![
-        known.identity.clone().unwrap_or_else(|| ABSENT.to_owned()),
+        identity(known),
         known.transport.clone(),
         aliases(&known.aliases),
+        known
+            .sharing
+            .map_or_else(|| ABSENT.to_owned(), |sharing| sharing.to_string()),
         known.state.to_string(),
         known
             .since
@@ -303,6 +324,16 @@ fn row(known: &Known, now: &Timestamp) -> Row {
             .unwrap_or_else(|| ABSENT.to_owned()),
     ])
     .emphasized(known.state.wants_attention())
+}
+
+/// What an endpoint is, as one cell: what it said it is, that nothing has asked
+/// it yet, or that nothing whatever is known.
+fn identity(known: &Known) -> String {
+    match (&known.identity, &known.way_in) {
+        (Some(identity), _) => identity.clone(),
+        (None, Some(_)) => PROVISIONAL.to_owned(),
+        (None, None) => ABSENT.to_owned(),
+    }
 }
 
 /// Every set of words that reaches one endpoint, as one cell.
@@ -339,6 +370,8 @@ mod tests {
             transport: transport.to_owned(),
             args: words(args),
             identity: Some("9f3c:1000".to_owned()),
+            way_in: Some("bob@fileserver:22".to_owned()),
+            sharing: None,
             aliases: vec![words(args)],
             label: args.join(" "),
             state,
@@ -426,6 +459,7 @@ mod tests {
     fn several_names_for_one_endpoint_are_one_row_listing_all_of_them() {
         let mut attached = entry(SSH, &["fileserver"], State::Attached);
         attached.aliases = vec![words(&["fileserver"]), words(&["192.168.0.4"])];
+        attached.sharing = Some(Sharing::Shared);
 
         let known = merge(
             &[target(SSH, &["fileserver"]), target(SSH, &["192.168.0.4"])],
@@ -437,6 +471,31 @@ mod tests {
             known[0].aliases,
             vec![words(&["fileserver"]), words(&["192.168.0.4"])]
         );
+        // Both names, what it turned out to be, and that reaching it by either
+        // of them costs one connection rather than two.
+        let table = render(&known, &now(), false);
+        assert!(table.contains("fileserver, 192.168.0.4"), "{table}");
+        assert!(table.contains("9f3c:1000"), "{table}");
+        assert!(table.contains("shared"), "{table}");
+    }
+
+    #[test]
+    fn an_endpoint_nothing_has_answered_for_yet_is_not_reported_as_though_it_had() {
+        let mut connecting = entry(SSH, &["fileserver"], State::Connecting);
+        connecting.identity = None;
+
+        let table = render(&merge(&[], Some(&[connecting.clone()])), &now(), false);
+
+        // What is known is where ssh would go, which is not what is there.
+        assert!(table.contains("(provisional)"), "{table}");
+        // And a target no daemon has met at all knows even less than that.
+        let nothing = render(&merge(&[target(SSH, &["fileserver"])], None), &now(), false);
+        assert!(!nothing.contains("(provisional)"), "{nothing}");
+        // The guess is still written down for anything reading this properly.
+        let written: serde_json::Value =
+            serde_json::from_str(&json(&merge(&[], Some(&[connecting])), true)).expect("not json");
+        assert_eq!(written["targets"][0]["identity"], serde_json::Value::Null);
+        assert_eq!(written["targets"][0]["way_in"], "bob@fileserver:22");
     }
 
     #[test]
@@ -455,6 +514,7 @@ mod tests {
     fn every_column_is_headed_and_filled() {
         let mut refused = entry(SSH, &["fileserver"], State::NeedsAttention);
         refused.last_error = Some("permission denied".to_owned());
+        refused.sharing = Some(Sharing::Separate);
 
         let table = render(&merge(&[], Some(&[refused])), &now(), false);
 
@@ -462,6 +522,7 @@ mod tests {
         assert_eq!(lines[0].split_whitespace().collect::<Vec<&str>>(), HEADINGS);
         assert!(lines[1].contains("9f3c:1000"), "{table}");
         assert!(lines[1].contains("fileserver"), "{table}");
+        assert!(lines[1].contains("separate"), "{table}");
         assert!(lines[1].contains("needs attention"), "{table}");
         assert!(lines[1].contains("1m0s"), "{table}");
         assert!(lines[1].contains("permission denied"), "{table}");

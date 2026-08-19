@@ -506,11 +506,45 @@ fn a_host_is_what_it_was_declared_as_and_where_ssh_says_that_is() {
 
     assert_eq!(host.label(), "-p 2222 bob@fs.example.net");
     assert_eq!(host.kind(), "ssh");
-    assert_eq!(host.identity().as_deref(), Some("bob@fs.example.net:2222"));
+    assert_eq!(host.way_in().as_deref(), Some("bob@fs.example.net:2222"));
+    // And it does not claim to know what is there. Where ssh would go is not
+    // what is at the other end of it, and the daemon over there is the party
+    // that settles that.
+    assert_eq!(host.identity(), None);
     assert_eq!(host.install_path("1.2.3"), "/tmp/agentbus-1.2.3");
     // Its own schedule, and a slower one than a container on this machine gets.
     assert_eq!(host.backoff().initial, std::time::Duration::from_secs(5));
     assert_eq!(host.backoff().max, std::time::Duration::from_secs(60));
+}
+
+#[test]
+fn letting_go_of_a_host_closes_the_connection_it_was_holding_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let ssh = Fake::new();
+
+    drop(host(dir.path(), &ssh));
+
+    let closed = ssh.asked_about("exit");
+    assert_eq!(closed.len(), 1, "{:?}", ssh.asked());
+    // Asked of the master for exactly the words that made it, and of no other.
+    assert_eq!(
+        closed[0][closed[0].len() - 5..],
+        words(&["-O", "exit", "-p", "2222", "bob@fs.example.net"])[..]
+    );
+}
+
+#[test]
+fn a_host_that_is_told_something_else_is_using_its_connection_leaves_it_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let ssh = Fake::new();
+    let host = host(dir.path(), &ssh);
+
+    host.keep_open();
+    drop(host);
+
+    // Nothing was asked to close: the connection belongs to the declaration
+    // that is still being read through it as much as to this one.
+    assert!(ssh.asked_about("exit").is_empty(), "{:?}", ssh.asked());
 }
 
 #[test]

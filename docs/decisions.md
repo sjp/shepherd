@@ -924,3 +924,68 @@ anything about a container — what goes in is whatever turns out to be in there
 and there is no halfway version of putting a binary on a machine. A command line
 carrying both is refused with the parser's own usage status rather than quietly
 doing half of what it says.
+
+## 2026-08-19 — knowing which daemon is at the far end
+
+### A daemon is the machine it is on and the user it runs as
+
+**Every snapshot carries `daemon: {"id": "<machine-id>:<uid>"}`, and the string
+is compared for equality and read for nothing else.** The machine half is
+whatever the host already calls itself — `/etc/machine-id`, then D-Bus's copy of
+it — because an id somebody else maintains outlives reboots, addresses and this
+program's own installation. The user half is not decoration: this program's
+sockets are per-user, so `ssh root@host` and `ssh host` reach one machine and
+two daemons holding two sets of sessions, and keying on the machine alone would
+merge them.
+
+A host that names no machine of its own gets one made up and kept beside the
+user's runtime files. It is written there rather than beside the sockets because
+a caller may point a daemon's sockets anywhere — a test, a second bus — and an
+identity that moved with them would make one machine look like several. Where
+that directory is cleared at boot, the id lasts for the life of the boot, which
+is longer than any attachment to that machine lasts.
+
+### Randomness for that comes from the kernel, not from a crate
+
+**Sixteen bytes of `/dev/urandom`, written as hexadecimal.** It is wanted in one
+place, for one value, once in the life of a machine that has no id of its own,
+and a dependency is a thing to be justified by more than four lines of code. A
+process that cannot open it — one with no `/dev` — falls back to hashing what is
+to hand, which is worth less than randomness and worth more than every such
+daemon agreeing on one value.
+
+### An address is not an identity, and the guess is kept apart from the answer
+
+**`Transport::identity` is what the transport knows it reached; a new
+`Transport::way_in` is what it could tell before reaching anything.** Docker
+answers the first, with the container id it asked for. ssh answers only the
+second, because where ssh would go is not what is at the other end of it: two
+names may be one machine, one name may be two machines on two days, and the
+party that knows is the daemon over there. What `agentbus targets` prints
+follows the same distinction — an identity when there is one, and the word
+`(provisional)` while the only thing known is where a connection would go.
+
+The way in is ssh's own resolved user, host and port, which is what ssh builds
+`%C` — and so the multiplexed connection's socket — out of. That is why one
+string does both jobs: two declarations that answer alike are two declarations
+ssh itself considers one endpoint, and they are already sharing one connection.
+Nothing here reproduces ssh's hash; what is compared is the resolution ssh made
+it from.
+
+### Several names for one daemon are all read until it says they are one
+
+**Every declaration gets its own stream, and the ones reading a daemon another
+stream is already reading are let go of afterwards.** Grouping them beforehand
+on the way in makes `agentbus targets` honest before anything has answered, and
+is only a guess — the split case is real, and a guess that suppressed a
+connection could never be found out. Riding ssh's multiplexing is what makes
+that affordable: the second stream costs a channel on a connection that is
+already open, not a second login.
+
+Letting go of the extra stream is not detaching. Detaching says nobody can speak
+for those sessions any more, and here the other attachment still is, so what was
+reported stays exactly where it is; and the connection is left open when
+something else is still reaching through it, which is what `Transport::keep_open`
+is for. The same rule now applies to ordinary detaching, where two attachments
+happened to overlap: a session is ended when no attachment is reporting it, not
+when the first of two goes away.

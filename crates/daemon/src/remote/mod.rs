@@ -40,6 +40,21 @@
 //! step, and [`Registry`] is how a name in a declaration becomes a way of
 //! reaching something.
 //!
+//! # One endpoint, named several ways
+//!
+//! Nothing about a name says what is behind it. Somebody declares `fileserver`,
+//! `192.168.0.42` and `fs.example.net` and means one machine; somebody else
+//! declares one name that meant a different machine last week. Two answers are
+//! kept apart accordingly. Before anything has been reached there is what the
+//! transport can work out for nothing — [`Transport::way_in`], which says two
+//! declarations obviously go to one place and never that two of them do not.
+//! Once a stream is open there is the daemon's own account of itself, which is
+//! authoritative and settles it: several declarations that reach one daemon
+//! become one attachment listing all of them, and one stream is let go of
+//! without withdrawing what it reported, because the attachment that is left is
+//! reporting the same thing. What the daemon here calls itself, for whoever is
+//! doing this to it, is [`crate::identity`].
+//!
 //! # Endpoints nobody had to name
 //!
 //! Where something on this machine already keeps an authoritative list of what

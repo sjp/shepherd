@@ -174,10 +174,17 @@ async fn a_subscriber_is_told_the_whole_state_before_it_is_told_anything_else() 
         "{statuses:?}"
     );
     // This daemon has no process table to read, so it says nothing whatever
-    // about the foreground rather than saying there is nothing in it; and
-    // nothing says which daemon this is. Both are absent rather than empty.
+    // about the foreground rather than saying there is nothing in it: absent
+    // rather than empty.
     assert!(snapshot.foreground.is_none());
-    assert!(snapshot.daemon.is_none());
+    // And it says which daemon this is, which is how a subscriber that is
+    // reading two of these tells one machine from two.
+    let daemon = snapshot.daemon.expect("this daemon did not say what it is");
+    let (machine, uid) = daemon.id.split_once(':').expect("no user in the identity");
+    assert!(!machine.is_empty(), "{}", daemon.id);
+    // Safe by construction: `geteuid` reads one field of the calling process and
+    // cannot fail.
+    assert_eq!(uid, unsafe { libc::geteuid() }.to_string(), "{}", daemon.id);
 }
 
 #[tokio::test]

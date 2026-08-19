@@ -47,7 +47,7 @@ use agentbus_protocol::Timestamp;
 use tracing::{debug, info, warn};
 
 use super::attach::{self, Attachment};
-use super::attachments::{Attachments, Entry, State};
+use super::attachments::{Attachments, Entry, Sharing, State};
 use super::bootstrap::Bootstrap;
 use super::discover::{Context, Discovery, Found};
 use super::targets::{Target, Targets};
@@ -218,19 +218,30 @@ struct Live {
     since: Timestamp,
     /// Whether it was found by looking rather than by being declared.
     auto: bool,
+    /// The way in to it, as far as could be told before anything reached it.
+    way_in: Option<String>,
+    /// What it turned out to be, once something said so. Kept once learned: an
+    /// endpoint whose stream has been let go because another set of words
+    /// reaches the same daemon is still known to be that daemon.
+    identity: Option<String>,
+    /// The declaration whose attachment carries this one, where these words
+    /// turned out to be another name for something already reached.
+    alias_of: Option<Vec<String>>,
 }
 
 impl Live {
-    /// What this endpoint looks like from outside.
-    fn entry(&self) -> Entry {
+    /// What this endpoint looks like from outside, given every other set of
+    /// words that turned out to reach it.
+    fn entry(&self, aliases: &[&Live]) -> Entry {
         Entry {
             transport: self.transport.clone(),
             args: self.args.clone(),
-            identity: self.attachment.as_ref().and_then(Attachment::identity),
-            // One for now. A transport that discovers two sets of words reach
-            // one endpoint adds the other here rather than by rewriting
-            // anybody's declaration.
-            aliases: vec![self.args.clone()],
+            identity: self.identity.clone(),
+            way_in: self.way_in.clone(),
+            aliases: std::iter::once(self.args.clone())
+                .chain(aliases.iter().map(|alias| alias.args.clone()))
+                .collect(),
+            sharing: self.sharing(aliases),
             label: self.label.clone(),
             state: self.state,
             attempt: self.attempt,
@@ -240,10 +251,48 @@ impl Live {
         }
     }
 
+    /// Whether every set of words reaching this endpoint reaches it the same
+    /// way, and nothing at all where there is only one of them or where the
+    /// transport has no way in to compare.
+    fn sharing(&self, aliases: &[&Live]) -> Option<Sharing> {
+        if aliases.is_empty() || self.way_in.is_none() {
+            return None;
+        }
+        match aliases.iter().all(|alias| alias.way_in == self.way_in) {
+            true => Some(Sharing::Shared),
+            false => Some(Sharing::Separate),
+        }
+    }
+
     /// Whether this is what `target` declared.
     fn is(&self, target: &Target) -> bool {
         self.transport == target.transport && self.args == target.args
     }
+}
+
+/// Whether two declarations turn out to name one endpoint.
+///
+/// Two answers, and which one is being given depends on how much is known. Where
+/// both far ends have said what they are, that settles it and nothing else is
+/// consulted: an identity is the daemon's own account of itself, and two
+/// different accounts are two daemons however alike the addresses look. Until
+/// then the way in stands in for it — two declarations ssh resolves to one
+/// endpoint are one endpoint, near enough to report as one — which is a guess,
+/// and one the paragraph above overturns the moment there is anything better.
+fn one(earlier: &Live, later: &Live) -> bool {
+    if earlier.transport != later.transport {
+        return false;
+    }
+    match (&earlier.identity, &later.identity) {
+        (Some(earlier), Some(later)) => earlier == later,
+        _ => earlier.way_in.is_some() && earlier.way_in == later.way_in,
+    }
+}
+
+/// Whether both far ends have said what they are and said the same thing, which
+/// is the point at which one of the two streams stops being worth reading.
+fn settled(earlier: &Live, later: &Live) -> bool {
+    earlier.identity.is_some() && earlier.identity == later.identity
 }
 
 /// The state one reconciler carries between passes.
@@ -308,6 +357,7 @@ impl Reconciler {
         self.declared();
         self.discovered();
         self.observe();
+        self.regroup();
         self.publish();
     }
 
@@ -352,7 +402,7 @@ impl Reconciler {
             if self.wanted.iter().any(|live| live.is(target)) {
                 continue;
             }
-            if let Some(live) = self.begin(target) {
+            if let Some(live) = self.begin(&target.transport, &target.args) {
                 self.wanted.push(live);
             }
         }
@@ -444,12 +494,15 @@ impl Reconciler {
                 transport: transport.to_owned(),
                 args: found.args,
                 label,
+                way_in: attachment.way_in(),
                 attachment: Some(attachment),
                 refused: None,
                 state: State::Connecting,
                 attempt: 0,
                 since: clock::now(),
                 auto: true,
+                identity: None,
+                alias_of: None,
             });
         }
     }
@@ -476,11 +529,11 @@ impl Reconciler {
     }
 
     /// Starts reaching one endpoint, or says why nothing was started.
-    fn begin(&mut self, target: &Target) -> Option<Live> {
-        let Some(made) = self.transports.make(&target.transport, &target.args) else {
-            if self.unknown.insert(target.transport.clone()) {
+    fn begin(&mut self, name: &str, args: &[String]) -> Option<Live> {
+        let Some(made) = self.transports.make(name, args) else {
+            if self.unknown.insert(name.to_owned()) {
                 warn!(
-                    transport = target.transport,
+                    transport = name,
                     known = %self.known(),
                     "a target is declared for a transport this build has never heard of; ignoring it"
                 );
@@ -492,7 +545,7 @@ impl Reconciler {
             Ok(transport) => {
                 let label = transport.label();
                 info!(
-                    transport = target.transport,
+                    transport = name,
                     endpoint = label,
                     "attaching to a declared endpoint"
                 );
@@ -503,32 +556,38 @@ impl Reconciler {
                     self.settings,
                 );
                 Some(Live {
-                    transport: target.transport.clone(),
-                    args: target.args.clone(),
+                    transport: name.to_owned(),
+                    args: args.to_vec(),
                     label,
+                    way_in: attachment.way_in(),
                     attachment: Some(attachment),
                     refused: None,
                     state: State::Connecting,
                     attempt: 0,
                     since: now,
                     auto: false,
+                    identity: None,
+                    alias_of: None,
                 })
             }
             Err(said) => {
                 warn!(
-                    transport = target.transport,
+                    transport = name,
                     said, "cannot reach what this target declares"
                 );
                 Some(Live {
-                    transport: target.transport.clone(),
-                    label: target.args.join(" "),
-                    args: target.args.clone(),
+                    transport: name.to_owned(),
+                    label: args.join(" "),
+                    args: args.to_vec(),
                     attachment: None,
                     refused: Some(said),
                     state: State::NeedsAttention,
                     attempt: 0,
                     since: now,
                     auto: false,
+                    way_in: None,
+                    identity: None,
+                    alias_of: None,
                 })
             }
         }
@@ -550,6 +609,11 @@ impl Reconciler {
             let Some(attachment) = live.attachment.as_ref() else {
                 continue;
             };
+            // Kept rather than replaced: an attachment that is between
+            // connections has not stopped being the endpoint it reached.
+            if let Some(identity) = attachment.identity() {
+                live.identity = Some(identity);
+            }
             let (state, attempt, said) = reported(&attachment.state());
             if state == live.state && attempt == live.attempt && said == live.refused {
                 continue;
@@ -562,14 +626,133 @@ impl Reconciler {
         }
     }
 
+    /// Works out which declarations turn out to name one endpoint, and lets go
+    /// of the streams that are reading a daemon another stream is already
+    /// reading.
+    ///
+    /// Only the declared ones. What a transport finds for itself it finds by
+    /// reading a list of what is there, and a list does not mention one endpoint
+    /// twice; what is declared is whatever somebody typed, which is exactly
+    /// where the same machine gets named three ways.
+    ///
+    /// The order is the declarations' own, and the earliest of a group carries
+    /// it: it is the one that was attached first, so keeping that one is the
+    /// choice that lets go of the connection made most recently and leaves the
+    /// one that has been working alone.
+    fn regroup(&mut self) {
+        let mut leaders: Vec<Option<usize>> = Vec::with_capacity(self.wanted.len());
+        for later in 0..self.wanted.len() {
+            let leader = (0..later).find(|earlier| {
+                leaders[*earlier].is_none() && one(&self.wanted[*earlier], &self.wanted[later])
+            });
+            leaders.push(leader);
+        }
+        for (later, leader) in leaders.into_iter().enumerate() {
+            match leader {
+                Some(earlier) => {
+                    self.wanted[later].alias_of = Some(self.wanted[earlier].args.clone());
+                    if settled(&self.wanted[earlier], &self.wanted[later]) {
+                        self.collapse(earlier, later);
+                    }
+                }
+                // Either it never was another name for anything, or whatever it
+                // was a name for is no longer declared, in which case this is
+                // now the one that has to be reaching the endpoint.
+                None => {
+                    self.wanted[later].alias_of = None;
+                    self.resume(later);
+                }
+            }
+        }
+    }
+
+    /// Stops reading one far end because the declaration at `earlier` is
+    /// reading the same daemon.
+    ///
+    /// What was reported through it stays: it is the other attachment's account
+    /// as much as this one's, and withdrawing it here would take away rows that
+    /// are still true. Whether the way in is closed depends on whether anything
+    /// else is still reaching through it — for ssh, two declarations it resolves
+    /// alike share one connection, and closing that would cut a stream this is
+    /// trying not to disturb.
+    fn collapse(&mut self, earlier: usize, later: usize) {
+        let shared = self.shares_the_way_in(later);
+        let Some(attachment) = self.wanted[later].attachment.take() else {
+            return;
+        };
+        info!(
+            endpoint = self.wanted[later].label,
+            also = self.wanted[earlier].label,
+            identity = self.wanted[later].identity,
+            "these turn out to be one endpoint; reading it through the first of them"
+        );
+        attachment.superseded(shared);
+    }
+
+    /// Whether anything else this daemon is reading reaches its far end the same
+    /// way as the declaration at `index` reaches its own.
+    ///
+    /// Which is to say: whether letting go of that one would take something
+    /// else's connection with it.
+    fn shares_the_way_in(&self, index: usize) -> bool {
+        let mine = &self.wanted[index].way_in;
+        mine.is_some()
+            && self
+                .wanted
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| *other != index)
+                .map(|(_, live)| live)
+                .chain(self.found.iter())
+                .any(|live| live.attachment.is_some() && &live.way_in == mine)
+    }
+
+    /// Starts reaching an endpoint again after whatever was reaching it for it
+    /// stopped being declared.
+    ///
+    /// Nothing happens to anything that is already attached, that is being
+    /// retried, or that could not be made into a transport at all: the last is a
+    /// state a person has to do something about, and trying it again every two
+    /// seconds would neither fix it nor be mentioned.
+    fn resume(&mut self, index: usize) {
+        let live = &self.wanted[index];
+        if live.attachment.is_some() || live.refused.is_some() {
+            return;
+        }
+        let (name, args) = (live.transport.clone(), live.args.clone());
+        info!(
+            transport = name,
+            endpoint = live.label,
+            "this is the only name left for an endpoint that was reached under another"
+        );
+        if let Some(live) = self.begin(&name, &args) {
+            self.wanted[index] = live;
+        }
+    }
+
+    /// Every other declaration reaching the endpoint `live` is attached to, in
+    /// the order they were declared in.
+    fn aliases_of(&self, live: &Live) -> Vec<&Live> {
+        self.wanted
+            .iter()
+            .filter(|alias| {
+                alias.transport == live.transport && alias.alias_of.as_ref() == Some(&live.args)
+            })
+            .collect()
+    }
+
     /// Writes what every attachment is doing, if it is not what was written
     /// last time.
+    ///
+    /// One entry per endpoint rather than per declaration: several sets of words
+    /// that reach one place are one thing that is attached, listing all of them.
     fn publish(&mut self) {
         let entries: Vec<Entry> = self
             .wanted
             .iter()
-            .chain(self.found.iter())
-            .map(Live::entry)
+            .filter(|live| live.alias_of.is_none())
+            .map(|live| live.entry(&self.aliases_of(live)))
+            .chain(self.found.iter().map(|live| live.entry(&[])))
             .collect();
         if self.published.as_ref() == Some(&entries) {
             return;

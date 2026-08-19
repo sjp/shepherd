@@ -186,7 +186,7 @@ pub struct Host {
     /// What it is called when telling somebody about it: what they typed.
     label: String,
     /// Who, where and on what port, as far as the configuration goes.
-    identity: String,
+    way_in: String,
     /// Whether the master has been asked after since this daemon started.
     checked: Mutex<bool>,
     /// Whether it has been told to close.
@@ -240,7 +240,7 @@ impl Host {
             argv: argv.to_vec(),
             options: options(config, &masters.socket()),
             label: argv.join(" "),
-            identity: format!("{user}@{hostname}:{port}"),
+            way_in: format!("{user}@{hostname}:{port}"),
             checked: Mutex::new(false),
             closed: AtomicBool::new(false),
         }
@@ -383,15 +383,53 @@ impl Transport for Host {
         self.label.clone()
     }
 
-    /// Who ssh would log in as, where, and on what port.
+    /// Nothing: an address is not an identity, and this end has not been told
+    /// one.
+    ///
+    /// What ssh was asked to reach says where to go and not what is there. Two
+    /// names may be one machine, one name may be two machines on two days, and
+    /// the same machine reached as two users is two of the daemons this is
+    /// looking for, because their sockets are per-user. The party that knows is
+    /// the daemon at the far end, which says so on every snapshot, so this end
+    /// waits to be told rather than concluding anything from what somebody
+    /// typed.
+    fn identity(&self) -> Option<String> {
+        None
+    }
+
+    /// Who ssh would log in as, where, and on what port — which is also what it
+    /// builds the name of a multiplexed connection's socket out of.
+    ///
+    /// That coincidence is the useful part, and it is not a coincidence: ssh
+    /// derives `%C` from the local host and the resolved user, host and port, so
+    /// two declarations that answer alike here are two declarations ssh itself
+    /// considers one endpoint, and they are already sharing one connection
+    /// rather than opening two. Nothing tries to reproduce that hash; what is
+    /// compared is the same resolution ssh made it from.
     ///
     /// Worth what it costs and no more. Two declarations that a `Host` block
     /// points at one machine come out identical here, which is enough to notice
     /// they are one endpoint; two names for one machine that only DNS could
     /// reconcile do not, because nothing has asked DNS anything. So this is good
     /// for spotting sameness and never for concluding difference.
-    fn identity(&self) -> Option<String> {
-        Some(self.identity.clone())
+    fn way_in(&self) -> Option<String> {
+        Some(self.way_in.clone())
+    }
+
+    /// Leaves the connection alone when this host is let go, because something
+    /// else is still using it.
+    ///
+    /// Two declarations that ssh considers one endpoint share one master, and
+    /// the ordinary way of letting go — asking that master to close — would take
+    /// the other one's stream down with it. Saying it is already closed is what
+    /// makes dropping this a local matter.
+    fn keep_open(&self) {
+        if !self.closed.swap(true, Ordering::SeqCst) {
+            debug!(
+                host = self.label,
+                "letting go of this host without closing the connection something else is using"
+            );
+        }
     }
 
     fn install_path(&self, version: &str) -> String {

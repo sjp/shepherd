@@ -68,8 +68,10 @@ fn the_daemon_listens_where_it_is_told_and_never_answers() {
 
     let socket = bus.join("emit.sock");
     wait_for(&socket);
+    // Whatever else a daemon keeps for this user under the runtime directory,
+    // the sockets are where it was told to put them and nowhere else.
     assert!(
-        !runtime.join("agentbus").exists(),
+        !runtime.join("agentbus").join("emit.sock").exists(),
         "an explicit directory did not win"
     );
     assert_eq!(mode(&bus), 0o700);

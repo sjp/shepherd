@@ -159,6 +159,17 @@ pub(crate) fn per_user_dir() -> PathBuf {
     per_user(current_uid())
 }
 
+/// Where this user's runtime files go, whatever directory the sockets were
+/// pointed at.
+///
+/// The same rules as above with the explicit variable left out, for the things
+/// that belong to the user on this machine rather than to one bus: a caller may
+/// point a daemon's sockets anywhere, and something that has to be the same for
+/// every daemon this user runs cannot follow it there.
+pub(crate) fn runtime_dir() -> PathBuf {
+    resolve_dir(None, std::env::var_os(RUNTIME_DIR_VAR), current_uid())
+}
+
 /// The per-user directory under `/tmp` for `uid`.
 fn per_user(uid: u32) -> PathBuf {
     PathBuf::from(format!("/tmp/{DIR_NAME}-{uid}"))
