@@ -428,7 +428,13 @@ pub trait Transport: fmt::Debug + Send + Sync {
     /// credential that is refused is the one that matters — and saying so is
     /// what stops something from retrying forever in a state nobody is being
     /// told about.
-    fn recoverable(&self, _error: &Error) -> bool {
+    ///
+    /// Whatever went wrong is offered whole rather than as one of the failures
+    /// named above, because most of what a transport can tell from is not a
+    /// variant: it is the sentence the tool printed, and by the time it gets
+    /// here it may be wrapped in a failure of some caller's own. A transport
+    /// that recognizes nothing in it says so by leaving this alone.
+    fn recoverable(&self, _failure: &dyn std::error::Error) -> bool {
         true
     }
 
@@ -535,12 +541,22 @@ impl Registry {
     /// A transport is added here as it is written, which is the whole of what a
     /// daemon has to be told about a new one.
     pub fn standard() -> Self {
-        Self::new().with(super::docker::NAME, |args| match args {
-            [reference] if !reference.is_empty() => Ok(Arc::new(
-                super::docker::Docker::resolve().container(reference),
-            ) as Arc<dyn Transport>),
-            _ => Err("a container is named by one word: its name or its id".to_owned()),
-        })
+        // One resolver and one directory of connections between every host, so
+        // that what ssh has already been asked is asked once and the masters all
+        // live in one place. Neither touches anything until a declaration names
+        // this transport.
+        let resolver = Arc::new(super::ssh::Resolver::new());
+        let masters = Arc::new(super::ssh::Masters::resolve());
+        Self::new()
+            .with(super::docker::NAME, |args| match args {
+                [reference] if !reference.is_empty() => Ok(Arc::new(
+                    super::docker::Docker::resolve().container(reference),
+                ) as Arc<dyn Transport>),
+                _ => Err("a container is named by one word: its name or its id".to_owned()),
+            })
+            .with(super::ssh::NAME, move |args| {
+                super::ssh::Host::declared(args, &resolver, &masters)
+            })
     }
 
     /// The same registry, also able to reach an endpoint declared under `name`.

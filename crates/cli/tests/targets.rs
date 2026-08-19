@@ -266,16 +266,27 @@ fn a_declaration_with_no_daemon_says_so_rather_than_failing() {
 #[test]
 fn a_daemon_says_what_it_is_attached_to_while_it_runs_and_takes_it_away_afterwards() {
     let machine = Machine::new();
-    machine.run(&["attach", "--", "fileserver"]);
+    // Words that could never reach anything, so that this is about what a
+    // daemon says rather than about a machine somebody would have to own: ssh's
+    // own grammar reads the last word as a command to run over there, which is
+    // not a thing a target may carry.
+    machine.run(&["attach", "--", "fileserver", "vim"]);
 
     let daemon = machine.daemon();
 
     let listed = machine.reported();
     assert_eq!(listed["daemon"], true);
-    // Nothing in this build reaches a host over ssh, so the declaration stands
-    // and nothing is attached to it — which is a different answer from there
+    // It is being reported on rather than reached: the declaration was refused
+    // before anything was connected to, which is a different answer from there
     // being no daemon to attach anything.
-    assert_eq!(listed["targets"][0]["state"], "not_attached");
+    assert_eq!(listed["targets"][0]["state"], "needs_attention");
+    assert!(
+        listed["targets"][0]["last_error"]
+            .as_str()
+            .expect("nothing was said about it")
+            .contains("carries a command to run"),
+        "{listed}"
+    );
 
     daemon.stop();
 

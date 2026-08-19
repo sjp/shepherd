@@ -165,7 +165,7 @@ impl Transport for Refusing {
         unreachable!("a far end that cannot be reached is never provisioned")
     }
 
-    fn recoverable(&self, _error: &Error) -> bool {
+    fn recoverable(&self, _failure: &dyn std::error::Error) -> bool {
         self.recoverable
     }
 

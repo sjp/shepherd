@@ -48,7 +48,7 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use super::bootstrap::{self, Bootstrap};
-use super::transport::{self, Running, Transport};
+use super::transport::{Running, Transport};
 use crate::bus::{AttachmentId, Bus};
 use crate::clock;
 
@@ -234,16 +234,6 @@ enum Broken {
     },
 }
 
-impl Broken {
-    /// What the transport said, where it was the transport that said anything.
-    fn transport(&self) -> Option<&transport::Error> {
-        match self {
-            Self::Bootstrap(bootstrap::Error::Transport(error)) => Some(error),
-            _ => None,
-        }
-    }
-}
-
 /// What the supervisor and whoever is holding the attachment both touch.
 #[derive(Debug)]
 struct Shared {
@@ -358,10 +348,11 @@ fn supervise(
                 }
             }
             Err(error) => {
-                let unrecoverable = error
-                    .transport()
-                    .is_some_and(|error| !transport.recoverable(error));
-                if unrecoverable {
+                // Asked of the transport whichever layer the failure came back
+                // through, because the thing that tells a host that is merely
+                // down from one that will never let this daemon in is what the
+                // tool printed, and that survives being wrapped.
+                if !transport.recoverable(&error) {
                     warn!(endpoint = label, %error, "cannot attach, and trying again will not help");
                     shared.set(State::NeedsAttention {
                         said: error.to_string(),
