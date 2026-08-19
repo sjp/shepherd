@@ -8,6 +8,14 @@ use serde_json::{Map, Value};
 use crate::VERSION;
 use crate::timestamp::Timestamp;
 
+/// The `detail` field an emitter puts the connection it was reached over in.
+///
+/// Set only where the emitter had no correlation of its own to report — a
+/// process that inherited neither is still reachable from whatever opened the
+/// connection, and that is worth saying. The value is copied out of the
+/// environment verbatim and is never interpreted here.
+pub const SSH_CONNECTION_DETAIL: &str = "ssh_connection";
+
 /// Which agent produced an event.
 ///
 /// The well-known values are exactly `claude`, `codex` and `opencode`; anything

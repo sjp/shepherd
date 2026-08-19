@@ -1,4 +1,4 @@
-//! What is running in front of each correlated shell.
+//! What is running in front of each watched shell.
 //!
 //! A shell is correlated by an environment variable it carries: whatever started
 //! it exported [`CORRELATION_VAR`], and every event emitted from underneath it
@@ -6,6 +6,15 @@
 //! question — not "what are my agents doing", which the events say, but "what
 //! process is in front of that terminal right now", which only the process table
 //! knows. A terminal running `vim` has an answer here and none there.
+//!
+//! # Shells nobody labelled
+//!
+//! A shell that arrived over a connection may carry no correlation at all — the
+//! variable is exported by whoever started the shell, and nothing guarantees it
+//! survives a boundary. Such a shell is still worth watching, so it is filed
+//! under [`SSH_CONNECTION_VAR`] instead: see [`Slot`]. Whoever reads these
+//! observations may then match one against another, made at the other end of
+//! the same connection, without either end having smuggled anything across.
 //!
 //! # Identity, never state
 //!
@@ -53,6 +62,16 @@ use crate::procfs::{Pid, ProcFs};
 /// validates or interprets one.
 pub const CORRELATION_VAR: &str = "AGENTBUS_PANE";
 
+/// The variable read for a correlation when [`CORRELATION_VAR`] is unset.
+///
+/// Purely a second name for the same thing, and read the same way: the value is
+/// copied and compared, never looked inside. It earns its place because a shell
+/// on the far side of an `ssh` connection inherits only what the server agreed
+/// to accept, and an `LC_`-prefixed name is what a default `sshd` configuration
+/// lets through. Nothing about that is this module's business beyond reading a
+/// second name.
+pub const CORRELATION_FALLBACK_VAR: &str = "LC_AGENTBUS_PANE";
+
 /// An environment variable carried alongside an observation for whoever has to
 /// match observations made on two sides of a connection.
 ///
@@ -68,16 +87,51 @@ pub const SSH_CONNECTION_VAR: &str = "SSH_CONNECTION";
 /// arrives between sweeps does not have to wait for one: see [`Monitor::want`].
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
-/// A change in what can be seen for one correlation.
+/// What a watched shell is filed under.
+///
+/// A shell that carries a correlation is filed under it, whatever else it
+/// carries. One that carries none is filed under the connection it arrived
+/// over, which is then the only thing that says which shell it is.
+///
+/// Both are opaque strings taken out of an environment block. This module
+/// compares two of them and does nothing else with either: it never splits one,
+/// never validates one, and has no opinion about what either variable's value
+/// is supposed to look like.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Slot {
+    /// The shell carried [`CORRELATION_VAR`], or [`CORRELATION_FALLBACK_VAR`].
+    Correlation(String),
+    /// The shell carried only [`SSH_CONNECTION_VAR`].
+    Connection(String),
+}
+
+impl Slot {
+    /// The value, whichever of the two it came from.
+    pub fn value(&self) -> &str {
+        match self {
+            Self::Correlation(value) | Self::Connection(value) => value,
+        }
+    }
+
+    /// The correlation, where the shell carried one.
+    pub fn correlation(&self) -> Option<&str> {
+        match self {
+            Self::Correlation(value) => Some(value),
+            Self::Connection(_) => None,
+        }
+    }
+}
+
+/// A change in what can be seen for one shell.
 ///
 /// Produced only when something is different from what was last reported for
 /// that shell, so a consumer may treat every one of these as news.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transition {
-    /// The correlation value this is about, exactly as the shell carried it.
-    pub correlation: String,
-    /// The shell the observation was made through. Two shells may carry the same
-    /// correlation, and this is what tells their observations apart.
+    /// What the shell is filed under, exactly as it carried it.
+    pub slot: Slot,
+    /// The shell the observation was made through. Two shells may be filed under
+    /// the same value, and this is what tells their observations apart.
     pub shell: Pid,
     /// What is now in the foreground, or `None` where the observation is
     /// withdrawn because there is no longer anything to observe.
@@ -90,15 +144,15 @@ pub struct Transition {
     pub gone: Option<Pid>,
 }
 
-/// The foreground process behind each correlation, and how it got there.
+/// The foreground process behind each watched shell, and how it got there.
 ///
 /// Owns a [`ProcFs`] and the state needed to tell one tick from the last. It is
 /// driven from outside and does nothing on its own.
 #[derive(Debug)]
 pub struct Monitor {
     proc: ProcFs,
-    /// Every shell being watched, keyed by the correlation it carries and its
-    /// own pid, so that two shells carrying one correlation stay distinct.
+    /// Every shell being watched, keyed by what it is filed under and its own
+    /// pid, so that two shells filed under one value stay distinct.
     shells: BTreeMap<Key, Shell>,
     /// Every correlation value this monitor has ever heard of, from a caller or
     /// from the process table. Only used to tell a new value from a known one.
@@ -111,8 +165,8 @@ pub struct Monitor {
     available: bool,
 }
 
-/// A correlation value and the shell that carries it.
-type Key = (String, Pid);
+/// What a shell is filed under and the shell that is filed under it.
+type Key = (Slot, Pid);
 
 impl Monitor {
     /// A monitor over one process table.
@@ -191,9 +245,16 @@ impl Monitor {
             return Vec::new();
         }
 
+        // One read of the connection tables serves every shell this round: they
+        // are two files however many processes are asked about, where the fd
+        // directory that has to be listed to use them is one per process.
+        let established = match self.shells.is_empty() {
+            true => BTreeMap::new(),
+            false => self.proc.established_tcp(),
+        };
         let proc = &self.proc;
-        self.shells.retain(|(correlation, pid), shell| {
-            match shell.look(proc, correlation, *pid, now) {
+        self.shells.retain(|(slot, pid), shell| {
+            match shell.look(proc, slot, *pid, now, &established) {
                 Step::Quiet => true,
                 Step::Changed(transition) => {
                     transitions.push(transition);
@@ -223,12 +284,12 @@ impl Monitor {
     /// Finds every shell in the process table and reconciles it with what was
     /// already being watched.
     ///
-    /// A shell carries the correlation, and so does everything it started, so
-    /// the shell is the *root* of the subtree that carries one value: the
-    /// process whose parent does not carry it too. A parent whose environment
-    /// cannot be read is not carrying anything as far as this can tell, which
-    /// makes its child a root — the right answer, since the child is then the
-    /// highest process that can be seen to be correlated.
+    /// A shell carries whatever it is filed under, and so does everything it
+    /// started, so the shell is the *root* of the subtree that carries one
+    /// value: the process whose parent does not carry it too. A parent whose
+    /// environment cannot be read is not carrying anything as far as this can
+    /// tell, which makes its child a root — the right answer, since the child is
+    /// then the highest process that can be seen to carry it.
     fn sweep(&mut self, now: &Timestamp, out: &mut Vec<Transition>) {
         self.swept = Some(now.clone());
         self.resweep = false;
@@ -240,30 +301,54 @@ impl Monitor {
             return;
         }
 
-        let mut carriers: BTreeMap<Pid, String> = BTreeMap::new();
+        let mut carriers: BTreeMap<Pid, Carried> = BTreeMap::new();
         for pid in pids {
-            if let Some(value) = self.proc.environ_var(pid, CORRELATION_VAR) {
-                carriers.insert(pid, value);
+            let carried = self.carried(pid);
+            if carried.correlation.is_some() || carried.connection.is_some() {
+                carriers.insert(pid, carried);
             }
         }
 
-        let mut roots: BTreeMap<String, Vec<Root>> = BTreeMap::new();
-        for (pid, value) in &carriers {
+        let mut roots: BTreeMap<Slot, Vec<Root>> = BTreeMap::new();
+        for (pid, carried) in &carriers {
             let Some(stat) = self.proc.stat(*pid) else {
                 continue;
             };
-            if carriers.get(&stat.ppid) == Some(value) {
-                continue;
-            }
-            roots.entry(value.clone()).or_default().push(Root {
+            let parent = carriers.get(&stat.ppid);
+            let slot = match &carried.correlation {
+                // A shell that carries a correlation is filed under it whatever
+                // else it carries, so its subtree is bounded by the correlation
+                // and the connection takes no part in deciding where it starts.
+                Some(value) => {
+                    if parent.and_then(|carried| carried.correlation.as_ref()) == Some(value) {
+                        continue;
+                    }
+                    Slot::Correlation(value.clone())
+                }
+                // No correlation, so the connection is the only thing left that
+                // says which shell this is. A process inside a subtree whose
+                // root does carry a correlation is skipped here, because its
+                // parent carries the same connection value and it is therefore
+                // not a root.
+                None => {
+                    let Some(value) = &carried.connection else {
+                        continue;
+                    };
+                    if parent.and_then(|carried| carried.connection.as_ref()) == Some(value) {
+                        continue;
+                    }
+                    Slot::Connection(value.clone())
+                }
+            };
+            roots.entry(slot).or_default().push(Root {
                 pid: *pid,
                 leads_session: stat.session == *pid,
             });
         }
 
         let mut shells = BTreeMap::new();
-        for (value, mut found) in roots {
-            // Two shells that exported the same value are two answers to one
+        for (slot, mut found) in roots {
+            // Two shells filed under the same value are two answers to one
             // question. A session leader is the better answer where there is
             // one — it is the shell a terminal belongs to rather than something
             // started underneath one — and where that does not decide it, both
@@ -272,19 +357,63 @@ impl Monitor {
                 found.retain(|root| root.leads_session);
             }
             for root in found {
-                let key = (value.clone(), root.pid);
+                let connection = carriers
+                    .get(&root.pid)
+                    .and_then(|carried| carried.connection.clone());
+                let key = (slot.clone(), root.pid);
                 let mut shell = self.shells.remove(&key).unwrap_or_default();
-                shell.ssh_connection = self.proc.environ_var(root.pid, SSH_CONNECTION_VAR);
+                shell.ssh_connection = connection;
                 shells.insert(key, shell);
             }
-            self.seen.insert(value);
+            if let Slot::Correlation(value) = slot {
+                self.seen.insert(value);
+            }
         }
 
         // Whatever the sweep did not find again is not there any more.
-        for ((correlation, pid), mut shell) in std::mem::replace(&mut self.shells, shells) {
-            out.extend(shell.withdraw(&self.proc, &correlation, pid));
+        for ((slot, pid), mut shell) in std::mem::replace(&mut self.shells, shells) {
+            out.extend(shell.withdraw(&self.proc, &slot, pid));
         }
     }
+
+    /// What one process carries of the two things a shell may be filed under.
+    ///
+    /// Both come out of one read of the environment block, which is what keeps a
+    /// sweep at one read per process however many names it is looking for.
+    ///
+    /// A value that is set to nothing is treated as unset. An empty correlation
+    /// ties nothing to anything, and an empty connection identifies no
+    /// connection, so in both cases the variable being there says no more than
+    /// its absence would.
+    fn carried(&self, pid: Pid) -> Carried {
+        let mut values = self
+            .proc
+            .environ_vars(
+                pid,
+                &[
+                    CORRELATION_VAR,
+                    CORRELATION_FALLBACK_VAR,
+                    SSH_CONNECTION_VAR,
+                ],
+            )
+            .into_iter()
+            .map(|value| value.filter(|value| !value.is_empty()));
+        let correlation = values.next().flatten();
+        let fallback = values.next().flatten();
+        Carried {
+            correlation: correlation.or(fallback),
+            connection: values.next().flatten(),
+        }
+    }
+}
+
+/// What one process carries of the two things a shell may be filed under.
+#[derive(Debug, Default)]
+struct Carried {
+    /// [`CORRELATION_VAR`], or [`CORRELATION_FALLBACK_VAR`] where that is unset.
+    correlation: Option<String>,
+    /// [`SSH_CONNECTION_VAR`].
+    connection: Option<String>,
 }
 
 /// The sweep interval in the units a timestamp difference comes in.
@@ -292,7 +421,7 @@ fn sweep_interval_millis() -> i64 {
     i64::try_from(SWEEP_INTERVAL.as_millis()).unwrap_or(i64::MAX)
 }
 
-/// A process carrying a correlation whose parent does not.
+/// A process carrying a value whose parent does not carry the same one.
 struct Root {
     pid: Pid,
     leads_session: bool,
@@ -327,14 +456,24 @@ enum Step {
 
 impl Shell {
     /// One tick's worth of work for one shell.
-    fn look(&mut self, proc: &ProcFs, correlation: &str, pid: Pid, now: &Timestamp) -> Step {
+    ///
+    /// `established` is the connection table for this round of reads, shared by
+    /// every shell; see [`ProcFs::established_tcp`].
+    fn look(
+        &mut self,
+        proc: &ProcFs,
+        slot: &Slot,
+        pid: Pid,
+        now: &Timestamp,
+        established: &BTreeMap<u64, u16>,
+    ) -> Step {
         let Some(shell) = proc.stat(pid) else {
-            return Step::Lost(self.withdraw(proc, correlation, pid));
+            return Step::Lost(self.withdraw(proc, slot, pid));
         };
         if shell.tpgid <= 0 {
             // No controlling terminal, so no foreground to speak of. The shell
             // is still there and may get one back.
-            return match self.withdraw(proc, correlation, pid) {
+            return match self.withdraw(proc, slot, pid) {
                 Some(transition) => Step::Changed(transition),
                 None => Step::Quiet,
             };
@@ -372,21 +511,26 @@ impl Shell {
         let observed = match followed {
             // The same pid keeps the name and command line it was resolved
             // with; only how it stands to its terminal can have moved, and
-            // `since` moves with it.
+            // `since` moves with it. What connection it holds open may have
+            // moved too, and that is re-read rather than kept, because a
+            // process that has just connected somewhere is the whole of what
+            // this field is for.
             Some((mut held, state)) => {
                 if held.entry.state != Some(state) {
                     held.entry.state = Some(state);
                     held.entry.since = now.clone();
                 }
                 held.entry.ssh_connection = self.ssh_connection.clone();
+                held.entry.ssh_client_port = sole_port(proc, held.pid, established);
                 Some(held)
             }
             None => resolve(
                 proc,
-                correlation,
+                slot,
                 shell.tpgid,
                 self.ssh_connection.clone(),
                 now,
+                established,
             ),
         };
 
@@ -397,7 +541,7 @@ impl Shell {
         }
         self.observed = observed;
         Step::Changed(Transition {
-            correlation: correlation.to_owned(),
+            slot: slot.clone(),
             shell: pid,
             foreground: self.observed.as_ref().map(|held| held.entry.clone()),
             gone,
@@ -411,10 +555,10 @@ impl Shell {
     /// the followed one is checked for one last time: that a shell died is a
     /// different fact from that the process in front of it did, and something
     /// binding sessions to pids needs the second one.
-    fn withdraw(&mut self, proc: &ProcFs, correlation: &str, pid: Pid) -> Option<Transition> {
+    fn withdraw(&mut self, proc: &ProcFs, slot: &Slot, pid: Pid) -> Option<Transition> {
         let observed = self.observed.take()?;
         Some(Transition {
-            correlation: correlation.to_owned(),
+            slot: slot.clone(),
             shell: pid,
             foreground: None,
             gone: (!proc.exists(observed.pid)).then_some(observed.pid),
@@ -429,10 +573,11 @@ impl Shell {
 /// the leader is the one that stands for it.
 fn resolve(
     proc: &ProcFs,
-    correlation: &str,
+    slot: &Slot,
     leader: Pid,
     ssh_connection: Option<String>,
     now: &Timestamp,
+    established: &BTreeMap<u64, u16>,
 ) -> Option<Observed> {
     let stat = proc.stat(leader)?;
     let pid = u32::try_from(leader).ok()?;
@@ -440,10 +585,23 @@ fn resolve(
     // which holds the same string; the command line is the one further read the
     // identity of a new pid costs.
     let cmdline = proc.cmdline(leader).unwrap_or_default().join(" ");
-    let mut entry = ForegroundEntry::new(correlation, pid, stat.comm, cmdline, now.clone());
+    let mut entry = ForegroundEntry::new(pid, stat.comm, cmdline, now.clone());
+    entry.correlation = slot.correlation().map(str::to_owned);
     entry.state = Some(ForegroundState::Foreground);
     entry.ssh_connection = ssh_connection;
+    entry.ssh_client_port = sole_port(proc, leader, established);
     Some(Observed { pid: leader, entry })
+}
+
+/// The source port of the one connection the observed process holds open.
+///
+/// Asked of every process this monitor follows and of no particular kind of
+/// process: there is no list here of programs that are allowed to have
+/// connections, because there could not be an honest one. What the field means
+/// where it is present, and why it is absent for a process with none or with
+/// several, is [`ProcFs::sole_established_port`].
+fn sole_port(proc: &ProcFs, pid: Pid, established: &BTreeMap<u64, u16>) -> Option<u32> {
+    proc.sole_established_port(pid, established).map(u32::from)
 }
 
 #[cfg(test)]
@@ -521,6 +679,16 @@ mod tests {
             let arguments: Vec<&str> = process.cmdline.iter().map(String::as_str).collect();
             fs::write(dir.join("cmdline"), nul_terminated(&arguments)).unwrap();
 
+            if !process.sockets.is_empty() {
+                let fd = dir.join("fd");
+                fs::create_dir_all(&fd).unwrap();
+                for (descriptor, inode) in process.sockets.iter().enumerate() {
+                    let link = fd.join(descriptor.to_string());
+                    let _ = fs::remove_file(&link);
+                    std::os::unix::fs::symlink(format!("socket:[{inode}]"), link).unwrap();
+                }
+            }
+
             let environ = dir.join("environ");
             let pairs: Vec<String> = process
                 .environ
@@ -537,6 +705,24 @@ mod tests {
         /// Takes one process out of the table, as an exit does.
         fn remove(&self, pid: Pid) {
             fs::remove_dir_all(self.root().join(pid.to_string())).unwrap();
+        }
+
+        /// Writes the connection table, as established connections of
+        /// `(socket inode, local port)`, replacing whatever was there.
+        fn established(&self, connections: &[(u64, u16)]) {
+            let net = self.root().join("net");
+            fs::create_dir_all(&net).unwrap();
+            let mut table = String::from(
+                "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when \
+                 retrnsmt   uid  timeout inode\n",
+            );
+            for (slot, (inode, port)) in connections.iter().enumerate() {
+                table.push_str(&format!(
+                    "{slot:4}: 0A00000A:{port:04X} 0A000009:0016 01 \
+                     00000000:00000000 00:00000000 00000000  1000        0 {inode} 1\n"
+                ));
+            }
+            fs::write(net.join("tcp"), table).unwrap();
         }
     }
 
@@ -560,6 +746,7 @@ mod tests {
         tpgid: Pid,
         cmdline: Vec<String>,
         environ: Vec<(String, String)>,
+        sockets: Vec<u64>,
         readable: bool,
     }
 
@@ -575,6 +762,7 @@ mod tests {
             tpgid: pid,
             cmdline: vec![comm.to_owned()],
             environ: Vec::new(),
+            sockets: Vec::new(),
             readable: true,
         }
     }
@@ -618,6 +806,12 @@ mod tests {
             self.env(CORRELATION_VAR, value)
         }
 
+        /// The sockets this process holds descriptors on, by inode.
+        fn holding(mut self, inodes: &[u64]) -> Self {
+            self.sockets = inodes.to_vec();
+            self
+        }
+
         /// An environment file nobody may open, as another user's is.
         fn secret(mut self) -> Self {
             self.readable = false;
@@ -655,7 +849,7 @@ mod tests {
 
         let transition = only(monitor.tick(&at(0)));
 
-        assert_eq!(transition.correlation, "pane-7");
+        assert_eq!(transition.slot, Slot::Correlation("pane-7".to_owned()));
         assert_eq!(transition.shell, 100);
         assert_eq!(transition.gone, None);
         let entry = observation(&transition);
@@ -803,7 +997,7 @@ mod tests {
         assert_eq!(transitions[0].shell, 100);
         assert_eq!(transitions[1].shell, 500);
         for transition in &transitions {
-            assert_eq!(transition.correlation, "pane-7");
+            assert_eq!(transition.slot, Slot::Correlation("pane-7".to_owned()));
         }
     }
 
@@ -864,7 +1058,7 @@ mod tests {
         tree.write(process(1, "init"));
         let transition = only(monitor.tick(&at(1)));
 
-        assert_eq!(transition.correlation, "pane-7");
+        assert_eq!(transition.slot, Slot::Correlation("pane-7".to_owned()));
         assert_eq!(transition.shell, 100);
         assert_eq!(transition.foreground, None);
         assert_eq!(transition.gone, Some(200), "it went with the shell");
@@ -877,7 +1071,10 @@ mod tests {
         let tree = Tree::new();
         tree.write(process(100, "bash").correlated("pane-a"));
         let mut monitor = tree.monitor();
-        assert_eq!(only(monitor.tick(&at(0))).correlation, "pane-a");
+        assert_eq!(
+            only(monitor.tick(&at(0))).slot,
+            Slot::Correlation("pane-a".to_owned())
+        );
 
         tree.write(process(200, "bash").correlated("pane-b"));
         assert!(
@@ -886,7 +1083,10 @@ mod tests {
         );
 
         monitor.want("pane-b");
-        assert_eq!(only(monitor.tick(&at(1))).correlation, "pane-b");
+        assert_eq!(
+            only(monitor.tick(&at(1))).slot,
+            Slot::Correlation("pane-b".to_owned())
+        );
 
         tree.write(process(300, "bash").correlated("pane-c"));
         monitor.want("pane-a");
@@ -896,8 +1096,8 @@ mod tests {
         );
 
         assert_eq!(
-            only(monitor.tick(&at(6))).correlation,
-            "pane-c",
+            only(monitor.tick(&at(6))).slot,
+            Slot::Correlation("pane-c".to_owned()),
             "the sweep interval finds it in its own time"
         );
     }
@@ -951,5 +1151,231 @@ mod tests {
             );
         }
         assert_eq!(monitor.observations().len(), 1);
+    }
+
+    #[test]
+    fn a_shell_that_carries_only_a_connection_is_watched_without_a_correlation() {
+        const CONNECTION: &str = "10.0.0.5 51234 10.0.0.9 22";
+
+        let tree = Tree::new();
+        tree.write(
+            process(100, "bash")
+                .fronted_by(200)
+                .env(SSH_CONNECTION_VAR, CONNECTION),
+        );
+        tree.write(
+            process(200, "claude")
+                .child_of(100)
+                .in_group(200)
+                .in_session(100)
+                .env(SSH_CONNECTION_VAR, CONNECTION),
+        );
+        let mut monitor = tree.monitor();
+
+        let transition = only(monitor.tick(&at(0)));
+
+        assert_eq!(transition.slot, Slot::Connection(CONNECTION.to_owned()));
+        assert_eq!(transition.shell, 100);
+        let entry = observation(&transition);
+        assert_eq!(entry.correlation, None);
+        assert_eq!(entry.ssh_connection.as_deref(), Some(CONNECTION));
+        assert_eq!(entry.pid, 200);
+        assert_eq!(entry.process, "claude");
+    }
+
+    #[test]
+    fn the_second_correlation_name_is_read_where_the_first_is_unset() {
+        let tree = Tree::new();
+        tree.write(process(100, "bash").env(CORRELATION_FALLBACK_VAR, "w1"));
+        let mut monitor = tree.monitor();
+
+        let transition = only(monitor.tick(&at(0)));
+
+        assert_eq!(transition.slot, Slot::Correlation("w1".to_owned()));
+        assert_eq!(observation(&transition).correlation.as_deref(), Some("w1"));
+    }
+
+    #[test]
+    fn the_first_correlation_name_is_the_one_that_counts_where_both_are_set() {
+        let tree = Tree::new();
+        tree.write(
+            process(100, "bash")
+                .correlated("the-one-here")
+                .env(CORRELATION_FALLBACK_VAR, "the-one-that-arrived"),
+        );
+        let mut monitor = tree.monitor();
+
+        assert_eq!(
+            only(monitor.tick(&at(0))).slot,
+            Slot::Correlation("the-one-here".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_correlation_set_to_nothing_is_a_correlation_nobody_set() {
+        let tree = Tree::new();
+        tree.write(
+            process(100, "bash")
+                .correlated("")
+                .env(CORRELATION_FALLBACK_VAR, "w1"),
+        );
+        let mut monitor = tree.monitor();
+
+        assert_eq!(
+            only(monitor.tick(&at(0))).slot,
+            Slot::Correlation("w1".to_owned()),
+            "an empty value ties nothing to anything, so the second name is read"
+        );
+    }
+
+    #[test]
+    fn a_shell_with_both_is_filed_under_its_correlation_and_reports_both() {
+        const CONNECTION: &str = "10.0.0.5 51234 10.0.0.9 22";
+
+        let tree = Tree::new();
+        tree.write(
+            process(100, "bash")
+                .env(CORRELATION_FALLBACK_VAR, "w1")
+                .env(SSH_CONNECTION_VAR, CONNECTION),
+        );
+        // Everything under it carries both, and none of it is a second shell.
+        tree.write(
+            process(200, "claude")
+                .child_of(100)
+                .in_group(100)
+                .in_session(100)
+                .env(CORRELATION_FALLBACK_VAR, "w1")
+                .env(SSH_CONNECTION_VAR, CONNECTION),
+        );
+        let mut monitor = tree.monitor();
+
+        let transition = only(monitor.tick(&at(0)));
+
+        assert_eq!(transition.slot, Slot::Correlation("w1".to_owned()));
+        let entry = observation(&transition);
+        assert_eq!(entry.correlation.as_deref(), Some("w1"));
+        assert_eq!(entry.ssh_connection.as_deref(), Some(CONNECTION));
+    }
+
+    #[test]
+    fn the_one_connection_the_foreground_process_holds_is_reported_as_its_port() {
+        let tree = Tree::new();
+        tree.established(&[(1001, 51234)]);
+        tree.write(process(100, "bash").fronted_by(200).correlated("pane-7"));
+        tree.write(
+            process(200, "ssh")
+                .child_of(100)
+                .in_group(200)
+                .in_session(100)
+                .holding(&[1001]),
+        );
+        let mut monitor = tree.monitor();
+
+        let entry = observation(&only(monitor.tick(&at(0)))).clone();
+
+        assert_eq!(entry.pid, 200);
+        assert_eq!(entry.ssh_client_port, Some(51234));
+    }
+
+    #[test]
+    fn a_foreground_process_with_no_connection_or_several_reports_no_port() {
+        let tree = Tree::new();
+        tree.established(&[(1001, 51234), (1002, 51235)]);
+        tree.write(process(100, "bash").fronted_by(200).correlated("pane-a"));
+        tree.write(
+            process(200, "curl")
+                .child_of(100)
+                .in_group(200)
+                .in_session(100)
+                .holding(&[1001, 1002]),
+        );
+        tree.write(process(300, "bash").fronted_by(400).correlated("pane-b"));
+        tree.write(
+            process(400, "vim")
+                .child_of(300)
+                .in_group(400)
+                .in_session(300),
+        );
+        let mut monitor = tree.monitor();
+
+        let ports: Vec<Option<u32>> = monitor
+            .tick(&at(0))
+            .iter()
+            .map(|transition| observation(transition).ssh_client_port)
+            .collect();
+
+        assert_eq!(ports, [None, None]);
+    }
+
+    #[test]
+    fn a_connection_that_appears_under_the_foreground_process_is_a_transition() {
+        let tree = Tree::new();
+        tree.established(&[]);
+        tree.write(process(100, "bash").fronted_by(200).correlated("pane-7"));
+        tree.write(
+            process(200, "ssh")
+                .child_of(100)
+                .in_group(200)
+                .in_session(100)
+                .holding(&[1001]),
+        );
+        let mut monitor = tree.monitor();
+        assert_eq!(
+            observation(&only(monitor.tick(&at(0)))).ssh_client_port,
+            None
+        );
+
+        // The same process, now connected: the pid did not change, so nothing
+        // about its identity did, and the port is still news.
+        tree.established(&[(1001, 51234)]);
+        let transition = only(monitor.tick(&at(1)));
+
+        let entry = observation(&transition);
+        assert_eq!(entry.pid, 200);
+        assert_eq!(entry.ssh_client_port, Some(51234));
+        assert_eq!(
+            entry.since,
+            at(0),
+            "the process did not change, so how long it has held did not either"
+        );
+        assert!(monitor.tick(&at(2)).is_empty());
+    }
+
+    #[test]
+    fn a_correlated_subtree_inside_a_connection_is_a_shell_of_its_own() {
+        const CONNECTION: &str = "10.0.0.5 51234 10.0.0.9 22";
+
+        let tree = Tree::new();
+        // A login shell with no correlation, and an agent under it that was
+        // started with one. Two roots, filed under two different things.
+        tree.write(
+            process(100, "bash")
+                .fronted_by(200)
+                .env(SSH_CONNECTION_VAR, CONNECTION),
+        );
+        tree.write(
+            process(200, "bash")
+                .child_of(100)
+                .in_group(200)
+                .in_session(100)
+                .fronted_by(200)
+                .correlated("w1")
+                .env(SSH_CONNECTION_VAR, CONNECTION),
+        );
+        let mut monitor = tree.monitor();
+
+        let slots: Vec<Slot> = monitor
+            .tick(&at(0))
+            .into_iter()
+            .map(|transition| transition.slot)
+            .collect();
+
+        assert_eq!(
+            slots,
+            [
+                Slot::Correlation("w1".to_owned()),
+                Slot::Connection(CONNECTION.to_owned()),
+            ]
+        );
     }
 }

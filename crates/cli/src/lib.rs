@@ -689,7 +689,7 @@ fn foreground(args: &ForegroundArgs) -> ExitCode {
         .filter(|entry| {
             args.correlation
                 .as_ref()
-                .is_none_or(|correlation| &entry.correlation == correlation)
+                .is_none_or(|correlation| entry.correlation.as_ref() == Some(correlation))
         })
         .collect();
     if wanted.is_empty() && args.correlation.is_some() {
@@ -738,21 +738,38 @@ fn tail(stream: &mut stream::Stream, of: Duration, out: &mut impl Write) -> Exit
 /// session. So there is one exit code here and it is zero, there is no output,
 /// and every decision that could go either way is made inside [`emit::run`],
 /// where it is made silently. The environment is read here and nowhere below:
-/// the correlation is whatever the variable holds, copied without being looked
-/// at, and an empty value is the same as an unset one because a correlation
-/// that says nothing cannot tie anything to anything.
+/// each value is whatever its variable holds, copied without being looked at,
+/// and an empty value is the same as an unset one because a value that says
+/// nothing cannot tie anything to anything.
+///
+/// Three variables and three `getenv` calls, which is what this path can
+/// afford. The second correlation name is read because a shell reached over a
+/// connection inherits only what the far end let through, and the connection
+/// itself is read because a shell that inherited neither name is still worth
+/// placing.
 fn emit(args: &EmitArgs, started: Instant) -> ExitCode {
     let pane = std::env::var_os(emit::PANE_VAR);
+    let fallback = std::env::var_os(emit::PANE_FALLBACK_VAR);
+    let connection = std::env::var_os(emit::SSH_CONNECTION_VAR);
     let request = emit::Request {
         agent: args.agent.as_deref(),
         source: args.source.as_deref(),
-        correlation: pane
-            .as_deref()
-            .and_then(std::ffi::OsStr::to_str)
-            .filter(|value| !value.is_empty()),
+        correlation: stated(&pane).or_else(|| stated(&fallback)),
+        ssh_connection: stated(&connection),
     };
     emit::run(&request, &args.location.paths(), started, std::io::stdin());
     ExitCode::SUCCESS
+}
+
+/// What an environment variable says, where it says anything at all.
+///
+/// A variable that is unset, one set to nothing, and one holding bytes that are
+/// not text are the same answer: this process was told nothing.
+fn stated(value: &Option<std::ffi::OsString>) -> Option<&str> {
+    value
+        .as_deref()
+        .and_then(std::ffi::OsStr::to_str)
+        .filter(|value| !value.is_empty())
 }
 
 /// Puts this program's hooks into the coding agents on this machine, or takes

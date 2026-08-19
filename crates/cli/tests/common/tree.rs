@@ -114,6 +114,17 @@ pub fn shell(pid: i32, correlation: &str, foreground: i32) -> Process {
     }
 }
 
+/// A shell that arrived over a connection carrying no correlation at all, with
+/// `foreground` in front of its terminal.
+pub fn connected_shell(pid: i32, connection: &str, foreground: i32) -> Process {
+    Process {
+        tpgid: foreground,
+        cmdline: vec!["-bash"],
+        environ: vec![("SSH_CONNECTION", connection.to_owned())],
+        ..Process::new(pid, "bash")
+    }
+}
+
 /// A process in the foreground of the terminal a shell owns.
 pub fn running(pid: i32, comm: &'static str, cmdline: Vec<&'static str>) -> Process {
     Process {

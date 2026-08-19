@@ -28,6 +28,15 @@
 //! operation returns `None`, or nothing, and writes one debug line saying which
 //! file it was and what the system said. There is no error type to match on.
 //!
+//! # Sockets and the network tables
+//!
+//! Two further questions have the same shape and are answered the same way:
+//! which sockets a process holds open, which procfs answers with symbolic links
+//! under `/proc/<pid>/fd`, and which connections those sockets are, which it
+//! answers with the tables under `/proc/net`. Both are ordinary files under the
+//! root this handle was pointed at, so both are as reachable from a directory a
+//! test wrote as from a kernel.
+//!
 //! # Parsing `stat`
 //!
 //! The one place this is subtle is the `stat` file, whose second field is the
@@ -43,6 +52,7 @@
 //! whitespace-separated. [`Stat::parse`] works that way round and never any
 //! other.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -277,6 +287,32 @@ impl ProcFs {
         })
     }
 
+    /// Several variables from the environment of one process, in the order the
+    /// names were given.
+    ///
+    /// One read however many names are asked about, which is what makes it
+    /// affordable to ask more than one question of every process in the table.
+    /// A name that is not set, and a whole environment that cannot be read, are
+    /// both simply `None` in the answer.
+    pub fn environ_vars(&self, pid: Pid, names: &[&str]) -> Vec<Option<String>> {
+        let mut found = vec![None; names.len()];
+        let Some(bytes) = self.read(pid, "environ") else {
+            return found;
+        };
+        for entry in nul_separated(&bytes) {
+            for (name, slot) in names.iter().zip(found.iter_mut()) {
+                if slot.is_none()
+                    && let Some(value) = entry
+                        .strip_prefix(name.as_bytes())
+                        .and_then(|rest| rest.strip_prefix(b"="))
+                {
+                    *slot = Some(String::from_utf8_lossy(value).into_owned());
+                }
+            }
+        }
+        found
+    }
+
     /// The working directory of one process.
     ///
     /// Procfs answers this with a symbolic link, and the link is read rather
@@ -294,6 +330,90 @@ impl ProcFs {
         }
     }
 
+    /// The inodes of the sockets one process holds open.
+    ///
+    /// Every entry under `/proc/<pid>/fd` is a link, and a link to a socket
+    /// reads as `socket:[<inode>]`. The inode is the only thing that identifies
+    /// which connection it is; the tables under `/proc/net` are keyed by the
+    /// same number, and [`ProcFs::established_tcp`] reads them.
+    ///
+    /// A set rather than a list because a process may hold several descriptors
+    /// on one socket — anything that has forked or called `dup` does — and
+    /// those are one connection, not several.
+    ///
+    /// Empty for a directory that cannot be listed, which for another user's
+    /// process is the normal outcome and is not a fault of any kind.
+    pub fn socket_inodes(&self, pid: Pid) -> BTreeSet<u64> {
+        let path = self.dir(pid).join("fd");
+        let entries = match fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                debug!(path = %path.display(), %error, "cannot list");
+                return BTreeSet::new();
+            }
+        };
+        entries
+            .filter_map(|entry| fs::read_link(entry.ok()?.path()).ok())
+            .filter_map(|target| socket_inode(target.to_str()?))
+            .collect()
+    }
+
+    /// The local port of every established TCP connection, by the inode of the
+    /// socket holding it.
+    ///
+    /// Both address families are read, always, because which one a connection
+    /// uses is not something anybody asking this question has chosen: a name
+    /// that resolves to an IPv6 address puts the connection in `tcp6`, and the
+    /// same name on the same machine may resolve the other way tomorrow.
+    ///
+    /// Only established connections are in the map. A listening socket has a
+    /// local port too, and it is not a connection to anywhere; including it
+    /// would make a server look like a client of itself.
+    ///
+    /// Read once and consulted many times, because it is one file per family
+    /// however many processes are being asked about.
+    pub fn established_tcp(&self) -> BTreeMap<u64, u16> {
+        let mut ports = BTreeMap::new();
+        for family in ["net/tcp", "net/tcp6"] {
+            let path = self.root.join(family);
+            let text = match fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(error) => {
+                    debug!(path = %path.display(), %error, "cannot read");
+                    continue;
+                }
+            };
+            for line in text.lines() {
+                if let Some((inode, port)) = established(line) {
+                    ports.insert(inode, port);
+                }
+            }
+        }
+        ports
+    }
+
+    /// The source port of the one connection a process has open, where it has
+    /// exactly one.
+    ///
+    /// `established` is what [`ProcFs::established_tcp`] returned for the same
+    /// round of reads.
+    ///
+    /// Exactly one is the whole of the rule. A process with no connection is
+    /// not reachable from anywhere and has no port to report; a process with
+    /// several — a browser, a language server, anything that talks to more than
+    /// one place — has no *one* port that stands for it, and picking any of
+    /// them would be attributing a connection to whatever the process happens
+    /// to be doing besides. Neither is an error: both mean this cannot say, and
+    /// saying nothing is the correct answer to a question with no answer.
+    pub fn sole_established_port(&self, pid: Pid, established: &BTreeMap<u64, u16>) -> Option<u16> {
+        let mut open = self
+            .socket_inodes(pid)
+            .into_iter()
+            .filter_map(|inode| established.get(&inode).copied());
+        let first = open.next()?;
+        open.next().is_none().then_some(first)
+    }
+
     /// One of a process's files, whole.
     fn read(&self, pid: Pid, name: &str) -> Option<Vec<u8>> {
         let path = self.dir(pid).join(name);
@@ -305,6 +425,46 @@ impl ProcFs {
             }
         }
     }
+}
+
+/// The inode in a `/proc/<pid>/fd` link target, where the target is a socket.
+///
+/// Every other kind of descriptor — a file, a pipe, an epoll set — has a target
+/// of some other shape, and none of them is a connection.
+fn socket_inode(target: &str) -> Option<u64> {
+    target
+        .strip_prefix("socket:[")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()
+}
+
+/// The socket inode and local port of one line of `/proc/net/tcp`, where that
+/// line is an established connection.
+///
+/// The format is the one `proc(5)` documents: a whitespace-separated table
+/// whose first line is headings, whose second column is the local address as
+/// `<hex address>:<hex port>`, whose fourth is the connection state, and whose
+/// tenth is the inode of the socket. `01` is `TCP_ESTABLISHED`; the rest of the
+/// states are connections being set up or torn down, and listening sockets,
+/// none of which is a connection this process has to somewhere.
+///
+/// The hex address is left alone. Which address a connection is on says nothing
+/// that the port does not say better, and reading one correctly would mean
+/// knowing which of the two families' byte orders this line is in.
+fn established(line: &str) -> Option<(u64, u16)> {
+    const ESTABLISHED: &str = "01";
+
+    let mut fields = line.split_ascii_whitespace();
+    let _slot = fields.next()?;
+    let local = fields.next()?;
+    let _remote = fields.next()?;
+    if fields.next()? != ESTABLISHED {
+        return None;
+    }
+    let port = u16::from_str_radix(local.rsplit_once(':')?.1, 16).ok()?;
+    let inode = fields.nth(5)?.parse().ok()?;
+    Some((inode, port))
 }
 
 /// The entries of a NUL-separated procfs file.
@@ -697,6 +857,138 @@ mod tests {
                 .iter()
                 .any(|(name, value)| { name == "PATH" && *value == path })
         );
+    }
+
+    #[test]
+    fn the_connection_tables_are_read_as_inodes_and_local_ports() {
+        let established = fixture("sockets").established_tcp();
+
+        assert_eq!(
+            established,
+            BTreeMap::from([(1001, 51234), (1002, 51235), (1003, 51236), (1004, 51237)]),
+            "a listening socket is not a connection and does not belong here"
+        );
+    }
+
+    #[test]
+    fn the_sockets_a_process_holds_are_the_links_that_are_sockets() {
+        let proc = fixture("sockets");
+
+        // Two descriptors on one socket are one socket, and a file, a pipe and
+        // an anonymous inode are not sockets at all.
+        assert_eq!(proc.socket_inodes(100), BTreeSet::from([1001]));
+        assert_eq!(proc.socket_inodes(102), BTreeSet::from([1003, 1004]));
+        assert!(
+            proc.socket_inodes(104).is_empty(),
+            "a process with no file table to list holds no sockets"
+        );
+    }
+
+    #[test]
+    fn one_established_connection_is_a_port_and_anything_else_is_nothing() {
+        let proc = fixture("sockets");
+        let established = proc.established_tcp();
+
+        assert_eq!(proc.sole_established_port(100, &established), Some(51234));
+        assert_eq!(
+            proc.sole_established_port(101, &established),
+            Some(51235),
+            "a connection in the second address family counts the same as one in the first"
+        );
+        assert_eq!(
+            proc.sole_established_port(102, &established),
+            None,
+            "two connections leave nothing that stands for the process"
+        );
+        assert_eq!(
+            proc.sole_established_port(103, &established),
+            None,
+            "a listening socket is not a connection to anywhere"
+        );
+        assert_eq!(
+            proc.sole_established_port(104, &established),
+            None,
+            "a process on its way out has no file table left to list"
+        );
+        assert_eq!(proc.sole_established_port(999, &established), None);
+    }
+
+    #[test]
+    fn a_file_table_nobody_may_list_is_no_connection_and_no_error() {
+        if is_root() {
+            eprintln!("skipped: running as root, which file modes do not apply to");
+            return;
+        }
+        let (_dir, proc) = writable_copy("sockets");
+        fs::set_permissions(proc.dir(100).join("fd"), fs::Permissions::from_mode(0o000)).unwrap();
+
+        assert!(proc.socket_inodes(100).is_empty());
+        assert_eq!(
+            proc.sole_established_port(100, &proc.established_tcp()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_root_with_no_connection_tables_has_no_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let proc = ProcFs::new(dir.path());
+
+        assert!(proc.established_tcp().is_empty());
+        assert_eq!(proc.sole_established_port(1, &BTreeMap::new()), None);
+    }
+
+    #[test]
+    fn a_line_of_a_connection_table_that_is_not_one_is_passed_over() {
+        for text in [
+            "",
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode",
+            // Every state but established, including the listening one.
+            "   0: 0A00000A:C822 0A000009:0016 0A 00000000:00000000 00:00000000 00000000 1000 0 1001 1",
+            "   0: 0A00000A:C822 0A000009:0016 06 00000000:00000000 00:00000000 00000000 1000 0 1001 1",
+            // A local address with no port on it.
+            "   0: 0A00000A 0A000009:0016 01 00000000:00000000 00:00000000 00000000 1000 0 1001 1",
+            // A port, and an inode, that are not numbers.
+            "   0: 0A00000A:zzzz 0A000009:0016 01 00000000:00000000 00:00000000 00000000 1000 0 1001 1",
+            "   0: 0A00000A:C822 0A000009:0016 01 00000000:00000000 00:00000000 00000000 1000 0 x 1",
+            // A line that stops before the inode.
+            "   0: 0A00000A:C822 0A000009:0016 01 00000000:00000000 00:00000000 00000000 1000 0",
+        ] {
+            assert_eq!(established(text), None, "read a connection out of {text:?}");
+        }
+    }
+
+    #[test]
+    fn a_link_target_that_is_not_a_socket_holds_no_inode() {
+        assert_eq!(socket_inode("socket:[1001]"), Some(1001));
+        for text in [
+            "",
+            "socket:[]",
+            "socket:[abc]",
+            "socket:[1001",
+            "1001",
+            "pipe:[1001]",
+            "/home/vscode/notes.txt",
+            "anon_inode:[eventpoll]",
+        ] {
+            assert_eq!(socket_inode(text), None, "read an inode out of {text:?}");
+        }
+    }
+
+    #[test]
+    fn several_variables_come_out_of_one_read_in_the_order_asked_for() {
+        let proc = fixture("basic");
+
+        assert_eq!(
+            proc.environ_vars(100, &["HOME", "NOT_SET", "AGENTBUS_PANE"]),
+            [
+                Some("/home/vscode".to_owned()),
+                None,
+                Some("pane-7".to_owned())
+            ]
+        );
+        assert_eq!(proc.environ_vars(100, &[]), Vec::<Option<String>>::new());
+        assert_eq!(proc.environ_vars(999, &["HOME"]), [None]);
     }
 
     #[test]

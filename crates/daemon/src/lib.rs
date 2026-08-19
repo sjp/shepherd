@@ -99,10 +99,10 @@ pub const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How often the process table is looked at.
 ///
-/// Steady state is a couple of reads per correlated shell, so looking this often
-/// costs nothing measurable, and it is fast enough that a command someone has
-/// just started is on the stream while they are still looking at the terminal
-/// they started it in.
+/// Steady state is a couple of reads per watched shell, plus the two connection
+/// tables once for all of them, so looking this often costs nothing measurable,
+/// and it is fast enough that a command someone has just started is on the
+/// stream while they are still looking at the terminal they started it in.
 pub const FOREGROUND_INTERVAL: Duration = Duration::from_millis(750);
 
 /// The version this daemon reports when it starts.

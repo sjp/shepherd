@@ -260,13 +260,38 @@ impl Bus {
                 .expect("this daemon is not watching a process table");
             if observed
                 .iter()
-                .any(|entry| entry.correlation == correlation)
+                .any(|entry| entry.correlation.as_deref() == Some(correlation))
             {
                 return snapshot;
             }
             assert!(
                 Instant::now() < deadline,
                 "nothing was ever observed for {correlation}: {observed:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Waits until the bus reports an observation matching `wanted`, and
+    /// returns the snapshot that says so.
+    pub fn wait_for_observation(
+        &self,
+        what: &str,
+        wanted: impl Fn(&ForegroundEntry) -> bool,
+    ) -> Snapshot {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let snapshot = self.snapshot();
+            let observed = snapshot
+                .foreground
+                .as_deref()
+                .expect("this daemon is not watching a process table");
+            if observed.iter().any(&wanted) {
+                return snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "nothing was ever observed for {what}: {observed:?}"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -428,7 +453,7 @@ pub fn foreground_of<'a>(snapshot: &'a Snapshot, correlation: &str) -> &'a Foreg
         .expect("this daemon is not watching a process table");
     let found: Vec<&ForegroundEntry> = observed
         .iter()
-        .filter(|entry| entry.correlation == correlation)
+        .filter(|entry| entry.correlation.as_deref() == Some(correlation))
         .collect();
     match found.as_slice() {
         [entry] => entry,

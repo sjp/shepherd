@@ -41,7 +41,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use agentbus_daemon::SocketPaths;
-use agentbus_protocol::{Source, UnstampedEvent};
+use agentbus_protocol::{SSH_CONNECTION_DETAIL, Source, UnstampedEvent};
 use serde_json::Value;
 use socket2::{Domain, SockAddr, Socket, Type};
 
@@ -55,6 +55,23 @@ use crate::{EMIT, LOG_VAR};
 /// here, and nothing may depend on its shape: two of these are equal or they are
 /// not, and that is the whole of the contract.
 pub const PANE_VAR: &str = "AGENTBUS_PANE";
+
+/// The variable read for the correlation when [`PANE_VAR`] is unset.
+///
+/// A second name for the same thing, read the same way and interpreted just as
+/// little. It is worth reading because a process on the far side of an `ssh`
+/// connection inherits only the variables the server agreed to accept, and an
+/// `LC_`-prefixed name is what a default `sshd` configuration lets through.
+pub const PANE_FALLBACK_VAR: &str = "LC_AGENTBUS_PANE";
+
+/// The variable whose value becomes an event's `ssh_connection` detail where
+/// there is no correlation to report instead.
+///
+/// `sshd` sets it in every remote session. This client copies it verbatim, does
+/// not look inside it, and reports it only as a last resort: a shell that
+/// carried a correlation has already said which shell it is, and the connection
+/// adds nothing to that.
+pub const SSH_CONNECTION_VAR: &str = "SSH_CONNECTION";
 
 /// The environment variable that sends diagnostics to a file instead of stderr.
 ///
@@ -119,9 +136,16 @@ pub struct Request<'a> {
     pub agent: Option<&'a str>,
     /// `--source`: where the claim comes from. Absent means a hook.
     pub source: Option<&'a str>,
-    /// The value of [`PANE_VAR`], if it was set to something. Copied into a
-    /// hook event verbatim; ignored for an observation, which states its own.
+    /// The value of [`PANE_VAR`], or of [`PANE_FALLBACK_VAR`] where that is
+    /// unset, if either was set to something. Copied into a hook event
+    /// verbatim; ignored for an observation, which states its own.
     pub correlation: Option<&'a str>,
+    /// The value of [`SSH_CONNECTION_VAR`], if it was set to something.
+    ///
+    /// Reported on a hook event only where there is no `correlation`, as the
+    /// one thing left that says where the event came from. Whoever reads the
+    /// event may recognise the connection; nothing here does.
+    pub ssh_connection: Option<&'a str>,
 }
 
 /// Reads a payload, and sends what it means to the bus if it means anything.
@@ -204,9 +228,16 @@ fn normalize(request: &Request<'_>, raw: &Value) -> Option<UnstampedEvent> {
                 PANIC_AGENT => panic!("{PANIC_AGENT}"),
                 _ => return None,
             };
-            match request.correlation {
-                Some(correlation) => Some(event.with_correlation(correlation)),
-                None => Some(event),
+            match (request.correlation, request.ssh_connection) {
+                (Some(correlation), _) => Some(event.with_correlation(correlation)),
+                // No correlation to copy, so the connection this process was
+                // reached over is reported instead. It is not a correlation and
+                // is not put in that field: it says which connection, and it is
+                // for a reader that can match it against the other end.
+                (None, Some(connection)) => {
+                    Some(event.with_detail_field(SSH_CONNECTION_DETAIL, connection))
+                }
+                (None, None) => Some(event),
             }
         }
         // An observation states its own correlation, which is why the
@@ -473,7 +504,7 @@ mod tests {
         let request = Request {
             agent: Some("claude"),
             source: Some("observed"),
-            correlation: None,
+            ..Request::default()
         };
         assert!(normalize(&request, &hook_payload()).is_none());
     }
@@ -483,7 +514,7 @@ mod tests {
         let request = Request {
             agent: Some("claude"),
             source: Some("guessed"),
-            correlation: None,
+            ..Request::default()
         };
         assert!(normalize(&request, &hook_payload()).is_none());
     }
@@ -494,7 +525,7 @@ mod tests {
             let request = Request {
                 agent: Some("claude"),
                 source,
-                correlation: None,
+                ..Request::default()
             };
             assert!(normalize(&request, &hook_payload()).is_some());
         }
@@ -506,6 +537,7 @@ mod tests {
             agent: None,
             source: Some("observed"),
             correlation: Some("from-the-environment"),
+            ..Request::default()
         };
         let payload = json!({"kind": "blocked", "correlation": "stated-by-the-observer"});
         let event = normalize(&request, &payload).expect("that should have been an event");

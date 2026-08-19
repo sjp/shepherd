@@ -171,8 +171,11 @@ pub struct SessionEntry {
 /// started under another program, is never in the foreground.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForegroundEntry {
-    /// The opaque correlation string this observation is about.
-    pub correlation: String,
+    /// The opaque correlation string this observation is about, where the shell
+    /// it was made through carried one. Absent for a shell that carried none —
+    /// an observation is still worth making about a terminal nobody labelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<String>,
     /// The observed process id, in the observing daemon's process namespace.
     pub pid: u32,
     /// The process name.
@@ -189,12 +192,24 @@ pub struct ForegroundEntry {
     /// Whether the process is in the foreground or has been backgrounded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<ForegroundState>,
-    /// An opaque value a monitor may report to help an aggregator match this
-    /// observation against one made on the other side of a connection. Compared
-    /// as-is, never interpreted.
+    /// The single established outbound TCP source port of the observed process,
+    /// where it has exactly one such connection open.
+    ///
+    /// A monitor reports it so that an aggregator can match this observation
+    /// against one made on the other side of that connection. It is a number
+    /// the kernel chose, and a consumer compares it as an opaque value: nothing
+    /// is inferred from its magnitude, and a process with no connection or with
+    /// several is simply one this cannot speak for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_client_port: Option<u32>,
-    /// A second opaque value with the same purpose and the same rule.
+    /// The `SSH_CONNECTION` the shell this observation was made through carried,
+    /// verbatim.
+    ///
+    /// Serves the same matching purpose from the other end, and under the same
+    /// rule: it is copied from an environment variable and compared, never
+    /// interpreted. The one thing anybody may do with its shape is documented
+    /// where the matching is done, and it is `sshd`'s documented format rather
+    /// than anything a receiver invented.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_connection: Option<String>,
 }
@@ -202,14 +217,13 @@ pub struct ForegroundEntry {
 impl ForegroundEntry {
     /// Builds an observation from the parts every monitor can supply.
     pub fn new(
-        correlation: impl Into<String>,
         pid: u32,
         process: impl Into<String>,
         cmdline: impl Into<String>,
         since: Timestamp,
     ) -> Self {
         Self {
-            correlation: correlation.into(),
+            correlation: None,
             pid,
             process: process.into(),
             cmdline: cmdline.into(),
@@ -219,6 +233,30 @@ impl ForegroundEntry {
             ssh_client_port: None,
             ssh_connection: None,
         }
+    }
+
+    /// The same observation, about `correlation`.
+    #[must_use]
+    pub fn with_correlation(mut self, correlation: impl Into<String>) -> Self {
+        self.correlation = Some(correlation.into());
+        self
+    }
+
+    /// The opaque value this observation is filed under.
+    ///
+    /// A slot is the `correlation` where there is one and the `ssh_connection`
+    /// where there is not, because those are the two things that identify the
+    /// shell an observation was made through: the label whatever started it
+    /// exported, or failing that the connection it arrived over. Both are
+    /// strings this crate never looks inside, so a slot is compared with `==`
+    /// and nothing else.
+    ///
+    /// It is the identity a whole shell's observations are withdrawn by; see
+    /// [`ForegroundChange`].
+    pub fn slot(&self) -> Option<&str> {
+        self.correlation
+            .as_deref()
+            .or(self.ssh_connection.as_deref())
     }
 }
 
@@ -278,10 +316,15 @@ pub struct ForegroundChange {
     pub ts: Timestamp,
     /// The new observation, or `null` when an observation is withdrawn.
     pub foreground: Option<ForegroundEntry>,
-    /// Which correlation lost its observation. Carried only on a withdrawal,
+    /// Which correlation lost its observations. Carried only on a withdrawal,
     /// where there is no entry to read it from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation: Option<String>,
+    /// Which connection lost its observations, for a shell that carried no
+    /// correlation to withdraw them by. Carried only on a withdrawal, and only
+    /// where [`ForegroundChange::correlation`] is not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_connection: Option<String>,
 }
 
 impl ForegroundChange {
@@ -293,10 +336,11 @@ impl ForegroundChange {
             ts,
             foreground: Some(foreground),
             correlation: None,
+            ssh_connection: None,
         }
     }
 
-    /// Withdraws the observation for a correlation.
+    /// Withdraws every observation filed under a correlation.
     pub fn withdrawn(seq: u64, ts: Timestamp, correlation: impl Into<String>) -> Self {
         Self {
             v: crate::VERSION,
@@ -304,6 +348,43 @@ impl ForegroundChange {
             ts,
             foreground: None,
             correlation: Some(correlation.into()),
+            ssh_connection: None,
+        }
+    }
+
+    /// Withdraws every observation filed under a connection, for a shell that
+    /// carried no correlation.
+    pub fn withdrawn_connection(
+        seq: u64,
+        ts: Timestamp,
+        ssh_connection: impl Into<String>,
+    ) -> Self {
+        Self {
+            v: crate::VERSION,
+            seq,
+            ts,
+            foreground: None,
+            correlation: None,
+            ssh_connection: Some(ssh_connection.into()),
+        }
+    }
+
+    /// Withdraws every observation filed where `entry` was filed.
+    ///
+    /// Takes the identity off the observation being withdrawn rather than
+    /// asking a caller to say which of the two fields it was, so that a
+    /// withdrawal cannot name a slot the entry was never under.
+    pub fn withdrawing(seq: u64, ts: Timestamp, entry: &ForegroundEntry) -> Self {
+        match &entry.correlation {
+            Some(correlation) => Self::withdrawn(seq, ts, correlation),
+            None => Self {
+                v: crate::VERSION,
+                seq,
+                ts,
+                foreground: None,
+                correlation: None,
+                ssh_connection: entry.ssh_connection.clone(),
+            },
         }
     }
 
@@ -311,8 +392,23 @@ impl ForegroundChange {
     pub fn correlation(&self) -> Option<&str> {
         self.foreground
             .as_ref()
-            .map(|entry| entry.correlation.as_str())
+            .and_then(|entry| entry.correlation.as_deref())
             .or(self.correlation.as_deref())
+    }
+
+    /// The slot this line is about: what an observation it reports is filed
+    /// under, or what a withdrawal withdraws.
+    ///
+    /// See [`ForegroundEntry::slot`] for what a slot is and why there are two
+    /// fields it can come from.
+    pub fn slot(&self) -> Option<&str> {
+        match &self.foreground {
+            Some(entry) => entry.slot(),
+            None => self
+                .correlation
+                .as_deref()
+                .or(self.ssh_connection.as_deref()),
+        }
     }
 }
 
@@ -397,7 +493,8 @@ mod tests {
 
     #[test]
     fn foreground_change_carries_an_entry_or_withdraws_one() {
-        let entry = ForegroundEntry::new("w9:p3", 4471, "claude", "claude --resume", ts());
+        let entry =
+            ForegroundEntry::new(4471, "claude", "claude --resume", ts()).with_correlation("w9:p3");
         let observed = ForegroundChange::observed(1042, ts(), entry);
         assert_eq!(
             serde_json::to_value(&observed).unwrap(),
@@ -435,7 +532,7 @@ mod tests {
             ssh_client_port: Some(51234),
             ssh_connection: Some("10.0.0.2 51234 10.0.0.1 22".to_owned()),
             origin: vec![OriginHop::new(OriginHop::SSH, "9f3c:1000", "fileserver")],
-            ..ForegroundEntry::new("w9:p3", 4471, "claude", "claude", ts())
+            ..ForegroundEntry::new(4471, "claude", "claude", ts()).with_correlation("w9:p3")
         };
         let written = serde_json::to_value(&entry).unwrap();
         assert_eq!(written["state"], json!("suspended"));
@@ -444,6 +541,77 @@ mod tests {
             serde_json::from_value::<ForegroundEntry>(written).unwrap(),
             entry
         );
+    }
+
+    #[test]
+    fn an_observation_of_a_shell_nobody_labelled_carries_the_connection_instead() {
+        let entry = ForegroundEntry {
+            ssh_connection: Some("10.0.0.5 51234 10.0.0.9 22".to_owned()),
+            ..ForegroundEntry::new(812, "claude", "claude", ts())
+        };
+        let written = serde_json::to_value(&entry).unwrap();
+
+        assert_eq!(written.get("correlation"), None, "{written}");
+        assert_eq!(entry.slot(), Some("10.0.0.5 51234 10.0.0.9 22"));
+        assert_eq!(
+            serde_json::from_value::<ForegroundEntry>(written).unwrap(),
+            entry
+        );
+
+        // A correlation is what an observation is filed under wherever there is
+        // one, whatever else it carries.
+        let labelled = entry.clone().with_correlation("w9:p3");
+        assert_eq!(labelled.slot(), Some("w9:p3"));
+
+        // And an observation with neither is filed under nothing at all.
+        assert_eq!(
+            ForegroundEntry::new(812, "claude", "claude", ts()).slot(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_withdrawal_names_the_slot_in_the_field_that_slot_came_from() {
+        let labelled =
+            ForegroundEntry::new(812, "claude", "claude", ts()).with_correlation("w9:p3");
+        let over = ForegroundEntry {
+            ssh_connection: Some("10.0.0.5 51234 10.0.0.9 22".to_owned()),
+            ..ForegroundEntry::new(812, "claude", "claude", ts())
+        };
+
+        let by_correlation = ForegroundChange::withdrawing(1044, ts(), &labelled);
+        assert_eq!(by_correlation.correlation(), Some("w9:p3"));
+        assert_eq!(by_correlation.ssh_connection, None);
+        assert_eq!(by_correlation.slot(), Some("w9:p3"));
+
+        let by_connection = ForegroundChange::withdrawing(1045, ts(), &over);
+        assert_eq!(by_connection.correlation(), None);
+        assert_eq!(by_connection.slot(), Some("10.0.0.5 51234 10.0.0.9 22"));
+        assert_eq!(
+            serde_json::to_value(&by_connection).unwrap(),
+            json!({
+                "kind": "foreground_change", "v": 1, "seq": 1045,
+                "ts": "2026-08-17T10:31:02.006Z",
+                "foreground": Value::Null,
+                "ssh_connection": "10.0.0.5 51234 10.0.0.9 22"
+            })
+        );
+
+        // A shell carrying nothing at all cannot be withdrawn by name, and the
+        // line says so rather than naming something it invented.
+        let anonymous = ForegroundEntry::new(812, "claude", "claude", ts());
+        assert_eq!(
+            ForegroundChange::withdrawing(1046, ts(), &anonymous).slot(),
+            None
+        );
+
+        for change in [by_correlation, by_connection] {
+            let line = serde_json::to_string(&change).unwrap();
+            assert_eq!(
+                serde_json::from_str::<StreamLine>(&line).unwrap(),
+                StreamLine::ForegroundChange(change)
+            );
+        }
     }
 
     #[test]

@@ -38,7 +38,8 @@ use std::sync::{Mutex, PoisonError};
 
 use agentbus_protocol::{
     DaemonIdentity, Event, ForegroundChange, ForegroundEntry, ForegroundState, OriginHop,
-    SessionEntry, SessionKey, SessionStatus, SessionTable, Snapshot, Timestamp, UnstampedEvent,
+    SSH_CONNECTION_DETAIL, SessionEntry, SessionKey, SessionStatus, SessionTable, Snapshot,
+    Timestamp, UnstampedEvent,
 };
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -46,7 +47,7 @@ use tracing::{debug, warn};
 
 use crate::binding::{Bind, Bindings};
 use crate::clock;
-use crate::foreground::Transition;
+use crate::foreground::{Slot, Transition};
 use crate::procfs::Pid;
 
 /// How many recent events the daemon keeps.
@@ -104,10 +105,23 @@ struct Attached {
     /// and "nobody is running anything" are different facts at every point in a
     /// chain, so this is carried rather than inferred from an empty table.
     watching: bool,
-    /// What it says is in the foreground, keyed by the correlation and the pid
-    /// in *its own* process namespace. The pid means nothing on this machine
-    /// beyond telling two of that daemon's observations apart.
+    /// What it says is in the foreground, keyed by the slot *it* filed the
+    /// observation under and the pid in *its own* process namespace. The pid
+    /// means nothing on this machine beyond telling two of that daemon's
+    /// observations apart.
+    ///
+    /// Its slot rather than the one an observation ends up with here, because
+    /// this table is maintained by the lines that daemon sends and it withdraws
+    /// a shell by the name it knows the shell by. A correlation put on an
+    /// observation here is carried in the observation, where it belongs, and
+    /// changes nothing about which of the far end's shells it is.
     foreground: BTreeMap<(String, u32), ForegroundEntry>,
+    /// Which of this daemon's correlations each connection the far end named
+    /// turned out to be, once a port matched; see [`State::correlate`].
+    ///
+    /// Kept per attachment because a port is only unique within one machine's
+    /// view of it, and the far end is what makes the pair a pair.
+    connections: BTreeMap<String, String>,
 }
 
 /// Everything the daemon knows, and the one place events enter it.
@@ -126,11 +140,11 @@ struct State {
     table: SessionTable,
     seq: u64,
     recent: VecDeque<Event>,
-    /// What is in the foreground of each correlated shell, keyed by the
-    /// correlation and the shell it was seen through, or `None` where nothing
-    /// is watching the process table at all.
+    /// What is in the foreground of each watched shell, keyed by the slot the
+    /// observation is filed under and the shell it was seen through, or `None`
+    /// where nothing is watching the process table at all.
     ///
-    /// Two shells may carry one correlation, and they are two answers to one
+    /// Two shells may be filed under one value, and they are two answers to one
     /// question rather than one answer twice, so the shell is part of the key.
     foreground: Option<BTreeMap<(String, Pid), ForegroundEntry>>,
     /// The process each session was last seen speaking from, for as long as both
@@ -312,7 +326,7 @@ impl Bus {
             if let Some(table) = foreground.as_mut() {
                 for transition in transitions {
                     *seq += 1;
-                    let key = (transition.correlation.clone(), transition.shell);
+                    let key = (transition.slot.value().to_owned(), transition.shell);
                     let line = match &transition.foreground {
                         Some(entry) => {
                             table.insert(key, entry.clone());
@@ -320,7 +334,7 @@ impl Bus {
                         }
                         None => {
                             table.remove(&key);
-                            ForegroundChange::withdrawn(*seq, now.clone(), &transition.correlation)
+                            withdrawing(*seq, now.clone(), &transition.slot)
                         }
                     };
                     let _ = self.events.send(Published::Foreground(line));
@@ -375,23 +389,37 @@ impl Bus {
         for entry in sessions {
             seeded.insert(state.table.seed(entry, now));
         }
+        let mut arriving: Vec<(String, ForegroundEntry)> = foreground
+            .unwrap_or_default()
+            .iter()
+            .map(|entry| (slot_of(entry), entry.clone()))
+            .collect();
+        for (_, entry) in &mut arriving {
+            state.correlate(id, entry);
+        }
+
         let attached = state.attached.entry(id).or_default();
         let dropped: Vec<SessionKey> = attached.sessions.difference(&seeded).cloned().collect();
         attached.sessions = seeded;
 
-        let reported: BTreeMap<(String, u32), ForegroundEntry> = foreground
-            .unwrap_or_default()
-            .iter()
-            .map(|entry| ((entry.correlation.clone(), entry.pid), entry.clone()))
+        let reported: BTreeMap<(String, u32), ForegroundEntry> = arriving
+            .into_iter()
+            .map(|(filed, entry)| ((filed, entry.pid), entry))
             .collect();
         attached.watching = foreground.is_some();
         let previous = std::mem::replace(&mut attached.foreground, reported.clone());
 
-        let withdrawn: BTreeSet<String> = previous
-            .keys()
-            .filter(|(correlation, _)| !reported.keys().any(|(still, _)| still == correlation))
-            .map(|(correlation, _)| correlation.clone())
-            .collect();
+        // A slot the far end no longer reports at all has lost every
+        // observation under it, and the line that says so is built from one of
+        // the observations being withdrawn, so that it names the slot in the
+        // field that slot came from.
+        let mut withdrawn: BTreeMap<String, ForegroundEntry> = BTreeMap::new();
+        for ((slot, _), entry) in previous
+            .iter()
+            .filter(|((slot, _), _)| !reported.keys().any(|(still, _)| still == slot))
+        {
+            withdrawn.entry(slot.clone()).or_insert(entry.clone());
+        }
         let observed: Vec<ForegroundEntry> = reported
             .iter()
             .filter(|(key, entry)| previous.get(*key) != Some(*entry))
@@ -403,9 +431,9 @@ impl Bus {
                 state.table.ended(key, now);
             }
         }
-        for correlation in withdrawn {
+        for entry in withdrawn.into_values() {
             state.seq += 1;
-            let line = ForegroundChange::withdrawn(state.seq, now.clone(), correlation);
+            let line = ForegroundChange::withdrawing(state.seq, now.clone(), &entry);
             let _ = self.events.send(Published::Foreground(line));
         }
         for entry in observed {
@@ -430,6 +458,7 @@ impl Bus {
         state.seq += 1;
         let mut event = event;
         event.seq = state.seq;
+        state.correlate_event(id, &mut event);
         if let Some(conflict) = state.table.apply_event(&event) {
             warn!(
                 agent = %conflict.key.agent,
@@ -458,6 +487,12 @@ impl Bus {
         state.seq += 1;
         let mut change = change;
         change.seq = state.seq;
+        // What the far end filed this under, read before anything here renames
+        // it: this daemon's table of that daemon's shells is keyed by the names
+        // that daemon uses for them.
+        let filed = change.foreground.as_ref().map(slot_of);
+        state.correlate_change(id, &mut change);
+
         let attached = state.attached.entry(id).or_default();
         // A daemon that reports a change is a daemon that is watching, whatever
         // its last snapshot said.
@@ -466,18 +501,22 @@ impl Bus {
             Some(entry) => {
                 attached
                     .foreground
-                    .insert((entry.correlation.clone(), entry.pid), entry.clone());
+                    .insert((filed.unwrap_or_default(), entry.pid), entry.clone());
             }
-            // A withdrawal names a correlation and nothing else, so it takes
-            // every observation of that correlation with it. That is what the
-            // line means at the far end too: the daemon that wrote it keeps its
-            // own table by exactly this rule.
+            // A withdrawal names a slot and nothing else, so it takes every
+            // observation filed under that slot with it. That is what the line
+            // means at the far end too: the daemon that wrote it keeps its own
+            // table by exactly this rule. Both fields are read because renaming
+            // the line put a correlation on it that the far end never used, and
+            // the name it did use is the one this table is keyed by.
             None => {
-                if let Some(correlation) = change.correlation() {
-                    attached
-                        .foreground
-                        .retain(|(reported, _), _| reported != correlation);
-                }
+                let named: Vec<&String> = [&change.correlation, &change.ssh_connection]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                attached
+                    .foreground
+                    .retain(|(slot, _), _| !named.contains(&slot));
             }
         }
         let _ = self.events.send(Published::Foreground(change.clone()));
@@ -500,15 +539,14 @@ impl Bus {
                 state.table.ended(key, now);
             }
         }
-        let withdrawn: BTreeSet<String> = attached
-            .foreground
-            .into_keys()
-            .map(|(correlation, _)| correlation)
-            .filter(|correlation| !state.still_observed(correlation))
-            .collect();
-        for correlation in withdrawn {
+        let mut withdrawn: BTreeMap<String, ForegroundEntry> = BTreeMap::new();
+        for ((slot, _), entry) in attached.foreground {
+            withdrawn.entry(slot).or_insert(entry);
+        }
+        withdrawn.retain(|slot, _| !state.still_observed(slot));
+        for entry in withdrawn.into_values() {
             state.seq += 1;
-            let line = ForegroundChange::withdrawn(state.seq, now.clone(), correlation);
+            let line = ForegroundChange::withdrawing(state.seq, now.clone(), &entry);
             let _ = self.events.send(Published::Foreground(line));
         }
     }
@@ -616,13 +654,10 @@ impl State {
     /// Whether any attachment is still observing something in `correlation`,
     /// which is the same question as above about the other half of what an
     /// attached daemon reports.
-    fn still_observed(&self, correlation: &str) -> bool {
-        self.attached.values().any(|attached| {
-            attached
-                .foreground
-                .keys()
-                .any(|(reported, _)| reported == correlation)
-        })
+    fn still_observed(&self, slot: &str) -> bool {
+        self.attached
+            .values()
+            .any(|attached| attached.foreground.keys().any(|(filed, _)| filed == slot))
     }
 
     /// Every foreground observation this daemon would report, its own and those
@@ -692,6 +727,156 @@ impl State {
         }
     }
 
+    /// Stamps the correlation of one of this daemon's own shells onto an
+    /// observation another daemon made through the connection that shell holds
+    /// open.
+    ///
+    /// This is the whole of what makes two views of one terminal one row.
+    /// Neither end sent the other anything: the far end reports the connection
+    /// its shell arrived over, this end reports the source port of the one
+    /// connection its own foreground process has open, and the two are the same
+    /// connection seen from its two halves. An observation that already carries
+    /// a correlation is left exactly as it is — the shell said what it was, and
+    /// nothing inferred here outranks that.
+    ///
+    /// Done for every attachment rather than for connections of some particular
+    /// kind, because the match is on values both ends produced and holds
+    /// wherever it holds. A far end whose shells carry no connection at all
+    /// never reaches the comparison.
+    ///
+    /// The pairing is remembered, so that an event which arrives from that same
+    /// shell can be attributed even at a moment when this end's own view of the
+    /// connection has not been re-read. It is dropped again as soon as an
+    /// observation of that shell arrives and no local shell holds the
+    /// connection any more; what was stamped before then stands, because it was
+    /// true when it was stamped.
+    fn correlate(&mut self, id: AttachmentId, entry: &mut ForegroundEntry) {
+        if entry.correlation.is_some() {
+            return;
+        }
+        let Some(connection) = entry.ssh_connection.clone() else {
+            return;
+        };
+        let held = self.holding(&connection);
+        let remembered = &mut self.attached.entry(id).or_default().connections;
+        match held {
+            Some(correlation) => {
+                entry.correlation = Some(correlation.clone());
+                remembered.insert(connection, correlation);
+            }
+            None => {
+                remembered.remove(&connection);
+            }
+        }
+    }
+
+    /// The same, for a whole line: an observation is stamped, and a withdrawal
+    /// is renamed.
+    ///
+    /// A withdrawal has to be renamed because of what was done to the
+    /// observations it withdraws. They went into this daemon's table under the
+    /// correlation stamped on them, so a line still naming the connection would
+    /// withdraw nothing, and a subscriber reading this daemon's stream would be
+    /// left holding an observation that has ended.
+    fn correlate_change(&mut self, id: AttachmentId, change: &mut ForegroundChange) {
+        if let Some(entry) = &mut change.foreground {
+            self.correlate(id, entry);
+            return;
+        }
+        let Some(connection) = change.ssh_connection.clone() else {
+            return;
+        };
+        if change.correlation.is_none()
+            && let Some(correlation) = self
+                .attached
+                .entry(id)
+                .or_default()
+                .connections
+                .remove(&connection)
+        {
+            change.correlation = Some(correlation);
+        }
+    }
+
+    /// Stamps a correlation on an event that came from a shell reached over a
+    /// connection one of this daemon's own shells holds open.
+    ///
+    /// The same match as [`State::correlate`] on the same value, because an
+    /// emitter with no correlation to copy reports the connection it was
+    /// reached over instead, and that says which shell here it came from just
+    /// as well. What this daemon can see now is preferred, and the pairing an
+    /// observation left behind stands in where it cannot see anything: an event
+    /// arrives whenever the agent produces one, which need not be a moment when
+    /// this end's own view of the connection has just been read.
+    fn correlate_event(&mut self, id: AttachmentId, event: &mut Event) {
+        if event
+            .correlation
+            .as_deref()
+            .is_some_and(|correlation| !correlation.is_empty())
+        {
+            return;
+        }
+        let Some(connection) = event
+            .detail
+            .as_ref()
+            .and_then(|detail| detail.get(SSH_CONNECTION_DETAIL))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        let correlation = self.holding(&connection).or_else(|| {
+            self.attached
+                .get(&id)
+                .and_then(|attached| attached.connections.get(&connection).cloned())
+        });
+        if let Some(correlation) = correlation {
+            event.correlation = Some(correlation);
+        }
+    }
+
+    /// The correlation of this daemon's own shell holding open the connection a
+    /// far end described, where exactly one of them does.
+    ///
+    /// `sshd` documents `SSH_CONNECTION` as four space-separated fields: the
+    /// client address, the client port, the server address and the server port.
+    /// Taking the second is the only structural thing done to the value
+    /// anywhere, and it is done against that documented format rather than
+    /// against a convention anybody here invented.
+    ///
+    /// Only the port is compared. It is the one part of the string that
+    /// identifies the connection rather than the machines at its ends;
+    /// addresses are rewritten by network address translation, mapped between
+    /// address families and replaced outright by a jump host, and none of that
+    /// changes which connection this is. The port is compared as a string,
+    /// against the decimal form of what was read from this machine's own
+    /// connection tables.
+    ///
+    /// Only this daemon's own observations are eligible. One relayed from
+    /// somewhere else is a view of a third machine's connections, whose ports
+    /// are numbers in a space this one shares nothing with.
+    ///
+    /// Where two of this daemon's shells would answer differently, none of them
+    /// answers: a correlation stamped on a guess is worse than none at all.
+    fn holding(&self, connection: &str) -> Option<String> {
+        let port = client_port(connection)?;
+        let mut correlations = self
+            .foreground
+            .as_ref()?
+            .values()
+            .filter(|entry| entry.origin.is_empty())
+            .filter(|entry| {
+                entry
+                    .ssh_client_port
+                    .is_some_and(|open| open.to_string() == port)
+            })
+            .filter_map(|entry| entry.correlation.as_deref());
+        let first = correlations.next()?;
+        correlations
+            .all(|other| other == first)
+            .then(|| first.to_owned())
+    }
+
     /// Ends every session bound to a process that has left the process table.
     ///
     /// A session that is already over is left where it is, so that the moment it
@@ -717,6 +902,39 @@ impl State {
     }
 }
 
+/// The client port field of an `SSH_CONNECTION` value.
+///
+/// Exactly four fields or nothing: a value with any other shape is not the one
+/// `sshd` documents, and guessing which of its parts was meant to be the port
+/// would be inventing a format.
+fn client_port(connection: &str) -> Option<&str> {
+    let mut fields = connection.split(' ');
+    let (_client, port, _server, _port) = (
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+    );
+    fields.next().is_none().then_some(port)
+}
+
+/// What an observation is filed under, for the tables keyed by it.
+///
+/// An observation with neither of the two values is filed under nothing, which
+/// is a key like any other: it is one shell's worth of observations, told apart
+/// from every other by the pid that goes in the key beside this.
+fn slot_of(entry: &ForegroundEntry) -> String {
+    entry.slot().unwrap_or_default().to_owned()
+}
+
+/// The line that withdraws every observation filed under one slot.
+fn withdrawing(seq: u64, ts: Timestamp, slot: &Slot) -> ForegroundChange {
+    match slot {
+        Slot::Correlation(value) => ForegroundChange::withdrawn(seq, ts, value),
+        Slot::Connection(value) => ForegroundChange::withdrawn_connection(seq, ts, value),
+    }
+}
+
 /// The process to follow for a session that spoke with `correlation` from
 /// `origin`, where the observations say what that is beyond doubt.
 ///
@@ -738,7 +956,9 @@ fn tracked(
 ) -> Option<Pid> {
     let mut running = foreground
         .values()
-        .filter(|entry| entry.correlation == correlation && same_path(&entry.origin, origin))
+        .filter(|entry| {
+            entry.correlation.as_deref() == Some(correlation) && same_path(&entry.origin, origin)
+        })
         .filter(|entry| {
             matches!(
                 entry.state,
@@ -782,7 +1002,7 @@ mod tests {
     use super::*;
 
     use agentbus_protocol::{Agent, Kind, Source, observed_session_id};
-    use serde_json::json;
+    use serde_json::{Map, json};
 
     /// A bus that is watching a process table, as one with a monitor behind it
     /// is.
@@ -800,10 +1020,11 @@ mod tests {
 
     /// What a monitor produces when it first sees something in front of a shell.
     fn appeared(correlation: &str, shell: Pid, pid: u32, process: &str) -> Transition {
-        let mut entry = ForegroundEntry::new(correlation, pid, process, process, now());
+        let mut entry =
+            ForegroundEntry::new(pid, process, process, now()).with_correlation(correlation);
         entry.state = Some(ForegroundState::Foreground);
         Transition {
-            correlation: correlation.to_owned(),
+            slot: Slot::Correlation(correlation.to_owned()),
             shell,
             foreground: Some(entry),
             gone: None,
@@ -813,7 +1034,7 @@ mod tests {
     /// What it produces when there is no longer anything to report there.
     fn withdrawn(correlation: &str, shell: Pid, gone: Option<Pid>) -> Transition {
         Transition {
-            correlation: correlation.to_owned(),
+            slot: Slot::Correlation(correlation.to_owned()),
             shell,
             foreground: None,
             gone,
@@ -1019,7 +1240,7 @@ mod tests {
 
         let observations = bus.foreground().expect("this bus is watching");
         assert_eq!(observations.len(), 1);
-        assert_eq!(observations[0].correlation, "w9:p3");
+        assert_eq!(observations[0].correlation.as_deref(), Some("w9:p3"));
         assert_eq!(observations[0].pid, 4471);
         assert_eq!(bus.last_seq(), 1);
         let Published::Foreground(line) = published.try_recv().unwrap() else {
@@ -1441,5 +1662,282 @@ mod tests {
         bus.tick(&Timestamp::parse("2026-08-17T11:32:01.412Z").unwrap());
 
         assert_eq!(bus.sessions()[0].status, SessionStatus::Stale);
+    }
+
+    /// An event as one arrives from a daemon at the far end.
+    fn from_far_away(connection: Option<&str>) -> Event {
+        let mut raw = tool_start();
+        raw["seq"] = json!(0);
+        raw["ts"] = json!(now());
+        let mut event: Event = serde_json::from_value(raw).expect("that is a tool_start line");
+        event.origin = vec![OriginHop::new(OriginHop::SSH, "9f3c:1000", "fileserver")];
+        event.detail = connection.map(|connection| {
+            Map::from_iter([(
+                SSH_CONNECTION_DETAIL.to_owned(),
+                Value::from(connection.to_owned()),
+            )])
+        });
+        event
+    }
+
+    /// A local shell whose foreground process holds one connection open.
+    fn holding(correlation: &str, shell: Pid, port: u32) -> Transition {
+        let mut transition = appeared(correlation, shell, 4471, "ssh");
+        if let Some(entry) = transition.foreground.as_mut() {
+            entry.ssh_client_port = Some(port);
+        }
+        transition
+    }
+
+    /// What a daemon at the far end of an ssh hop reports about a shell that
+    /// arrived there carrying no correlation.
+    fn over(connection: &str, pid: u32) -> ForegroundEntry {
+        let mut entry = ForegroundEntry::new(pid, "claude", "claude --resume", now());
+        entry.state = Some(ForegroundState::Foreground);
+        entry.ssh_connection = Some(connection.to_owned());
+        entry.origin = vec![OriginHop::new(OriginHop::SSH, "9f3c:1000", "fileserver")];
+        entry
+    }
+
+    #[test]
+    fn a_shell_at_the_far_end_of_a_connection_this_one_holds_open_is_that_shells_slot() {
+        let bus = watching();
+        let far = bus.attach();
+        bus.observed(&[holding("w1", 100, 51234)], &now());
+
+        let line = bus.merge_foreground(
+            far,
+            ForegroundChange::observed(0, now(), over("10.0.0.5 51234 10.0.0.9 22", 812)),
+        );
+
+        let entry = line.foreground.expect("an observation was merged");
+        assert_eq!(entry.correlation.as_deref(), Some("w1"));
+        assert_eq!(
+            entry.ssh_connection.as_deref(),
+            Some("10.0.0.5 51234 10.0.0.9 22")
+        );
+        assert_eq!(
+            entry.origin,
+            [OriginHop::new(OriginHop::SSH, "9f3c:1000", "fileserver")]
+        );
+        // And it is reported that way to anybody reading this daemon.
+        let observations = bus.foreground().expect("this bus is watching");
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|entry| entry.correlation.as_deref() == Some("w1"))
+                .count(),
+            2,
+            "{observations:?}"
+        );
+    }
+
+    #[test]
+    fn a_connection_no_shell_here_holds_open_leaves_the_far_end_uncorrelated() {
+        let bus = watching();
+        let far = bus.attach();
+        bus.observed(&[holding("w1", 100, 51234)], &now());
+
+        for connection in [
+            // The right shape, a port nothing here has open.
+            "10.0.0.5 51235 10.0.0.9 22",
+            // The port is there, and it is not the field a port goes in.
+            "51234 22 10.0.0.9 22",
+            // Not the four fields sshd writes.
+            "10.0.0.5 51234 10.0.0.9",
+            "10.0.0.5 51234 10.0.0.9 22 extra",
+            "51234",
+            "",
+        ] {
+            let line = bus.merge_foreground(
+                far,
+                ForegroundChange::observed(0, now(), over(connection, 812)),
+            );
+            let entry = line.foreground.expect("an observation was merged");
+            assert_eq!(entry.correlation, None, "matched on {connection:?}");
+        }
+    }
+
+    #[test]
+    fn a_far_end_that_says_which_shell_it_is_is_believed_over_any_port() {
+        let bus = watching();
+        let far = bus.attach();
+        bus.observed(&[holding("w1", 100, 51234)], &now());
+
+        let mut stated = over("10.0.0.5 51234 10.0.0.9 22", 812);
+        stated.correlation = Some("said-so".to_owned());
+        let line = bus.merge_foreground(far, ForegroundChange::observed(0, now(), stated));
+
+        assert_eq!(
+            line.foreground.unwrap().correlation.as_deref(),
+            Some("said-so")
+        );
+    }
+
+    #[test]
+    fn a_shell_here_that_has_gone_leaves_the_next_observation_over_it_uncorrelated() {
+        let bus = watching();
+        let far = bus.attach();
+        bus.observed(&[holding("w1", 100, 51234)], &now());
+        let first = bus.merge_foreground(
+            far,
+            ForegroundChange::observed(0, now(), over("10.0.0.5 51234 10.0.0.9 22", 812)),
+        );
+        assert_eq!(
+            first.foreground.unwrap().correlation.as_deref(),
+            Some("w1"),
+            "the connection was held open at the time"
+        );
+
+        // The pane closed, so nothing here holds that connection any more.
+        bus.observed(&[withdrawn("w1", 100, None)], &now());
+        let next = bus.merge_foreground(
+            far,
+            ForegroundChange::observed(0, now(), over("10.0.0.5 51234 10.0.0.9 22", 813)),
+        );
+
+        assert_eq!(next.foreground.unwrap().correlation, None);
+    }
+
+    #[test]
+    fn withdrawing_a_connection_withdraws_what_it_was_correlated_as() {
+        let bus = watching();
+        let far = bus.attach();
+        bus.observed(&[holding("w1", 100, 51234)], &now());
+        bus.merge_foreground(
+            far,
+            ForegroundChange::observed(0, now(), over("10.0.0.5 51234 10.0.0.9 22", 812)),
+        );
+
+        let line = bus.merge_foreground(
+            far,
+            ForegroundChange::withdrawn_connection(0, now(), "10.0.0.5 51234 10.0.0.9 22"),
+        );
+
+        // The line is renamed on the way through, because the observations it
+        // withdraws went into this daemon under the correlation put on them.
+        assert_eq!(line.correlation.as_deref(), Some("w1"));
+        let observations = bus.foreground().expect("this bus is watching");
+        assert_eq!(
+            observations.len(),
+            1,
+            "only this daemon's own shell should be left: {observations:?}"
+        );
+        assert!(observations[0].origin.is_empty());
+    }
+
+    #[test]
+    fn withdrawing_a_connection_takes_what_was_correlated_before_the_shell_here_went() {
+        let bus = watching();
+        let far = bus.attach();
+        bus.observed(&[holding("w1", 100, 51234)], &now());
+        bus.merge_foreground(
+            far,
+            ForegroundChange::observed(0, now(), over("10.0.0.5 51234 10.0.0.9 22", 812)),
+        );
+
+        // The shell here goes, so the next observation of the far end's shell is
+        // uncorrelated — and what was stamped before it stands.
+        bus.observed(&[withdrawn("w1", 100, None)], &now());
+        bus.merge_foreground(
+            far,
+            ForegroundChange::observed(0, now(), over("10.0.0.5 51234 10.0.0.9 22", 900)),
+        );
+        bus.merge_foreground(
+            far,
+            ForegroundChange::withdrawn_connection(0, now(), "10.0.0.5 51234 10.0.0.9 22"),
+        );
+
+        assert_eq!(
+            bus.foreground().expect("this bus is watching"),
+            Vec::new(),
+            "a withdrawal takes every observation the far end made of that shell"
+        );
+    }
+
+    #[test]
+    fn an_event_from_a_shell_over_a_connection_this_one_holds_open_is_that_shells() {
+        let bus = watching();
+        let far = bus.attach();
+        bus.observed(&[holding("w1", 100, 51234)], &now());
+
+        let merged = bus.merge(far, from_far_away(Some("10.0.0.5 51234 10.0.0.9 22")));
+
+        assert_eq!(merged.correlation.as_deref(), Some("w1"));
+    }
+
+    #[test]
+    fn an_event_arriving_when_nothing_here_can_be_seen_uses_what_an_observation_settled() {
+        let bus = watching();
+        let far = bus.attach();
+        bus.observed(&[holding("w1", 100, 51234)], &now());
+        bus.merge_foreground(
+            far,
+            ForegroundChange::observed(0, now(), over("10.0.0.5 51234 10.0.0.9 22", 812)),
+        );
+
+        // The monitor has not looked since, and this end's own view of the
+        // connection is momentarily gone; what the observation settled stands.
+        bus.observed(&[withdrawn("w1", 100, None)], &now());
+        let event = from_far_away(Some("10.0.0.5 51234 10.0.0.9 22"));
+
+        assert_eq!(bus.merge(far, event).correlation.as_deref(), Some("w1"));
+    }
+
+    #[test]
+    fn an_event_that_says_which_shell_it_came_from_keeps_saying_it() {
+        let bus = watching();
+        let far = bus.attach();
+        bus.observed(&[holding("w1", 100, 51234)], &now());
+
+        let mut event = from_far_away(Some("10.0.0.5 51234 10.0.0.9 22"));
+        event.correlation = Some("said-so".to_owned());
+
+        assert_eq!(
+            bus.merge(far, event).correlation.as_deref(),
+            Some("said-so")
+        );
+    }
+
+    #[test]
+    fn two_shells_here_holding_one_port_settle_nothing() {
+        let bus = watching();
+        let far = bus.attach();
+        bus.observed(
+            &[holding("w1", 100, 51234), holding("w2", 300, 51234)],
+            &now(),
+        );
+
+        let line = bus.merge_foreground(
+            far,
+            ForegroundChange::observed(0, now(), over("10.0.0.5 51234 10.0.0.9 22", 812)),
+        );
+
+        assert_eq!(
+            line.foreground.unwrap().correlation,
+            None,
+            "a correlation stamped on a guess is worse than none"
+        );
+    }
+
+    #[test]
+    fn a_connection_seen_through_one_far_end_is_not_a_connection_seen_through_another() {
+        let bus = watching();
+        let far = bus.attach();
+        let elsewhere = bus.attach();
+        bus.observed(&[holding("w1", 100, 51234)], &now());
+        bus.merge_foreground(
+            far,
+            ForegroundChange::observed(0, now(), over("10.0.0.5 51234 10.0.0.9 22", 812)),
+        );
+        bus.observed(&[withdrawn("w1", 100, None)], &now());
+
+        let event = from_far_away(Some("10.0.0.5 51234 10.0.0.9 22"));
+
+        assert_eq!(
+            bus.merge(elsewhere, event).correlation,
+            None,
+            "a port only means anything within one machine's view of it"
+        );
     }
 }

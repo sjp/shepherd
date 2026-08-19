@@ -7,7 +7,7 @@
 //! untouched. Both ways in are covered — an agent's own hook, and the ingestion
 //! path any program that watches a terminal can use.
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -80,11 +80,18 @@ fn start_daemon(dir: &Path) -> Process {
 /// Runs one hook: `payload` on stdin, `AGENTBUS_PANE` set to `pane` if it is
 /// given, exactly as an agent would run it.
 fn emit(dir: &Path, args: &[&str], pane: Option<&str>, payload: &[u8]) -> Output {
+    let environment: Vec<(&str, &str)> = pane
+        .map(|pane| ("AGENTBUS_PANE", pane))
+        .into_iter()
+        .collect();
+    emit_in(dir, args, &environment, payload)
+}
+
+/// The same, in whatever environment the hook is being said to have inherited.
+fn emit_in(dir: &Path, args: &[&str], environment: &[(&str, &str)], payload: &[u8]) -> Output {
     let mut command = command(dir, &["emit"]);
     command.args(args).stdin(Stdio::piped());
-    if let Some(pane) = pane {
-        command.env("AGENTBUS_PANE", pane);
-    }
+    command.envs(environment.iter().copied());
     let mut child = command.spawn().expect("cannot run agentbus");
     let mut stdin = child.stdin.take().expect("no stdin");
     stdin.write_all(payload).expect("cannot write the payload");
@@ -126,6 +133,49 @@ fn only_session(dir: &Path) -> Value {
             _ => panic!("more sessions than were sent: {sessions}"),
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A subscriber reading the daemon's stream, for the tests that are about what
+/// an event carries rather than about the session it folds into.
+struct Subscriber {
+    process: Process,
+    printed: BufReader<std::process::ChildStdout>,
+}
+
+/// Starts one, past the snapshot every stream begins with.
+fn subscribe(dir: &Path) -> Subscriber {
+    let mut process = Process(
+        command(dir, &["subscribe"])
+            .spawn()
+            .expect("cannot run agentbus"),
+    );
+    let mut printed = BufReader::new(process.0.stdout.take().expect("no stdout"));
+    let mut snapshot = String::new();
+    printed.read_line(&mut snapshot).expect("cannot read");
+    assert!(snapshot.contains(r#""kind":"snapshot""#), "{snapshot:?}");
+    Subscriber { process, printed }
+}
+
+impl Subscriber {
+    /// The next event on the stream, past anything else that arrives first.
+    ///
+    /// An event's `kind` is the kind of thing that happened, so it is the lines
+    /// that are *not* events which have to be named here.
+    fn event(&mut self) -> Value {
+        const NOT_EVENTS: [&str; 3] = ["snapshot", "heartbeat", "foreground_change"];
+
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            assert!(Instant::now() < deadline, "no event ever arrived");
+            let mut line = String::new();
+            self.printed.read_line(&mut line).expect("cannot read");
+            let line: Value = serde_json::from_str(&line).unwrap_or_else(|_| panic!("{line:?}"));
+            if !NOT_EVENTS.contains(&line["kind"].as_str().unwrap_or_default()) {
+                let _ = &self.process;
+                return line;
+            }
+        }
     }
 }
 
@@ -331,4 +381,83 @@ fn the_client_never_waits_for_the_bus_to_answer() {
     stream.shutdown(Shutdown::Both).expect("cannot close");
 
     assert_eq!(only_session(&dir)["status"], "working");
+}
+
+/// The variable `sshd` sets in every remote session.
+const SSH_CONNECTION: &str = "SSH_CONNECTION";
+
+/// The value it holds, in the four fields `sshd` documents.
+const CONNECTION: &str = "10.0.0.5 51234 10.0.0.9 22";
+
+#[test]
+fn a_hook_with_no_correlation_reports_the_connection_it_was_reached_over() {
+    let (_temp, dir) = bus_dir();
+    let _daemon = start_daemon(&dir);
+    let mut stream = subscribe(&dir);
+
+    emit_in(
+        &dir,
+        &["--agent", "claude"],
+        &[(SSH_CONNECTION, CONNECTION)],
+        &fixture("PreToolUse"),
+    );
+
+    let event = stream.event();
+    assert_eq!(event["correlation"], Value::Null);
+    assert_eq!(event["detail"]["ssh_connection"], CONNECTION);
+}
+
+#[test]
+fn a_hook_that_has_a_correlation_says_that_and_says_nothing_about_the_connection() {
+    let (_temp, dir) = bus_dir();
+    let _daemon = start_daemon(&dir);
+    let mut stream = subscribe(&dir);
+
+    emit_in(
+        &dir,
+        &["--agent", "claude"],
+        &[("AGENTBUS_PANE", "w9:p3"), (SSH_CONNECTION, CONNECTION)],
+        &fixture("PreToolUse"),
+    );
+
+    let event = stream.event();
+    assert_eq!(event["correlation"], "w9:p3");
+    assert_eq!(
+        event["detail"]["ssh_connection"],
+        Value::Null,
+        "the shell said which shell it was, so the connection adds nothing"
+    );
+}
+
+#[test]
+fn the_second_correlation_name_is_read_where_the_first_is_unset() {
+    let (_temp, dir) = bus_dir();
+    let _daemon = start_daemon(&dir);
+
+    emit_in(
+        &dir,
+        &["--agent", "claude"],
+        &[("LC_AGENTBUS_PANE", "w9:p3"), (SSH_CONNECTION, CONNECTION)],
+        &fixture("PreToolUse"),
+    );
+
+    assert_eq!(only_session(&dir)["correlation"], "w9:p3");
+}
+
+#[test]
+fn the_first_correlation_name_is_the_one_that_counts_where_both_are_set() {
+    let (_temp, dir) = bus_dir();
+    let _daemon = start_daemon(&dir);
+
+    emit_in(
+        &dir,
+        &["--agent", "claude"],
+        &[
+            ("AGENTBUS_PANE", "the-one-here"),
+            ("LC_AGENTBUS_PANE", "the-one-that-arrived"),
+        ],
+        &fixture("PreToolUse"),
+    );
+
+    assert_eq!(only_session(&dir)["correlation"], "the-one-here");
 }

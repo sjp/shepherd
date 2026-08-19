@@ -3,8 +3,14 @@
 //! What is printed answers "what is running in that terminal", which is a
 //! different question from the one `status` answers and has different columns:
 //! the correlation first, because that is what somebody is looking a row up by,
-//! then the process and how it stands to its terminal, then where the
-//! observation was made and how long it has held.
+//! then the connection the shell arrived over where there is one, then the
+//! process and how it stands to its terminal, then where the observation was
+//! made and how long it has held.
+//!
+//! The connection has a column of its own because a shell that carries no
+//! correlation is identified by nothing else. Printing it in the correlation's
+//! column would say the shell was labelled when it was not, and leaving it out
+//! would leave a row nobody could tell from any other.
 //!
 //! Every value here arrived from a daemon and is printed as it arrived. A
 //! correlation in particular is an opaque string belonging to whoever exported
@@ -15,8 +21,9 @@ use agentbus_protocol::{ForegroundEntry, ForegroundState, Timestamp};
 use crate::table::{self, ABSENT, Row};
 
 /// The column headings, in order.
-const HEADINGS: [&str; 7] = [
+const HEADINGS: [&str; 8] = [
     "CORRELATION",
+    "CONNECTION",
     "PID",
     "STATE",
     "PROCESS",
@@ -59,7 +66,14 @@ pub fn json(entries: &[&ForegroundEntry]) -> String {
 /// One observation's row, in the order of [`HEADINGS`].
 fn row(entry: &ForegroundEntry, now: &Timestamp) -> Row {
     Row::new(vec![
-        entry.correlation.clone(),
+        entry
+            .correlation
+            .clone()
+            .unwrap_or_else(|| ABSENT.to_owned()),
+        entry
+            .ssh_connection
+            .clone()
+            .unwrap_or_else(|| ABSENT.to_owned()),
         entry.pid.to_string(),
         entry
             .state
@@ -98,12 +112,12 @@ mod tests {
 
     fn entry(correlation: &str) -> ForegroundEntry {
         let mut entry = ForegroundEntry::new(
-            correlation,
             4471,
             "claude",
             "claude --resume",
             timestamp("2026-08-17T10:31:48.000Z"),
-        );
+        )
+        .with_correlation(correlation);
         entry.state = Some(ForegroundState::Foreground);
         entry
     }

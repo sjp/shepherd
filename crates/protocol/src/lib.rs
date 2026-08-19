@@ -43,7 +43,7 @@ pub mod stream;
 pub mod table;
 pub mod timestamp;
 
-pub use event::{Agent, Event, Kind, OriginHop, Source, UnstampedEvent};
+pub use event::{Agent, Event, Kind, OriginHop, SSH_CONNECTION_DETAIL, Source, UnstampedEvent};
 pub use fold::{DEFAULT_STALE_AFTER, Fold, Input, SessionState, is_activity};
 pub use status::SessionStatus;
 pub use stream::{

@@ -229,7 +229,7 @@ fn watching(pid: u32, origin: Vec<OriginHop>) -> ForegroundEntry {
     ForegroundEntry {
         origin,
         state: Some(ForegroundState::Foreground),
-        ..ForegroundEntry::new(SLOT, pid, "claude", "claude --resume", now())
+        ..ForegroundEntry::new(pid, "claude", "claude --resume", now()).with_correlation(SLOT)
     }
 }
 

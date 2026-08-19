@@ -17,7 +17,7 @@ mod common;
 use std::time::Duration;
 
 use agentbus_protocol::{ForegroundEntry, ForegroundState, SessionStatus, StreamLine};
-use common::tree::{Tree, running, shell};
+use common::tree::{Tree, connected_shell, running, shell};
 use common::{Bus, foreground_of};
 
 /// How long a test waits to be sure nothing more is coming.
@@ -73,7 +73,7 @@ fn a_command_replacing_another_is_one_line_on_the_stream() {
     let entry = change
         .foreground
         .expect("a change with no observation in it");
-    assert_eq!(entry.correlation, "w9:p3");
+    assert_eq!(entry.correlation.as_deref(), Some("w9:p3"));
     assert_eq!(entry.pid, 300);
     assert_eq!(entry.process, "vim");
     assert_eq!(entry.cmdline, "vim notes.md");
@@ -140,6 +140,7 @@ fn the_command_prints_a_row_for_what_it_can_see() {
         headings,
         [
             "CORRELATION",
+            "CONNECTION",
             "PID",
             "STATE",
             "PROCESS",
@@ -202,7 +203,7 @@ fn the_json_is_the_entries_one_to_a_line() {
         .map(|line| serde_json::from_str(line).unwrap_or_else(|error| panic!("{error} in {line}")))
         .collect();
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].correlation, "w9:p3");
+    assert_eq!(entries[0].correlation.as_deref(), Some("w9:p3"));
     assert_eq!(entries[0].pid, 200);
 }
 
@@ -270,4 +271,59 @@ fn there_is_nothing_to_report_from_where_there_is_no_daemon() {
     assert!(printed.stdout.is_empty(), "{printed:?}");
     let said = String::from_utf8_lossy(&printed.stderr);
     assert!(said.contains("no daemon running"), "{said}");
+}
+
+/// A connection value in the four fields `sshd` documents.
+const CONNECTION: &str = "10.0.0.5 51234 10.0.0.9 22";
+
+#[test]
+fn a_shell_that_arrived_over_a_connection_is_observed_without_a_correlation() {
+    let tree = Tree::new();
+    tree.write(&connected_shell(100, CONNECTION, 200));
+    tree.write(&running(200, "claude", vec!["claude", "--resume"]));
+    let bus = Bus::watching(&tree.root());
+
+    let snapshot = bus.wait_for_observation(CONNECTION, |entry| {
+        entry.ssh_connection.as_deref() == Some(CONNECTION)
+    });
+
+    let observed = snapshot.foreground.expect("this daemon is not watching");
+    assert_eq!(observed.len(), 1, "{observed:?}");
+    let entry = &observed[0];
+    assert_eq!(
+        entry.correlation, None,
+        "nothing labelled that shell, so nothing here may claim it was"
+    );
+    assert_eq!(entry.pid, 200);
+    assert_eq!(entry.process, "claude");
+
+    // And it is a row somebody can read, with the connection where the label
+    // would have been if there had been one.
+    let printed = bus.run(&["foreground"]);
+    let text = String::from_utf8(printed.stdout).expect("not text");
+    let rows = rows(&text);
+    assert_eq!(rows.len(), 1, "{text}");
+    assert!(rows[0].contains(CONNECTION), "{text}");
+    assert!(rows[0].starts_with('-'), "{text}");
+}
+
+#[test]
+fn a_shell_that_arrived_labelled_is_observed_under_that_label_and_reports_both() {
+    let tree = Tree::new();
+    let mut arrived = connected_shell(100, CONNECTION, 200);
+    // What a server that let the second correlation name through leaves behind.
+    arrived.environ.push(("LC_AGENTBUS_PANE", "w1".to_owned()));
+    tree.write(&arrived);
+    tree.write(&running(200, "claude", vec!["claude", "--resume"]));
+    let bus = Bus::watching(&tree.root());
+
+    let snapshot = bus.wait_for_foreground("w1");
+
+    let entry = foreground_of(&snapshot, "w1");
+    assert_eq!(entry.pid, 200);
+    assert_eq!(
+        entry.ssh_connection.as_deref(),
+        Some(CONNECTION),
+        "a shell that was labelled and arrived over a connection carries both"
+    );
 }
