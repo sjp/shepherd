@@ -44,10 +44,13 @@ use std::io::{ErrorKind, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use agentbus_protocol::Agent;
+use agentbus_protocol::{Agent, UnstampedEvent};
 use serde::Serialize;
 
 use crate::explain::{Explain, ManifestSource};
+use crate::hooks::CompiledHookManifest;
+use crate::hooks::bundled::bundled_hook_manifests;
+use crate::hooks::schema::HookManifest;
 use crate::identify::{ProcessInfo, same};
 use crate::screen::bundled::bundled_screen_manifests;
 use crate::screen::region::ScreenInput;
@@ -279,6 +282,41 @@ impl Family for Screen {
 
     fn bundled() -> &'static [(&'static str, &'static str)] {
         bundled_screen_manifests()
+    }
+}
+
+/// The hook-mapping family: what an agent's hook payloads mean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hooks;
+
+impl Family for Hooks {
+    const NAME: &'static str = "hooks";
+
+    type Manifest = HookManifest;
+    type Compiled = CompiledHookManifest;
+
+    fn parse(content: &str) -> Result<Self::Manifest, String> {
+        HookManifest::parse(content).map_err(|error| error.to_string())
+    }
+
+    fn id(manifest: &Self::Manifest) -> &str {
+        &manifest.id
+    }
+
+    fn aliases(manifest: &Self::Manifest) -> &[String] {
+        &manifest.aliases
+    }
+
+    fn version(manifest: &Self::Manifest) -> Option<&ManifestVersion> {
+        manifest.version.as_ref()
+    }
+
+    fn compile(manifest: Self::Manifest) -> Self::Compiled {
+        CompiledHookManifest::compile(manifest)
+    }
+
+    fn bundled() -> &'static [(&'static str, &'static str)] {
+        bundled_hook_manifests()
     }
 }
 
@@ -627,13 +665,15 @@ fn read_bounded(path: &Path) -> Result<Option<String>, String> {
 /// process opens one, asks its question and exits.
 pub struct ManifestStore {
     screen: FamilyStore<Screen>,
+    hooks: FamilyStore<Hooks>,
 }
 
 impl ManifestStore {
     /// A store over the manifests at `paths`.
     pub fn open(paths: StorePaths) -> Self {
         Self {
-            screen: FamilyStore::new(paths),
+            screen: FamilyStore::new(paths.clone()),
+            hooks: FamilyStore::new(paths),
         }
     }
 
@@ -655,6 +695,7 @@ impl ManifestStore {
     /// needs and nothing else.
     pub fn reload(&self) {
         self.screen.reload();
+        self.hooks.reload();
     }
 
     /// Which copy of each manifest answers, and what was passed over.
@@ -664,8 +705,15 @@ impl ManifestStore {
     /// which is what a caller checking why detection behaves as it does needs
     /// to see. An agent nothing has asked about yet is decided here and now,
     /// there being no earlier decision to contradict.
+    ///
+    /// Every family is reported, one family after another, because "which copy
+    /// is active" is asked of a machine rather than of a family: an agent whose
+    /// screen rules come from an override and whose hook mapping comes from the
+    /// bundled tier is two lines, and both of them are the answer.
     pub fn summaries(&self) -> Vec<ManifestSummary> {
-        self.screen.summaries()
+        let mut summaries = self.screen.summaries();
+        summaries.append(&mut self.hooks.summaries());
+        summaries
     }
 
     /// What one screen says `agent` is doing.
@@ -697,6 +745,26 @@ impl ManifestStore {
         warnings.append(&mut explanation.warnings);
         explanation.warnings = warnings;
         explanation
+    }
+
+    /// What one hook payload from `agent` means.
+    ///
+    /// `None` is every way a payload can produce nothing, and a caller treats
+    /// them alike — send nothing, say nothing: no copy of any mapping describes
+    /// this agent, the payload names an event the mapping does not map, the
+    /// entry's condition does not hold, or the payload carries no session.
+    ///
+    /// What comes back is the event as the *mapping* sees it. The things only
+    /// the caller knows — where the hook was run, what it should be correlated
+    /// with — are the caller's to add.
+    pub fn normalize_hook(
+        &self,
+        agent: &str,
+        payload: &serde_json::Value,
+    ) -> Option<UnstampedEvent> {
+        let entry = self.hooks.entry(agent);
+        let active = entry.active.as_ref()?;
+        active.compiled.normalize(payload)
     }
 
     /// Whose manifest a screen should be read with, over the active copies.
@@ -779,9 +847,14 @@ contains = ["the marker"]
 
     /// Puts one file in one tier.
     fn place(store: &ManifestStore, tier: Tier, id: &str, content: &str) {
+        place_in(store, tier, Screen::NAME, id, content);
+    }
+
+    /// Puts one file in one tier of one family.
+    fn place_in(store: &ManifestStore, tier: Tier, family: &str, id: &str, content: &str) {
         let path = store
             .paths()
-            .file(tier, Screen::NAME, id)
+            .file(tier, family, id)
             .expect("a path for the id");
         fs::create_dir_all(path.parent().expect("a parent")).expect("the directory is created");
         fs::write(&path, content).expect("the manifest is written");
@@ -1239,5 +1312,165 @@ contains = ["the marker"]
                 .map(|agent| agent.as_str().to_owned()),
             Some(BUNDLED_AGENT.to_owned()),
         );
+    }
+
+    /// A hook mapping whose one event is enough to tell which copy answered.
+    fn hook_manifest(id: &str, aliases: &[&str], kind: &str) -> String {
+        let aliases = aliases
+            .iter()
+            .map(|alias| format!("{alias:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            r#"
+id = "{id}"
+aliases = [{aliases}]
+
+[payload]
+event = "hook_event_name"
+session = ["session_id"]
+cwd = ["cwd"]
+
+[[events]]
+name = "Stop"
+kind = "{kind}"
+"#
+        )
+    }
+
+    /// The payload the mappings above answer to.
+    fn stop_payload() -> serde_json::Value {
+        serde_json::json!({"hook_event_name": "Stop", "session_id": "s1", "cwd": "/work"})
+    }
+
+    #[test]
+    fn a_payload_is_normalized_by_the_mapping_in_force() {
+        let (_home, store) = machine();
+        place_in(
+            &store,
+            Tier::Override,
+            Hooks::NAME,
+            "agent",
+            &hook_manifest("agent", &[], "turn_end"),
+        );
+
+        let event = store
+            .normalize_hook("agent", &stop_payload())
+            .expect("an event");
+        assert_eq!(event.agent.as_str(), "agent");
+        assert_eq!(event.session, "s1");
+        assert_eq!(event.kind, agentbus_protocol::Kind::TurnEnd);
+        assert_eq!(event.cwd.as_deref(), Some("/work"));
+    }
+
+    #[test]
+    fn a_mapping_answers_to_an_alias_it_declares() {
+        let (_home, store) = machine();
+        // Filed under the alias, declaring the id: the caller knows the agent
+        // by the name it typed, and the events carry the name the mapping owns.
+        place_in(
+            &store,
+            Tier::Override,
+            Hooks::NAME,
+            "nickname",
+            &hook_manifest("agent", &["nickname"], "turn_end"),
+        );
+
+        let event = store
+            .normalize_hook("nickname", &stop_payload())
+            .expect("an event");
+        assert_eq!(event.agent.as_str(), "agent");
+    }
+
+    #[test]
+    fn an_agent_no_mapping_describes_normalizes_nothing() {
+        let (_home, store) = machine();
+        assert!(store.normalize_hook("nobody", &stop_payload()).is_none());
+        // The bundled corpus describes this agent's screen and says nothing
+        // about its hooks; one family is never an answer for the other.
+        assert!(
+            store
+                .normalize_hook(BUNDLED_AGENT, &stop_payload())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn each_family_is_read_from_its_own_directory() {
+        let (_home, store) = machine();
+        // A mapping filed under the screen family is not a screen manifest, and
+        // is no use to the family that would look for it there either.
+        place_in(
+            &store,
+            Tier::Override,
+            Screen::NAME,
+            "agent",
+            &hook_manifest("agent", &[], "turn_end"),
+        );
+
+        assert!(store.normalize_hook("agent", &stop_payload()).is_none());
+        assert!(warned_about(
+            &summary(&store, "agent").warnings,
+            &["override", "not readable"],
+        ));
+    }
+
+    #[test]
+    fn a_mapping_on_disk_is_summarized_under_its_own_family() {
+        let (_home, store) = machine();
+        place_in(
+            &store,
+            Tier::Override,
+            Hooks::NAME,
+            "agent",
+            &hook_manifest("agent", &[], "turn_end"),
+        );
+
+        let summaries = store.summaries();
+        assert_eq!(summaries.len(), BUNDLED_COUNT + 1);
+        let mapping = summaries
+            .iter()
+            .find(|summary| summary.family == Hooks::NAME)
+            .expect("a summary for the mapping");
+        assert_eq!(mapping.id, "agent");
+        assert!(matches!(
+            mapping.source,
+            Some(ManifestSource::Override { .. })
+        ));
+    }
+
+    #[test]
+    fn an_edited_mapping_is_read_again_only_after_a_reload() {
+        let (_home, store) = machine();
+        place_in(
+            &store,
+            Tier::Override,
+            Hooks::NAME,
+            "agent",
+            &hook_manifest("agent", &[], "turn_end"),
+        );
+        let kind_of = |store: &ManifestStore| {
+            store
+                .normalize_hook("agent", &stop_payload())
+                .expect("an event")
+                .kind
+        };
+        assert_eq!(kind_of(&store), agentbus_protocol::Kind::TurnEnd);
+
+        place_in(
+            &store,
+            Tier::Override,
+            Hooks::NAME,
+            "agent",
+            &hook_manifest("agent", &[], "session_end"),
+        );
+        assert_eq!(
+            kind_of(&store),
+            agentbus_protocol::Kind::TurnEnd,
+            "the decision already made should stand until it is discarded",
+        );
+
+        store.reload();
+        assert_eq!(kind_of(&store), agentbus_protocol::Kind::SessionEnd);
     }
 }
