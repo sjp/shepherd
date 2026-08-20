@@ -17,7 +17,7 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::screen::region::{DEFAULT_REGION, RegionSpec, UnknownRegion};
 use crate::version::ManifestVersion;
@@ -43,10 +43,10 @@ const MAX_MATCHER_CHARS: usize = 512;
 
 /// What a screen says the agent is doing.
 ///
-/// Private to this crate's screen reading, and deliberately not the vocabulary
-/// any wire format uses: a screen is evidence, and what a consumer does with
-/// that evidence is its own business.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+/// This crate's own vocabulary, used in its verdicts and its explanations, and
+/// deliberately not the vocabulary any wire format uses: a screen is evidence,
+/// and what a consumer does with that evidence is its own business.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScreenState {
     /// Waiting for a human, with nothing outstanding.

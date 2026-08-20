@@ -36,9 +36,14 @@
 
 #![warn(missing_docs)]
 
+pub mod explain;
 pub mod screen;
 pub mod version;
 
+pub use explain::{
+    EvaluatedRule, Evidence, Explain, GateCounts, ManifestSource, MatchedRule, MatcherCounts,
+    PREVIEW_CHARS, explain,
+};
 pub use screen::detect;
 pub use screen::region::{DEFAULT_REGION, RegionSpec, ScreenInput, UnknownRegion};
 pub use screen::rules::{
