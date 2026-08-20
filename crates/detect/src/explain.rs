@@ -222,6 +222,11 @@ impl Explain {
 ///
 /// The verdict this reports is [`detect`](crate::detect)'s, taken from the same
 /// evaluation as the table below it.
+///
+/// The `source` field is left empty here, this function having been handed a
+/// manifest rather than having found one.
+/// [`ManifestStore::explain`](crate::store::ManifestStore::explain) fills it in,
+/// along with whatever it had to skip to arrive at that copy.
 pub fn explain(manifest: &CompiledManifest, input: ScreenInput<'_>) -> Explain {
     let verdicts = manifest.evaluate(input);
     let detection = verdicts.detection();

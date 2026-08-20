@@ -240,7 +240,7 @@ fn strip_script_extension(name: &str) -> &str {
 }
 
 /// Whether two names are the same name.
-fn same(left: &str, right: &str) -> bool {
+pub(crate) fn same(left: &str, right: &str) -> bool {
     left.trim().eq_ignore_ascii_case(right.trim())
 }
 

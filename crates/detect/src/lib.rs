@@ -18,6 +18,12 @@
 //! answered by shipping a file is a change that can be answered in an afternoon
 //! by someone who does not build this software.
 //!
+//! A corpus of manifests ships inside the library, so it is useful on a machine
+//! where nothing has been installed. Newer copies may sit on disk beside it, and
+//! [`ManifestStore`] is what decides which copy of an agent's manifest is the
+//! one in force — a copy its operator wrote first, a fetched copy that is not
+//! older than the bundled one next, and the bundled copy as the floor.
+//!
 //! # Who this is for
 //!
 //! Any program holding terminal text: a host with a live grid of its own, a
@@ -39,6 +45,7 @@
 pub mod explain;
 pub mod identify;
 pub mod screen;
+pub mod store;
 pub mod version;
 
 pub use explain::{
@@ -56,4 +63,5 @@ pub use screen::schema::{
     Gate, GateView, Identify, ManifestFault, Rule, SCREEN_ENGINE_VERSION, ScreenManifest,
     ScreenManifestError, ScreenState,
 };
+pub use store::{Family, MAX_MANIFEST_BYTES, ManifestStore, ManifestSummary, Screen, StorePaths};
 pub use version::{InvalidVersion, ManifestVersion};

@@ -23,6 +23,11 @@ pub use rules::{CompiledManifest, Detection};
 /// For an agent no manifest describes, the answer is
 /// [`Detection::unknown_agent`] rather than anything this function could
 /// return.
+///
+/// This is the form for a caller holding a manifest of its own. A caller that
+/// only knows which agent it is looking at wants
+/// [`ManifestStore::detect`](crate::store::ManifestStore::detect), which finds
+/// the copy in force on the machine first.
 pub fn detect(manifest: &CompiledManifest, input: ScreenInput<'_>) -> Detection {
     manifest.detect(input)
 }

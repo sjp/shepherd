@@ -15,11 +15,6 @@
 //! came from — two of the files are named after the product and declare a
 //! shorter id, and the id is what a caller asks for.
 
-// The corpus is stocked before the shop opens: the loader that will choose
-// between a bundled manifest and a newer one found on disk is not written yet,
-// so for now only tests read the list.
-#![allow(dead_code)]
-
 /// Every bundled screen manifest, as (declared id, TOML source).
 ///
 /// Sorted by id so that the list reads the way a listing of it prints. The
