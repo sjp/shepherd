@@ -1,9 +1,10 @@
 //! The socket subscribers read the stream from.
 //!
 //! The exchange has no request in it. A client connects and reads; the daemon
-//! writes a snapshot, then every event as it is ingested and every change in
-//! what is running in front of a correlated shell, then a heartbeat whenever
-//! the stream would otherwise be silent for too long. Nothing a client
+//! writes a snapshot, then every line it takes in or produces afterwards — an
+//! event as it is ingested, a claim an observer made about a correlated slot, a
+//! change in what is running in front of a correlated shell — and a heartbeat
+//! whenever the stream would otherwise be silent for too long. Nothing a client
 //! writes is ever read as a message — it is drained and discarded — because a
 //! socket with no request protocol on it cannot be wedged by a client that
 //! misunderstands one.
@@ -189,6 +190,7 @@ async fn feed(
                 Ok(published) if published.seq() <= snapshot_seq => continue,
                 Ok(Published::Event(event)) => line(&event),
                 Ok(Published::Foreground(change)) => line(&change),
+                Ok(Published::Assertion(assertion)) => line(&assertion),
                 // Lagging means lines were published faster than this
                 // subscriber's own queue could be filled, which is the same
                 // failure as an overflow and is treated the same way.

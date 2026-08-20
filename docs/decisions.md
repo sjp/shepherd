@@ -144,9 +144,10 @@ codes sit in the middle of every field.
 ### Configuration is flags, with an environment variable behind each
 
 **No config file for the daemon.** `--dir`, `--stale-secs`,
-`--done-retention-secs` and `--log-level` are the whole of it, and each reads from
-`AGENTBUS_DIR`, `AGENTBUS_STALE_SECS`, `AGENTBUS_DONE_RETENTION_SECS` and
-`AGENTBUS_LOG` respectively when the flag is absent. Flags are for people;
+`--done-retention-secs`, `--assert-hold-secs` and `--log-level` are the whole of
+it, and each reads from `AGENTBUS_DIR`, `AGENTBUS_STALE_SECS`,
+`AGENTBUS_DONE_RETENTION_SECS`, `AGENTBUS_ASSERT_HOLD_SECS` and `AGENTBUS_LOG`
+respectively when the flag is absent. Flags are for people;
 variables are for whatever supervises the process, which often cannot choose the
 argument vector but can always choose the environment. A file would be a third
 place for the same answer to live, and a file per machine is the opposite of what

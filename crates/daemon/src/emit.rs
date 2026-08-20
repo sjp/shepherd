@@ -1,7 +1,10 @@
-//! The socket emitters send events to.
+//! The socket emitters send their lines to.
 //!
 //! The exchange is one line long and one-directional: a client connects, writes
-//! one JSON line, and closes without waiting for anything. That is what the
+//! one JSON line, and closes without waiting for anything. What the line says —
+//! that something happened, or that something is currently the case — is read
+//! off the line itself, so a client that has a second thing to say opens a
+//! second connection and nothing here has to be negotiated. That is what the
 //! client on the other end needs it to be — it is a hook running inside somebody's
 //! coding agent, with a budget of a few milliseconds and no way to report a
 //! problem — so this side never writes a byte back, never negotiates, and never
@@ -26,7 +29,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, trace, warn};
 
 use crate::ACCEPT_RETRY_DELAY;
-use crate::bus::Bus;
+use crate::bus::{Bus, Ingested};
 use crate::paths::SOCKET_MODE;
 
 /// The most of one line the daemon will hold.
@@ -93,11 +96,19 @@ impl EmitListener {
 /// Reads one connection's line and hands it to the bus.
 async fn receive(mut stream: UnixStream, bus: Arc<Bus>) {
     match tokio::time::timeout(READ_TIMEOUT, read_line(&mut stream)).await {
-        Ok(Ok(line)) => {
-            if let Some(event) = bus.ingest(&line) {
+        Ok(Ok(line)) => match bus.ingest(&line) {
+            Some(Ingested::Event(event)) => {
                 trace!(seq = event.seq, kind = %event.kind, "ingested an event");
             }
-        }
+            Some(Ingested::Assertion(assertion)) => {
+                trace!(
+                    seq = assertion.seq,
+                    assert = %assertion.assert,
+                    "ingested an assertion"
+                );
+            }
+            None => {}
+        },
         Ok(Err(ReadError::TooLong)) => {
             debug!(limit = MAX_LINE, "dropped an over-long line");
         }

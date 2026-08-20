@@ -564,8 +564,14 @@ fn merging(
             // arriving, and this daemon owes its own subscribers heartbeats of
             // its own rather than somebody else's.
             StreamLine::Heartbeat(_) => {}
-            // Dropped: this daemon holds no assertions, so there is nothing
-            // here for one to change.
+            // Dropped rather than applied. A claim is about a slot the daemon
+            // that made it can see, and it has already had its whole effect
+            // over there: whatever it changed is in the sessions that daemon
+            // reports, which arrive here as any other session does. Applying it
+            // again here would file it against a correlation on *this*
+            // machine — an opaque string that means whatever the local shells
+            // mean by it — and let something nobody here can see speak for a
+            // slot in front of somebody's face.
             StreamLine::Assertion(_) => {}
             StreamLine::Unknown => {}
         }

@@ -262,7 +262,14 @@ fn a_directory_that_cannot_be_made_is_reported_and_fails() {
 fn the_daemon_reports_how_it_was_started_and_why_it_stopped() {
     let (_temp, dir) = bus_dir();
     let mut command = command(&dir);
-    command.args(["--stale-secs", "5", "--done-retention-secs", "7"]);
+    command.args([
+        "--stale-secs",
+        "5",
+        "--done-retention-secs",
+        "7",
+        "--assert-hold-secs",
+        "9",
+    ]);
     let mut daemon = Daemon::spawn(&mut command, &dir);
     daemon.wait_until_serving();
 
@@ -277,6 +284,7 @@ fn the_daemon_reports_how_it_was_started_and_why_it_stopped() {
         &dir.display().to_string(),
         "stale_secs=5",
         "done_retention_secs=7",
+        "assert_hold_secs=9",
         "SIGTERM",
     ] {
         assert!(
@@ -292,7 +300,8 @@ fn the_settings_can_be_given_in_the_environment_instead() {
     let mut command = command(&dir);
     command
         .env("AGENTBUS_STALE_SECS", "5")
-        .env("AGENTBUS_DONE_RETENTION_SECS", "7");
+        .env("AGENTBUS_DONE_RETENTION_SECS", "7")
+        .env("AGENTBUS_ASSERT_HOLD_SECS", "9");
     let mut daemon = Daemon::spawn(&mut command, &dir);
     daemon.wait_until_serving();
 
@@ -301,6 +310,7 @@ fn the_settings_can_be_given_in_the_environment_instead() {
     let said = String::from_utf8_lossy(&daemon.output().stderr).into_owned();
     assert!(said.contains("stale_secs=5"), "{said}");
     assert!(said.contains("done_retention_secs=7"), "{said}");
+    assert!(said.contains("assert_hold_secs=9"), "{said}");
 }
 
 #[test]

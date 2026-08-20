@@ -71,7 +71,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentbus_protocol::{DEFAULT_DONE_RETENTION, DEFAULT_STALE_AFTER, Fold, SessionTable};
+use agentbus_protocol::{
+    DEFAULT_ASSERT_HOLD, DEFAULT_DONE_RETENTION, DEFAULT_STALE_AFTER, Fold, SessionTable,
+};
 use bus::Published;
 use foreground::Monitor;
 use procfs::ProcFs;
@@ -130,6 +132,12 @@ pub struct Settings {
     pub stale_after: Duration,
     /// How long a session that has finished is kept before it is forgotten.
     pub done_retention: Duration,
+    /// How long a claim made by an observer stands before it has to be repeated.
+    ///
+    /// A claim is level-triggered and its power to be shown over an agent's own
+    /// record decays with age, so this is the whole of how long silence from an
+    /// observer is tolerated before what it last said stops counting.
+    pub assert_hold: Duration,
     /// How often each subscriber is sent a heartbeat.
     pub heartbeat: Duration,
     /// How often the declared endpoints are looked at.
@@ -153,6 +161,7 @@ impl Default for Settings {
         Self {
             stale_after: DEFAULT_STALE_AFTER,
             done_retention: DEFAULT_DONE_RETENTION,
+            assert_hold: DEFAULT_ASSERT_HOLD,
             heartbeat: DEFAULT_HEARTBEAT,
             reconcile_every: reconcile::INTERVAL,
             proc_root: PathBuf::from(procfs::DEFAULT_ROOT),
@@ -166,6 +175,7 @@ impl Settings {
         SessionTable::new()
             .with_fold(Fold::with_stale_after(self.stale_after))
             .with_done_retention(self.done_retention)
+            .with_assert_hold(self.assert_hold)
     }
 }
 
@@ -542,7 +552,12 @@ fn wanted(
                     monitor.want(correlation);
                 }
             }
-            Ok(Published::Foreground(_)) => {}
+            // Neither says anything about a correlation the monitor has not
+            // already been told about: a foreground observation is the monitor's
+            // own work coming back round, and a claim is about a slot something
+            // else is watching, which is not a reason for this daemon to start
+            // reading a process table for it.
+            Ok(Published::Foreground(_) | Published::Assertion(_)) => {}
             Err(TryRecvError::Empty) => return true,
             Err(TryRecvError::Lagged(lines)) => {
                 debug!(

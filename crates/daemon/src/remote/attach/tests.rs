@@ -300,7 +300,7 @@ fn events(lines: Vec<Published>) -> Vec<Event> {
         .into_iter()
         .filter_map(|line| match line {
             Published::Event(event) => Some(event),
-            Published::Foreground(_) => None,
+            Published::Foreground(_) | Published::Assertion(_) => None,
         })
         .collect()
 }

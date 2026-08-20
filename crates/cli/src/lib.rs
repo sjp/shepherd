@@ -64,6 +64,9 @@ const STALE_SECS_VAR: &str = "AGENTBUS_STALE_SECS";
 /// The environment variable behind `--done-retention-secs`.
 const DONE_RETENTION_SECS_VAR: &str = "AGENTBUS_DONE_RETENTION_SECS";
 
+/// The environment variable behind `--assert-hold-secs`.
+const ASSERT_HOLD_SECS_VAR: &str = "AGENTBUS_ASSERT_HOLD_SECS";
+
 /// The environment variable behind `--proc-root`.
 const PROC_ROOT_VAR: &str = "AGENTBUS_PROC_ROOT";
 
@@ -268,6 +271,15 @@ struct DaemonArgs {
     )]
     done_retention_secs: u64,
 
+    /// Seconds an observer's claim stands before it has to be made again
+    #[arg(
+        long,
+        value_name = "SECS",
+        env = ASSERT_HOLD_SECS_VAR,
+        default_value_t = Settings::default().assert_hold.as_secs(),
+    )]
+    assert_hold_secs: u64,
+
     /// How much to say on stderr: a level — off, error, warn, info, debug, trace — or a filter naming targets
     #[arg(
         long,
@@ -298,6 +310,7 @@ impl DaemonArgs {
         Settings {
             stale_after: Duration::from_secs(self.stale_secs),
             done_retention: Duration::from_secs(self.done_retention_secs),
+            assert_hold: Duration::from_secs(self.assert_hold_secs),
             proc_root: self.proc_root.clone(),
             ..Settings::default()
         }
@@ -617,6 +630,7 @@ fn daemon(args: &DaemonArgs) -> ExitCode {
         dir = %paths.dir().display(),
         stale_secs = args.stale_secs,
         done_retention_secs = args.done_retention_secs,
+        assert_hold_secs = args.assert_hold_secs,
         log_level = args.log_level,
         "starting"
     );

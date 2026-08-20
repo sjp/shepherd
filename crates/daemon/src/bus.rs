@@ -2,13 +2,20 @@
 //! table, the foreground observations, the recent-event buffer and the
 //! publisher.
 //!
-//! Ingest is where an emitter's line stops being a string and becomes an event
+//! Ingest is where an emitter's line stops being a string and becomes something
 //! this daemon vouches for. Three of the envelope's fields are the daemon's to
 //! decide and are never taken from an emitter: `seq`, because a counter that
 //! anyone can write is not a counter; `origin`, because an emitter has no idea
 //! what it is inside, and a line arriving on this daemon's own socket has by
 //! definition crossed no boundary to get here; and `ts` when the emitter did not
 //! supply a usable one.
+//!
+//! The socket takes two shapes and this is the door for both. An event is what
+//! an agent says happened to it; a claim is what something watching that agent
+//! from outside says is currently the case. They differ in what they mean and in
+//! what they change, and in nothing else that matters here: both are numbered
+//! from the one counter, applied under the one lock, and published to the one
+//! stream.
 //!
 //! The lock is held for stamping, the fold, the buffer write and the publish,
 //! and for nothing else. Those four are one step: an event's sequence number is
@@ -37,9 +44,9 @@ use std::fmt;
 use std::sync::{Mutex, PoisonError};
 
 use agentbus_protocol::{
-    DaemonIdentity, Event, ForegroundChange, ForegroundEntry, ForegroundState, OriginHop,
+    DaemonIdentity, EmitLine, Event, ForegroundChange, ForegroundEntry, ForegroundState, OriginHop,
     SSH_CONNECTION_DETAIL, SessionEntry, SessionKey, SessionStatus, SessionTable, Snapshot,
-    Timestamp, UnstampedEvent,
+    StampedAssertion, StateAssertion, Timestamp, UnstampedEvent, parse_emit_line,
 };
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -59,7 +66,7 @@ pub const RECENT_EVENTS: usize = 1024;
 
 /// One line the bus publishes to everything watching it.
 ///
-/// Both kinds travel on one channel because they are numbered from one counter
+/// Every kind travels on one channel because they are numbered from one counter
 /// and a subscriber is promised that counter's order. Two channels would be free
 /// to deliver 42 after 43.
 #[derive(Debug, Clone, PartialEq)]
@@ -68,6 +75,8 @@ pub enum Published {
     Event(Event),
     /// A change in what is running in front of a correlated shell.
     Foreground(ForegroundChange),
+    /// A claim an observer made about a correlated slot.
+    Assertion(StampedAssertion),
 }
 
 impl Published {
@@ -76,8 +85,24 @@ impl Published {
         match self {
             Self::Event(event) => event.seq,
             Self::Foreground(change) => change.seq,
+            Self::Assertion(assertion) => assertion.seq,
         }
     }
+}
+
+/// What one line delivered to the emit socket turned out to be.
+///
+/// The socket takes two shapes, and which one arrived is settled by reading the
+/// line rather than by the connection saying so; see
+/// [`parse_emit_line`](agentbus_protocol::parse_emit_line). Both are stamped
+/// from the same counter, so a caller that wants to say what it just took in has
+/// a sequence number either way.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Ingested {
+    /// Something happened, folded into the session it happened to.
+    Event(Event),
+    /// Something is the case, filed against the slot it is about.
+    Assertion(StampedAssertion),
 }
 
 /// One daemon this one has attached to, for as long as it is attached.
@@ -224,56 +249,96 @@ impl Bus {
         self
     }
 
-    /// Turns one received line into a stamped event, folds it into its session,
-    /// records it and publishes it. Returns the event, or nothing if the line
-    /// was not an event at all.
+    /// Takes in one line delivered to the emit socket, whichever of the two
+    /// shapes it is, and publishes what it became. Returns nothing if the line
+    /// was neither.
     ///
     /// A line that does not parse is dropped: the emitter is a hook inside
     /// somebody's coding agent and cannot be told about it, and a daemon that
     /// stopped ingesting because one client sent nonsense would be trading every
-    /// other session's status for a message nobody reads.
+    /// other session's status for a message nobody reads. That covers a line
+    /// carrying both discriminating fields or neither as well, which is not a
+    /// line whose meaning anything here is entitled to guess at.
+    pub fn ingest(&self, line: &[u8]) -> Option<Ingested> {
+        let ingested = match parse_emit_line(line) {
+            Some(EmitLine::Event(event)) => {
+                Ingested::Event(self.ingest_event(event, reported_ts(line)))
+            }
+            Some(EmitLine::Assertion(assertion)) => {
+                Ingested::Assertion(self.ingest_assertion(assertion))
+            }
+            None => {
+                debug!("dropped a line that is neither an event nor an assertion");
+                return None;
+            }
+        };
+        Some(ingested)
+    }
+
+    /// Stamps one event, folds it into its session, records it and publishes it.
     ///
     /// An event is also where a session is bound to the process it is speaking
     /// from, because an event is the only moment the two are known to be the
     /// same thing: whatever is in front of that terminal now is what just spoke.
-    pub fn ingest(&self, line: &[u8]) -> Option<Event> {
-        let (mut event, reported_ts) = match parse(line) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                debug!(%error, "dropped a line that is not an event");
-                return None;
-            }
-        };
+    fn ingest_event(&self, mut event: UnstampedEvent, reported_ts: Option<Timestamp>) -> Event {
         // Nothing received here came from anywhere else.
         event.origin.clear();
         let ts = reported_ts.unwrap_or_else(clock::now);
 
-        let event = {
-            let mut state = self.lock();
-            state.seq += 1;
-            let event = event.stamp(state.seq, ts);
-            if let Some(conflict) = state.table.apply_event(&event) {
-                warn!(
-                    agent = %conflict.key.agent,
-                    session = %conflict.key.session,
-                    "an event's origin disagrees with the chain this session was first seen with"
-                );
-            }
-            state.bind(&event);
-            if state.recent.len() == RECENT_EVENTS {
-                state.recent.pop_front();
-            }
-            state.recent.push_back(event.clone());
-            // Published while the number is still being handed out, because
-            // subscribers are promised the stream in `seq` order and two
-            // connections ingesting at once would otherwise be free to reach the
-            // publisher in the opposite order to the one they were numbered in.
-            // Nobody may be listening, and that is not a failure: the bus exists
-            // whether or not anything is watching it.
-            let _ = self.events.send(Published::Event(event.clone()));
-            event
-        };
-        Some(event)
+        let mut state = self.lock();
+        state.seq += 1;
+        let event = event.stamp(state.seq, ts);
+        if let Some(conflict) = state.table.apply_event(&event) {
+            warn!(
+                agent = %conflict.key.agent,
+                session = %conflict.key.session,
+                "an event's origin disagrees with the chain this session was first seen with"
+            );
+        }
+        state.bind(&event);
+        if state.recent.len() == RECENT_EVENTS {
+            state.recent.pop_front();
+        }
+        state.recent.push_back(event.clone());
+        // Published while the number is still being handed out, because
+        // subscribers are promised the stream in `seq` order and two
+        // connections ingesting at once would otherwise be free to reach the
+        // publisher in the opposite order to the one they were numbered in.
+        // Nobody may be listening, and that is not a failure: the bus exists
+        // whether or not anything is watching it.
+        let _ = self.events.send(Published::Event(event.clone()));
+        event
+    }
+
+    /// Stamps one claim, files it against the slot it is about, and publishes
+    /// it.
+    ///
+    /// Numbered from the counter events are numbered from and published under
+    /// the lock they are folded under, for the reason everything else on this
+    /// path is: a subscriber reads one stream and is owed one order for it.
+    ///
+    /// Two things an event carries are missing here on purpose. There is no
+    /// chain of hops to clear, because a claim has no room to carry one: a line
+    /// arriving on this daemon's own socket has by definition crossed no
+    /// boundary to get here, and the session it drives is filed with an empty
+    /// chain, which is what says so to the rules that settle two views of one
+    /// slot against each other. And the emitter's idea of the time is not read,
+    /// because when a claim was received is the only timing an observer's word
+    /// can be trusted on: it cannot tell a state that just began from one that
+    /// has been true for a minute, so the moment it spoke is the moment the
+    /// claim is worth anything from.
+    ///
+    /// Nothing is bound to a process either. A binding says which process a
+    /// session is speaking from, and an observer is not the session speaking.
+    fn ingest_assertion(&self, assertion: StateAssertion) -> StampedAssertion {
+        let ts = clock::now();
+        let mut state = self.lock();
+        state.seq += 1;
+        let seq = state.seq;
+        state.table.apply_assertion(&assertion, &ts);
+        let stamped = assertion.stamp(seq, ts);
+        let _ = self.events.send(Published::Assertion(stamped.clone()));
+        stamped
     }
 
     /// Moves every session's clock forward, so that a session that has gone
@@ -980,21 +1045,25 @@ fn same_path(left: &[OriginHop], right: &[OriginHop]) -> bool {
             .all(|(left, right)| left.kind == right.kind && left.id == right.id)
 }
 
-/// Reads one line as an event, along with the timestamp it reported if that
-/// timestamp is one this protocol can carry.
+/// The moment an emitter said its event happened, where it said one this
+/// protocol can carry.
 ///
-/// An emitter's `ts` is kept because it is closer to when the thing actually
+/// Read off the line rather than out of the parsed event, because the envelope
+/// an emitter writes has no `ts` field in it: the stamp is the daemon's, and
+/// what an emitter puts under that name is a suggestion about a stamp that has
+/// not been applied yet.
+///
+/// The suggestion is taken because it is closer to when the thing actually
 /// happened than the moment the daemon got round to reading the socket. It is
 /// not trusted any further than that: anything that is not a well-formed
-/// timestamp is replaced rather than rejected, since the event itself is still
-/// news.
-fn parse(line: &[u8]) -> Result<(UnstampedEvent, Option<Timestamp>), serde_json::Error> {
-    let value: Value = serde_json::from_slice(line)?;
-    let ts = value
+/// timestamp is ignored rather than made a reason to drop the line, since the
+/// event itself is still news.
+fn reported_ts(line: &[u8]) -> Option<Timestamp> {
+    serde_json::from_slice::<Value>(line)
+        .ok()?
         .get("ts")
         .and_then(Value::as_str)
-        .and_then(|ts| Timestamp::parse(ts).ok());
-    Ok((serde_json::from_value(value)?, ts))
+        .and_then(|ts| Timestamp::parse(ts).ok())
 }
 
 #[cfg(test)]
@@ -1050,6 +1119,34 @@ mod tests {
         serde_json::to_vec(value).unwrap()
     }
 
+    /// The event a line was taken in as, failing the test if it was taken in as
+    /// anything else.
+    fn ingested_event(bus: &Bus, line: &[u8]) -> Event {
+        match bus.ingest(line) {
+            Some(Ingested::Event(event)) => event,
+            other => panic!("not ingested as an event: {other:?}"),
+        }
+    }
+
+    /// The claim a line was taken in as, under the same rule.
+    fn ingested_assertion(bus: &Bus, line: &[u8]) -> StampedAssertion {
+        match bus.ingest(line) {
+            Some(Ingested::Assertion(assertion)) => assertion,
+            other => panic!("not ingested as an assertion: {other:?}"),
+        }
+    }
+
+    /// A claim about `correlation`, as an observer writes one.
+    fn claims(correlation: &str, assert: &str, visible: bool) -> Vec<u8> {
+        let mut assertion = json!({
+            "v": 1, "agent": "claude", "assert": assert, "correlation": correlation
+        });
+        if visible {
+            assertion["visible"] = json!(true);
+        }
+        line(&assertion)
+    }
+
     fn tool_start() -> Value {
         json!({"v": 1, "agent": "claude", "session": "abc123", "kind": "tool_start"})
     }
@@ -1091,7 +1188,7 @@ mod tests {
     fn an_event_is_stamped_folded_and_recorded() {
         let bus = Bus::new();
 
-        let event = bus.ingest(&line(&tool_start())).unwrap();
+        let event = ingested_event(&bus, &line(&tool_start()));
 
         assert_eq!(event.seq, 1);
         assert_eq!(event.agent, agent("claude"));
@@ -1111,7 +1208,7 @@ mod tests {
         let bus = Bus::new();
 
         let seqs: Vec<u64> = (0..3)
-            .map(|_| bus.ingest(&line(&tool_start())).unwrap().seq)
+            .map(|_| ingested_event(&bus, &line(&tool_start())).seq)
             .collect();
 
         assert_eq!(seqs, vec![1, 2, 3]);
@@ -1124,10 +1221,10 @@ mod tests {
         let mut reported = tool_start();
         reported["ts"] = json!("2026-08-17T10:32:01.412Z");
 
-        let kept = bus.ingest(&line(&reported)).unwrap();
+        let kept = ingested_event(&bus, &line(&reported));
         assert_eq!(kept.ts.as_str(), "2026-08-17T10:32:01.412Z");
 
-        let stamped = bus.ingest(&line(&tool_start())).unwrap();
+        let stamped = ingested_event(&bus, &line(&tool_start()));
         assert!(stamped.ts.as_str() > "2020-01-01T00:00:00.000Z");
     }
 
@@ -1137,7 +1234,7 @@ mod tests {
         let mut event = tool_start();
         event["ts"] = json!("yesterday afternoon");
 
-        let ingested = bus.ingest(&line(&event)).unwrap();
+        let ingested = ingested_event(&bus, &line(&event));
 
         assert!(ingested.ts.as_str() > "2020-01-01T00:00:00.000Z");
     }
@@ -1148,7 +1245,7 @@ mod tests {
         let mut event = tool_start();
         event["origin"] = json!([{"kind": "ssh", "id": "9f3c:1000", "name": "fileserver"}]);
 
-        let ingested = bus.ingest(&line(&event)).unwrap();
+        let ingested = ingested_event(&bus, &line(&event));
 
         assert_eq!(ingested.origin, Vec::<OriginHop>::new());
         assert_eq!(bus.sessions()[0].origin, Vec::<OriginHop>::new());
@@ -1164,7 +1261,7 @@ mod tests {
         event["detail"] = json!({"tool": "Bash"});
         event["raw"] = json!({"hook_event_name": "PreToolUse"});
 
-        let ingested = bus.ingest(&line(&event)).unwrap();
+        let ingested = ingested_event(&bus, &line(&event));
 
         assert_eq!(ingested.source, Source::Observed);
         assert_eq!(ingested.cwd.as_deref(), Some("/srv/project"));
@@ -1177,7 +1274,7 @@ mod tests {
     }
 
     #[test]
-    fn a_line_that_is_not_an_event_is_dropped_without_consuming_a_sequence_number() {
+    fn a_line_that_is_neither_shape_is_dropped_without_consuming_a_sequence_number() {
         let bus = Bus::new();
 
         assert!(bus.ingest(b"not json at all").is_none());
@@ -1187,10 +1284,106 @@ mod tests {
                 .is_none()
         );
         assert!(bus.ingest(b"").is_none());
+        // Both discriminating fields at once, which is not a line whose meaning
+        // anything here is entitled to guess at.
+        let mut confused = tool_start();
+        confused["assert"] = json!("blocked");
+        confused["correlation"] = json!("w9:p3");
+        assert!(bus.ingest(&line(&confused)).is_none());
         assert_eq!(bus.last_seq(), 0);
         assert!(bus.sessions().is_empty());
 
-        assert_eq!(bus.ingest(&line(&tool_start())).unwrap().seq, 1);
+        assert_eq!(ingested_event(&bus, &line(&tool_start())).seq, 1);
+    }
+
+    #[test]
+    fn a_claim_is_numbered_from_the_counter_events_are_numbered_from() {
+        let bus = Bus::new();
+
+        assert_eq!(ingested_event(&bus, &line(&tool_start())).seq, 1);
+        assert_eq!(
+            ingested_assertion(&bus, &claims("w9:p3", "blocked", true)).seq,
+            2
+        );
+        assert_eq!(ingested_event(&bus, &line(&tool_start())).seq, 3);
+        assert_eq!(bus.last_seq(), 3);
+    }
+
+    #[test]
+    fn a_claim_about_a_slot_nothing_is_speaking_for_drives_a_session_of_its_own() {
+        let bus = Bus::new();
+
+        bus.ingest(&claims("w9:p3", "blocked", true));
+
+        let sessions = bus.sessions();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session, observed_session_id("w9:p3"));
+        assert_eq!(sessions[0].status, SessionStatus::Blocked);
+        assert_eq!(sessions[0].source, Source::Observed);
+        // A line arriving on this daemon's own socket crossed no boundary to get
+        // here, so there is nothing for a deeper view of the slot to outrank.
+        assert_eq!(sessions[0].origin, Vec::<OriginHop>::new());
+    }
+
+    #[test]
+    fn a_claim_is_stamped_here_and_not_by_whoever_made_it() {
+        let bus = Bus::new();
+        // Both of these are the daemon's to decide, so an observer naming them
+        // changes nothing: `ts`, because when a claim was received is the only
+        // timing an observer's word can be trusted on, and the chain, because a
+        // line that arrived here came from here.
+        let mut assertion = json!({
+            "v": 1, "agent": "claude", "assert": "blocked", "correlation": "w9:p3",
+            "ts": "2001-01-01T00:00:00.000Z",
+            "origin": [{"kind": "ssh", "id": "9f3c:1000", "name": "fileserver"}],
+        });
+        assertion["visible"] = json!(true);
+
+        let stamped = ingested_assertion(&bus, &line(&assertion));
+
+        assert!(stamped.ts.as_str() > "2020-01-01T00:00:00.000Z");
+        assert_eq!(bus.sessions()[0].origin, Vec::<OriginHop>::new());
+    }
+
+    #[test]
+    fn every_ingested_claim_reaches_a_subscriber_without_the_evidence() {
+        let bus = Bus::new();
+        let mut events = bus.events();
+        let mut assertion = json!({
+            "v": 1, "agent": "claude", "assert": "blocked", "correlation": "w9:p3",
+            "detail": {"rule": "bash_permission_prompt"},
+            "raw": {"screen": "a whole terminal's worth of text"},
+        });
+        assertion["visible"] = json!(true);
+
+        let stamped = ingested_assertion(&bus, &line(&assertion));
+
+        assert_eq!(
+            events.try_recv().unwrap(),
+            Published::Assertion(stamped.clone())
+        );
+        // Why it was said survives; what was seen does not, because a subscriber
+        // would pay for a screenful of it on every repeat.
+        let published = serde_json::to_value(&stamped).unwrap();
+        assert_eq!(published["detail"]["rule"], json!("bash_permission_prompt"));
+        assert_eq!(published.get("raw"), None, "{published}");
+    }
+
+    #[test]
+    fn a_claim_binds_nothing_to_a_process() {
+        let bus = Bus::new();
+
+        bus.ingest(&claims("w9:p3", "blocked", true));
+
+        // A binding says which process a session is speaking from, and an
+        // observer is not the session speaking.
+        assert_eq!(
+            bus.bound_to(&SessionKey::new(
+                agent("claude"),
+                observed_session_id("w9:p3")
+            )),
+            None
+        );
     }
 
     #[test]
@@ -1199,7 +1392,7 @@ mod tests {
         let mut event = tool_start();
         event["kind"] = json!("sang_a_song");
 
-        let ingested = bus.ingest(&line(&event)).unwrap();
+        let ingested = ingested_event(&bus, &line(&event));
 
         assert_eq!(ingested.kind, Kind::Unknown("sang_a_song".to_owned()));
     }
@@ -1209,7 +1402,7 @@ mod tests {
         let bus = Bus::new();
         let mut events = bus.events();
 
-        let ingested = bus.ingest(&line(&tool_start())).unwrap();
+        let ingested = ingested_event(&bus, &line(&tool_start()));
 
         assert_eq!(events.try_recv().unwrap(), Published::Event(ingested));
     }
@@ -1262,7 +1455,7 @@ mod tests {
 
         bus.ingest(&line(&tool_start()));
         bus.observed(&[appeared("w9:p3", 100, 4471, "claude")], &now());
-        let last = bus.ingest(&line(&tool_start())).unwrap();
+        let last = ingested_event(&bus, &line(&tool_start()));
 
         assert_eq!(last.seq, 3);
         assert_eq!(bus.last_seq(), 3);

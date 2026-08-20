@@ -53,7 +53,7 @@ fn row(session: &SessionEntry, now: &Timestamp) -> Row {
     Row::new(vec![
         session.agent.to_string(),
         session.session.clone(),
-        session.status.to_string(),
+        status(session),
         session.source.to_string(),
         table::origin(&session.origin),
         session.cwd.clone().unwrap_or_else(|| ABSENT.to_owned()),
@@ -64,6 +64,20 @@ fn row(session: &SessionEntry, now: &Timestamp) -> Row {
         table::elapsed(now, &session.since),
     ])
     .emphasized(session.status == SessionStatus::Blocked)
+}
+
+/// What the STATUS cell says.
+///
+/// Nearly always the status alone, which is the session's own record. Where the
+/// bus is showing something else's word over that record it says whose, in the
+/// same word the SOURCE column uses, because a status that came from somewhere
+/// other than the row it is on is exactly the thing somebody reading this needs
+/// not to mistake for the agent's own.
+fn status(session: &SessionEntry) -> String {
+    match session.status_source {
+        Some(source) => format!("{} ({source})", session.status),
+        None => session.status.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -169,6 +183,18 @@ mod tests {
 
         let row = table.lines().nth(1).unwrap();
         assert!(row.contains("observed"), "{row}");
+    }
+
+    #[test]
+    fn a_status_shown_over_a_sessions_own_record_says_where_it_came_from() {
+        let mut overridden = session("abc123", SessionStatus::Blocked);
+        overridden.status_source = Some(Source::Observed);
+
+        let table = rendered(vec![overridden]);
+
+        // The row is still the agent's, and the status on it is not.
+        assert_eq!(cells(&table, 1)[2], "blocked (observed)");
+        assert_eq!(cells(&table, 1)[3], "hook");
     }
 
     #[test]
