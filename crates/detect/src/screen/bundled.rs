@@ -17,7 +17,7 @@
 
 // The corpus is stocked before the shop opens: the loader that will choose
 // between a bundled manifest and a newer one found on disk is not written yet,
-// so for now only this module's own tests read the list.
+// so for now only tests read the list.
 #![allow(dead_code)]
 
 /// Every bundled screen manifest, as (declared id, TOML source).
@@ -130,6 +130,36 @@ mod tests {
             .collect();
         for id in ["agy", "copilot"] {
             assert!(keys.contains(id), "the corpus has no entry for {id:?}");
+        }
+    }
+
+    #[test]
+    fn every_bundled_manifest_can_identify_its_agent() {
+        // A manifest that names no executable can only ever be reached by a
+        // caller that already knows the answer, which defeats the point of
+        // shipping the names as data.
+        for (id, content) in bundled_screen_manifests() {
+            let manifest = ScreenManifest::parse(content).expect("loadable");
+            assert!(
+                !manifest.identify.names.is_empty(),
+                "bundled manifest {id:?} names no executable",
+            );
+        }
+    }
+
+    #[test]
+    fn no_executable_name_is_claimed_by_two_bundled_manifests() {
+        // Two manifests answering to one name is reported as no answer at all,
+        // so a collision inside the corpus silently disables both.
+        let mut owners: Vec<(&str, String)> = Vec::new();
+        for (id, content) in bundled_screen_manifests() {
+            let manifest = ScreenManifest::parse(content).expect("loadable");
+            for name in manifest.identify.names {
+                if let Some((other, _)) = owners.iter().find(|(_, seen)| *seen == name) {
+                    panic!("manifests {other:?} and {id:?} both claim the name {name:?}");
+                }
+                owners.push((id, name));
+            }
         }
     }
 

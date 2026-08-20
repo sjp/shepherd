@@ -4,6 +4,10 @@ min_engine_version = 1
 updated_at = "2026-08-01T00:00:00Z"
 aliases = ["kiro-cli"]
 
+[identify]
+names = ["kiro", "kiro-cli"]
+wrappers = []
+
 [[rules]]
 id = "tool_approval"
 state = "blocked"

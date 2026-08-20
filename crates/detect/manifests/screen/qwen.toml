@@ -4,6 +4,10 @@ min_engine_version = 2
 updated_at = "2026-08-14T00:00:00Z"
 aliases = ["qwen-code", "qwen code"]
 
+[identify]
+names = ["qwen", "qwen-code"]
+wrappers = ["node", "bun"]
+
 # Qwen Code keeps its composer visible while responding, so the prompt box is
 # not idle evidence by itself. Its status-prefixed terminal titles are the
 # primary locale-independent signals when ui.showStatusInTitle is enabled.

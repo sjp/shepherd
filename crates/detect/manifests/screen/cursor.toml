@@ -4,6 +4,10 @@ min_engine_version = 1
 updated_at = "2026-08-03T01:08:04Z"
 aliases = ["cursor-agent"]
 
+[identify]
+names = ["cursor", "cursor-agent"]
+wrappers = []
+
 [[rules]]
 id = "write_file_approval"
 state = "blocked"

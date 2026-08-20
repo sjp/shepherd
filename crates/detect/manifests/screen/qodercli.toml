@@ -4,6 +4,10 @@ min_engine_version = 1
 updated_at = "2026-06-10T00:00:00Z"
 aliases = ["qoderclicn", "qoder", "qodercn"]
 
+[identify]
+names = ["qodercli", "qoderclicn", "qoder", "qodercn"]
+wrappers = ["node", "bun"]
+
 [[rules]]
 id = "confirmation_or_input_blocker"
 state = "blocked"

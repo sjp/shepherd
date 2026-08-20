@@ -4,6 +4,10 @@ min_engine_version = 1
 updated_at = "2026-07-07T14:15:00Z"
 aliases = ["github-copilot", "ghcs"]
 
+[identify]
+names = ["copilot", "github-copilot", "ghcs"]
+wrappers = ["node", "bun"]
+
 [[rules]]
 id = "selection_blocker"
 state = "blocked"

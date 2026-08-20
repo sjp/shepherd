@@ -4,6 +4,10 @@ min_engine_version = 3
 updated_at = "2026-07-16T00:00:00Z"
 aliases = ["grok-build"]
 
+[identify]
+names = ["grok", "grok-build"]
+wrappers = []
+
 # Evidence: Grok Build 0.2.101 source and live pane reads.
 #
 # Grok emits OSC 0 titles by default. Idle is "grok" or

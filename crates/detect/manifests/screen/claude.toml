@@ -4,6 +4,10 @@ min_engine_version = 2
 updated_at = "2026-08-19T00:00:00Z"
 aliases = ["claude-code"]
 
+[identify]
+names = ["claude", "claude-code"]
+wrappers = ["node", "bun"]
+
 [[rules]]
 id = "osc_title_working"
 state = "working"

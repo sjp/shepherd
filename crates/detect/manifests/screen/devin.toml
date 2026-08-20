@@ -4,6 +4,10 @@ min_engine_version = 1
 updated_at = "2026-06-15T00:00:00Z"
 aliases = ["devin-cli", "devin cli"]
 
+[identify]
+names = ["devin", "devin-cli"]
+wrappers = []
+
 [[rules]]
 id = "workspace_trust_prompt"
 state = "blocked"

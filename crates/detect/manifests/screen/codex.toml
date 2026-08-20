@@ -3,6 +3,10 @@ version = "2026.08.09.1"
 min_engine_version = 3
 updated_at = "2026-08-09T00:00:00Z"
 
+[identify]
+names = ["codex"]
+wrappers = ["node", "bun"]
+
 [[rules]]
 id = "osc_title_blocked"
 state = "blocked"

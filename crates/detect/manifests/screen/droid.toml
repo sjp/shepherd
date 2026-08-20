@@ -3,6 +3,10 @@ version = "2026.06.10.1"
 min_engine_version = 1
 updated_at = "2026-06-10T00:00:00Z"
 
+[identify]
+names = ["droid"]
+wrappers = []
+
 [[rules]]
 id = "execute_selection_blocker"
 state = "blocked"

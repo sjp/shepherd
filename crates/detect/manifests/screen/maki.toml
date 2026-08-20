@@ -3,6 +3,10 @@ version = "2026.07.09.2"
 min_engine_version = 1
 updated_at = "2026-07-09T00:00:00Z"
 
+[identify]
+names = ["maki"]
+wrappers = []
+
 # Maki renders a persistent one-line status bar on the bottom row. It starts
 # with the mode label "[BUILD]", "[PLAN]", or "[BASH]" when idle and gets a
 # leading braille spinner cell while the agent is streaming. Permission

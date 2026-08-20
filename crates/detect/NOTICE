@@ -20,9 +20,18 @@ Modifications to the manifest data as vendored here:
   - One comment in the grok manifest named the upstream project as the reader of
     an OSC 9;4 payload; it now says "the engine", which is what it describes.
 
+  - An [identify] section was added to every manifest, listing the executable
+    names and interpreter wrappers by which the agent is recognized from a
+    running process. Upstream ships no such section; the values were derived
+    from the process-identity logic in the upstream project's own source, not
+    from its manifest data. Manifest versions were deliberately not bumped: a
+    version identifies the upstream release a file was vendored from, and these
+    additions do not change which release that is.
+
 Everything else in the vendored files - identifiers, versions, timestamps, rule
 bodies and comments - is carried verbatim, so that a copy held here can be
-compared byte for byte against the upstream release it came from.
+compared against the upstream release it came from with the modifications above
+as the only differences.
 
 No source code from the herdr project is used. The herdr name appears in this
 crate only in this file and in LICENSE-APACHE-2.0.

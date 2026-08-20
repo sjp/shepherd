@@ -4,6 +4,10 @@ min_engine_version = 1
 updated_at = "2026-06-24T00:00:00Z"
 aliases = ["antigravity", "antigravity-cli"]
 
+[identify]
+names = ["agy", "antigravity", "antigravity-cli"]
+wrappers = []
+
 [[rules]]
 id = "permission_prompt"
 state = "blocked"

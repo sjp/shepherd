@@ -4,6 +4,10 @@ min_engine_version = 2
 updated_at = "2026-07-09T00:00:00Z"
 aliases = ["amp-local"]
 
+[identify]
+names = ["amp", "amp-local"]
+wrappers = ["node", "bun"]
+
 [[rules]]
 id = "osc_title_plugin_confirmation_blocked"
 state = "blocked"
