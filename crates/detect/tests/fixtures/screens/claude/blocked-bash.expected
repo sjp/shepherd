@@ -5,4 +5,4 @@
 # the screen and 'skip' if the screen was showing the past.
 #
 # The rules currently read it as: {"state":"idle","visible":true,"skip":false,"matched_rule":"live_prompt_box","fallback":null}
-TODO
+idle visible
