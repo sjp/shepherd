@@ -30,6 +30,7 @@ const INHERITED: &[&str] = &[
     "AGENTBUS_LOG",
     "AGENTBUS_REMOTE_BINARY",
     "XDG_CONFIG_HOME",
+    "XDG_RUNTIME_DIR",
 ];
 
 /// A `docker` that is a script, and the machine it pretends to have.
@@ -175,6 +176,11 @@ case "$1" in
         | sed "s#$fs/tmp/#@FSTMP@#g; s#/tmp/#@FSTMP@#g; s#@FSTMP@#$fs/tmp/#g")"
       i=$((i+1))
     done
+    # A container has no session of its own, so it has no runtime directory
+    # either, whatever the machine running these tests happens to have: the
+    # copy inside goes to the per-user directory under the container's own
+    # /tmp, which is the only place this stand-in can put one.
+    unset XDG_RUNTIME_DIR
     remote=
     for candidate in "$fs"/tmp/agentbus-* "$fs"/tmp/*/agentbus-*; do
       if [ -x "$candidate" ]; then remote=$candidate; fi
