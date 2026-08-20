@@ -4,11 +4,13 @@
 //! snapshot exists because a subscriber attaching mid-session has to learn
 //! *current state*, not merely future events. After it come live [`Event`] lines,
 //! a [`Heartbeat`] every ten seconds so that a dead stream is distinguishable
-//! from a quiet one, and [`ForegroundChange`] lines as observations change.
+//! from a quiet one, and [`ForegroundChange`] and [`StampedAssertion`] lines as
+//! observations change.
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
+use crate::assertion::StampedAssertion;
 use crate::event::{Agent, Event, Kind, OriginHop, Source};
 use crate::status::SessionStatus;
 use crate::timestamp::Timestamp;
@@ -29,6 +31,8 @@ pub enum StreamLine {
     Heartbeat(Heartbeat),
     /// A correlation's foreground observation changed.
     ForegroundChange(ForegroundChange),
+    /// An observer said what state it believes a correlation is in.
+    Assertion(StampedAssertion),
     /// A normalized lifecycle event.
     Event(Event),
     /// A line of a kind this build does not know.
@@ -49,6 +53,7 @@ impl<'de> Deserialize<'de> for StreamLine {
             SNAPSHOT => Self::Snapshot(from_value(value)?),
             HEARTBEAT => Self::Heartbeat(from_value(value)?),
             FOREGROUND_CHANGE => Self::ForegroundChange(from_value(value)?),
+            ASSERTION => Self::Assertion(from_value(value)?),
             other if Kind::from(other).is_known() => Self::Event(from_value(value)?),
             _ => Self::Unknown,
         };
@@ -66,6 +71,8 @@ pub const SNAPSHOT: &str = "snapshot";
 pub const HEARTBEAT: &str = "heartbeat";
 /// The `kind` of a [`ForegroundChange`] line.
 pub const FOREGROUND_CHANGE: &str = "foreground_change";
+/// The `kind` of a [`StampedAssertion`] line.
+pub const ASSERTION: &str = "assertion";
 
 /// The first line of every subscription: everything the daemon currently knows.
 ///
@@ -150,6 +157,16 @@ pub struct SessionEntry {
     /// on an event: a receiver has to be able to render the difference, and a
     /// snapshot is not on the hot path where the saved bytes would matter.
     pub source: Source,
+    /// Where the *displayed* status came from, when that is not where the
+    /// session's record came from.
+    ///
+    /// Present only while an observer's live claim is being shown over a
+    /// quieter agent-reported record, and absent whenever the status is the
+    /// fold's own — which is nearly always. A receiver that renders it can say
+    /// which of the two it is looking at, and one that ignores it sees the
+    /// stronger evidence about the session either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_source: Option<Source>,
     /// The agent's working directory, if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
@@ -415,6 +432,7 @@ impl ForegroundChange {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assertion::{AssertedState, StateAssertion};
     use serde_json::json;
 
     /// Builds an agent id from a literal, which is what every one of these is.
@@ -441,6 +459,11 @@ mod tests {
     const EVENT_LINE: &str = r#"{"v":1,"seq":1041,"ts":"2026-08-17T10:32:01.412Z",
         "agent":"claude","session":"abc123","kind":"tool_start","origin":[]}"#;
 
+    const ASSERTION_LINE: &str = r#"
+      {"v":1,"kind":"assertion","seq":1042,"ts":"2026-08-17T10:32:01.412Z",
+       "assert":"blocked","visible":true,"agent":"claude","correlation":"w9:p3",
+       "session":"abc123","cwd":"/x","detail":{"rule":"bash_permission_prompt"}}"#;
+
     fn ts() -> Timestamp {
         Timestamp::parse("2026-08-17T10:31:02.006Z").unwrap()
     }
@@ -453,6 +476,7 @@ mod tests {
             StreamLine::Snapshot(s) => serde_json::to_value(s).unwrap(),
             StreamLine::Heartbeat(h) => serde_json::to_value(h).unwrap(),
             StreamLine::ForegroundChange(f) => serde_json::to_value(f).unwrap(),
+            StreamLine::Assertion(a) => serde_json::to_value(a).unwrap(),
             StreamLine::Event(e) => serde_json::to_value(e).unwrap(),
             StreamLine::Unknown => panic!("{line} was not understood"),
         };
@@ -494,6 +518,91 @@ mod tests {
             panic!("expected an event");
         };
         assert_eq!(event.kind, Kind::ToolStart);
+    }
+
+    #[test]
+    fn documented_assertion_line_round_trips() {
+        let StreamLine::Assertion(assertion) = assert_round_trips(ASSERTION_LINE) else {
+            panic!("expected an assertion");
+        };
+        assert_eq!(assertion.seq, 1042);
+        assert_eq!(assertion.assert, AssertedState::Blocked);
+        assert!(assertion.visible);
+        assert_eq!(assertion.correlation, "w9:p3");
+        assert_eq!(assertion.agent, agent("claude"));
+        assert_eq!(
+            assertion.detail.as_ref().unwrap()["rule"],
+            json!("bash_permission_prompt")
+        );
+
+        // And what an observer sends arrives here as this line and no other.
+        let stamped = StateAssertion::new(agent("claude"), "w9:p3", AssertedState::Blocked)
+            .with_visible(true)
+            .with_session("abc123")
+            .with_cwd("/x")
+            .with_detail_field("rule", "bash_permission_prompt")
+            .with_raw(json!({"matched": "…"}))
+            .stamp(1042, Timestamp::parse("2026-08-17T10:32:01.412Z").unwrap());
+        assert_eq!(stamped, assertion);
+        assert_eq!(
+            serde_json::from_str::<StreamLine>(&serde_json::to_string(&stamped).unwrap()).unwrap(),
+            StreamLine::Assertion(stamped)
+        );
+    }
+
+    #[test]
+    fn an_assertion_is_a_line_kind_and_not_an_event_kind() {
+        // The two namespaces are separate, so a subscriber that switches on the
+        // line's `kind` never has to wonder which of the two it is holding.
+        assert!(!Kind::from(ASSERTION).is_known());
+        assert!(
+            !SessionStatus::ALL
+                .iter()
+                .any(|status| status.as_str() == ASSERTION)
+        );
+    }
+
+    #[test]
+    fn an_entry_the_fold_speaks_for_says_nothing_about_a_second_source() {
+        let entry = SessionEntry {
+            session: "abc123".to_owned(),
+            agent: agent("claude"),
+            status: SessionStatus::Working,
+            source: Source::Hook,
+            status_source: None,
+            cwd: None,
+            correlation: Some("w9:p3".to_owned()),
+            origin: Vec::new(),
+            since: ts(),
+        };
+        let written = serde_json::to_value(&entry).unwrap();
+        assert_eq!(
+            written,
+            json!({
+                "session": "abc123", "agent": "claude", "status": "working",
+                "source": "hook", "correlation": "w9:p3", "origin": [],
+                "since": "2026-08-17T10:31:02.006Z"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<SessionEntry>(written).unwrap(),
+            entry
+        );
+
+        // And one being shown over says whose claim is on screen, without
+        // losing whose record it is.
+        let held = SessionEntry {
+            status: SessionStatus::Blocked,
+            status_source: Some(Source::Observed),
+            ..entry
+        };
+        let written = serde_json::to_value(&held).unwrap();
+        assert_eq!(written["source"], json!("hook"));
+        assert_eq!(written["status_source"], json!("observed"));
+        assert_eq!(
+            serde_json::from_value::<SessionEntry>(written).unwrap(),
+            held
+        );
     }
 
     #[test]

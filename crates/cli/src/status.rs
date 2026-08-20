@@ -91,6 +91,7 @@ mod tests {
             agent: agent("claude"),
             status,
             source: Source::Hook,
+            status_source: None,
             cwd: Some("/workspaces/foo".to_owned()),
             correlation: Some("w9:p3".to_owned()),
             origin: Vec::new(),

@@ -424,6 +424,10 @@ impl SessionTable {
                 agent: key.agent.clone(),
                 status: session.state.status,
                 source: session.source,
+                // What the table concluded, which is the only thing it has to
+                // report: an entry names a second source only where something
+                // is being shown over the record rather than from it.
+                status_source: None,
                 cwd: session.cwd.clone(),
                 correlation: session.correlation.clone(),
                 origin: session.origin.clone(),
@@ -1097,6 +1101,7 @@ mod tests {
             agent: agent("claude"),
             status,
             source: Source::Hook,
+            status_source: None,
             cwd: Some("/srv/project".to_owned()),
             correlation: Some(SLOT.to_owned()),
             origin: vec![container("9f3c", "build")],

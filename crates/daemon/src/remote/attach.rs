@@ -564,6 +564,9 @@ fn merging(
             // arriving, and this daemon owes its own subscribers heartbeats of
             // its own rather than somebody else's.
             StreamLine::Heartbeat(_) => {}
+            // Dropped: this daemon holds no assertions, so there is nothing
+            // here for one to change.
+            StreamLine::Assertion(_) => {}
             StreamLine::Unknown => {}
         }
     }

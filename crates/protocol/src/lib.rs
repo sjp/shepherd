@@ -19,6 +19,11 @@
 //! merely future events, then events, [`Heartbeat`]s and [`ForegroundChange`]s as
 //! they happen.
 //!
+//! Something watching a session from the outside sends a [`StateAssertion`]
+//! instead — the same socket, a second line shape, telling the daemon what the
+//! state *is* rather than what happened. [`parse_emit_line`] is what tells the
+//! two apart.
+//!
 //! # Two rules that keep this stable
 //!
 //! **The core is small and closed, and `raw` is the escape hatch.** The
@@ -36,6 +41,7 @@
 
 #![warn(missing_docs)]
 
+pub mod assertion;
 pub mod event;
 pub mod fold;
 pub mod status;
@@ -43,6 +49,7 @@ pub mod stream;
 pub mod table;
 pub mod timestamp;
 
+pub use assertion::{AssertedState, EmitLine, StampedAssertion, StateAssertion, parse_emit_line};
 pub use event::{
     Agent, Event, InvalidAgent, Kind, OriginHop, SSH_CONNECTION_DETAIL, Source, UnstampedEvent,
 };

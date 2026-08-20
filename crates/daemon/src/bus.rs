@@ -1344,6 +1344,7 @@ mod tests {
             agent: agent("claude"),
             status: SessionStatus::Blocked,
             source: Source::Hook,
+            status_source: None,
             cwd: None,
             correlation: None,
             origin: vec![OriginHop::new(OriginHop::SSH, "9f3c:1000", "fileserver")],

@@ -221,6 +221,7 @@ fn snapshot(id: &str) -> Snapshot {
             agent: agent("claude"),
             status: SessionStatus::Blocked,
             source: Source::Hook,
+            status_source: None,
             cwd: None,
             correlation: None,
             origin: Vec::new(),

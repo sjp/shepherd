@@ -1110,3 +1110,43 @@ the disk, and measuring it against the invocation as a whole puts the whole run
 — payload, mapping, delivered event — around a millisecond against a 100 ms
 budget. A cache would be a second representation to keep in step with the files,
 for a beneficiary who does not exist.
+
+## 2026-08-20 — a second thing an emitter can say
+
+### The envelope's version stays 1, because every part of this is additive
+
+**A new emit line shape, a new stream line kind and a new optional field on a
+snapshot entry, and `v` is still `1`.** The number exists so that a reader can
+refuse a document it cannot understand; bumping it for a change no reader has to
+understand would cost every existing pairing for nothing. Each of the three
+degrades on its own, in a direction that was designed in rather than discovered:
+a daemon built before assertions reads one, finds no `kind`, fails the event
+parse and drops that single line; a subscriber built before them reads the new
+stream kind, does not recognize it and ignores it, which is the rule it has
+followed since the first version; and a subscriber reading a snapshot entry with
+a field it has never heard of drops the field, exactly as it drops any other.
+Nothing that existed before changed meaning, and nothing already on the wire
+moved, which is the whole test for whether a version has to move with it.
+
+### Two line shapes on one socket, told apart by which field is present
+
+**`kind` means an event; `assert` means a state assertion; both or neither means
+the line is dropped.** The alternative — a tag field naming the shape — would
+have made every line unreadable to a daemon that predates the tag, so a new
+emitter meeting an old daemon would have lost everything rather than the one
+thing that daemon could not have acted on anyway. Discriminating on presence is
+what makes the addition safe with no coordination at all: nobody has to upgrade
+in an order, and the degradation is one dropped line, in the one direction where
+dropping is correct.
+
+### The republished assertion carries the reasoning and not the evidence
+
+**`detail` survives to subscribers; `raw` is dropped on the way through.**
+Evidence is as large as whatever produced it felt like making it — a screenful of
+text is ordinary — and an observer re-asserts a state it can still see every
+second or two, so carrying it would charge every subscriber for the same
+screenful several times a second per observed slot. `detail` is small by
+construction and says which rule concluded what, which is what a subscriber
+needs to render or debug the claim. Anything that genuinely needs to see what
+was seen is better off running the observer itself, where the evidence already
+is.
