@@ -36,7 +36,7 @@ const HOOKS_FILE: &str = "hooks.json";
 const HOOKS_KEY: &str = "hooks";
 
 /// The events this program asks Codex for, which are exactly the ones the
-/// adapter has something to say about.
+/// mapping for this agent has something to say about.
 ///
 /// Asking for more would run this program's binary on every occurrence of an
 /// event whose payload it would then throw away — a cost to somebody's session
@@ -186,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn there_is_one_entry_for_every_event_the_adapter_reads_and_no_other() {
+    fn there_is_one_entry_for_every_event_the_mapping_reads_and_no_other() {
         let document = written("/opt/bin/agentbus");
 
         let registered: Vec<&String> = document[HOOKS_KEY]

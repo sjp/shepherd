@@ -509,12 +509,13 @@ mod tests {
     }
 
     /// A payload the bundled mapping for Claude has something to say about.
+    ///
+    /// Read from a recorded one rather than written out here. What an agent's
+    /// fields are called is the mapping's business now, and a copy of them in
+    /// this file would be a second place to update when that agent renames one.
     fn hook_payload() -> Value {
-        json!({
-            "session_id": "abc123",
-            "hook_event_name": "UserPromptSubmit",
-            "cwd": "/srv/project",
-        })
+        let recorded = include_str!("../tests/fixtures/hooks/claude/UserPromptSubmit.json");
+        serde_json::from_str(recorded).expect("a recorded payload is JSON")
     }
 
     #[test]

@@ -267,8 +267,8 @@ something they did not run.
 
 ### A build with debug assertions on carries an agent that panics
 
-**One name in the adapter dispatch, present only when `debug_assertions` is on,
-panics when it is asked to normalize anything.** The guarantee that a panic
+**One name in the emit path's agent handling, present only when
+`debug_assertions` is on, panics when it is asked to normalize anything.** The guarantee that a panic
 anywhere below still exits 0 with empty stdout is worth very little tested
 against a closure standing in for the real process, and there is otherwise no
 way to make the real process panic on purpose. A released build does not contain

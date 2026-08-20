@@ -1,9 +1,11 @@
 //! An observation of a terminal, normalized by whoever made it.
 //!
-//! The other modules here read one agent's hook payload. This one reads the
-//! other kind of payload the client accepts: fields already in the bus's own
-//! vocabulary, sent by a program that was watching a terminal and formed an
-//! opinion about what was happening in it. A screen reader, a multiplexer
+//! A coding agent's hook payload is read by a mapping manifest, which says what
+//! that agent's events mean. This reads the other kind of payload the client
+//! accepts: fields already in the bus's own vocabulary, sent by a program that
+//! was watching a terminal and formed an opinion about what was happening in
+//! it — which is why it is code and not a manifest, since a manifest here would
+//! only describe this crate to itself. A screen reader, a multiplexer
 //! plugin, a script tailing a log, a person with a shell script — this module
 //! never learns which, and nothing downstream of it learns that anything was
 //! watched at all. It reads a payload; that is the whole interface.
@@ -28,9 +30,17 @@
 //! speaking for itself.
 
 use agentbus_protocol::{Agent, Kind, Source, UnstampedEvent, observed_session_id};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
-use super::string;
+/// The value of a string field, if it is there and is a string.
+///
+/// Every field read below is optional on read, whatever the sender's own schema
+/// promises: a payload arrives from another program and that program moves, so a
+/// field that is missing or has changed type must degrade the event rather than
+/// lose it.
+fn string<'a>(payload: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+    payload.get(key)?.as_str()
+}
 
 /// Normalizes one observation.
 ///

@@ -273,7 +273,7 @@ fn an_observation_becomes_a_session_no_agent_reported() {
 }
 
 #[test]
-fn a_payload_the_adapter_has_nothing_to_say_about_reaches_the_bus_as_nothing() {
+fn a_payload_the_mapping_has_nothing_to_say_about_reaches_the_bus_as_nothing() {
     let (_temp, dir) = bus_dir();
     let _daemon = start_daemon(&dir);
 

@@ -37,8 +37,8 @@ use serde_json::Value;
 /// what it costs to start a process at all.
 const LIMIT: Duration = Duration::from_millis(150);
 
-/// A payload the Claude adapter has something to say about, so that a test is
-/// never passing merely because there was nothing to send.
+/// A payload the bundled mapping for Claude has something to say about, so that
+/// a test is never passing merely because there was nothing to send.
 const HOOK_PAYLOAD: &str =
     r#"{"session_id":"abc123","hook_event_name":"UserPromptSubmit","cwd":"/srv/project"}"#;
 
@@ -299,7 +299,7 @@ fn a_payload_over_the_bound_is_not_an_event() {
 }
 
 #[test]
-fn an_agent_nobody_has_written_an_adapter_for_is_not_an_event() {
+fn any_agent_name_at_all_is_harmless() {
     let (_temp, dir) = bus_dir();
     for agent in ["codex", "opencode", "an-agent-from-the-future", ""] {
         emit(&dir, &["--agent", agent], HOOK_PAYLOAD.as_bytes()).is_harmless();
