@@ -19,7 +19,7 @@ jobs:
     name: The tag names the workspace version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Compare the tag with Cargo.toml
         run: |
           . scripts/release-lib.sh
@@ -60,7 +60,7 @@ jobs:
           - triple: aarch64-apple-darwin
             runner: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.triple }}
@@ -76,7 +76,7 @@ jobs:
         env:
           AGENTBUS_RUN_WRAPPER: ${{ matrix.emulator }}
         run: scripts/build-release.sh "${{ matrix.triple }}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: asset-${{ matrix.triple }}
           path: dist/*
@@ -89,8 +89,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           pattern: asset-*
