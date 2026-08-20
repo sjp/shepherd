@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/protocol",
+    "crates/detect",
     "crates/daemon",
     "crates/install",
     "crates/cli",
@@ -14,12 +15,14 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 agentbus-protocol = { path = "crates/protocol" }
+agentbus-detect = { path = "crates/detect" }
 agentbus-daemon = { path = "crates/daemon" }
 agentbus-install = { path = "crates/install" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 libc = "0.2"
+regex = "1"
 rustls-graviola = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -29,6 +32,7 @@ tempfile = "3"
 thiserror = "2"
 tiny_http = "0.12"
 tokio = "1"
+toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots", "gzip"] }
