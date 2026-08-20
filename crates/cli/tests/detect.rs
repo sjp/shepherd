@@ -191,6 +191,33 @@ fn the_two_json_forms_cannot_be_asked_for_at_once() {
 }
 
 #[test]
+fn sending_a_verdict_and_printing_one_cannot_be_asked_for_at_once() {
+    for printed in ["--json", "--explain"] {
+        let output = detect(&["--agent", AGENT, "--emit", printed], BLOCKED);
+
+        assert!(!output.status.success(), "{}", said(&output));
+        assert_eq!(out(&output), "");
+    }
+}
+
+#[test]
+fn what_a_claim_would_carry_can_only_be_given_to_something_that_will_send_one() {
+    // Each of these describes a claim, and a command that is only going to
+    // print one word has nowhere to put it. Saying so is better than accepting
+    // it and doing nothing with it.
+    for described in [
+        ["--correlation", "w9:p3"],
+        ["--session", "abc123"],
+        ["--cwd", "/x"],
+    ] {
+        let output = detect(&["--agent", AGENT, described[0], described[1]], BLOCKED);
+
+        assert!(!output.status.success(), "{}", said(&output));
+        assert_eq!(out(&output), "");
+    }
+}
+
+#[test]
 fn an_empty_screen_from_a_known_agent_falls_back_to_calm() {
     let output = detect(&["--agent", AGENT], "");
 
@@ -243,6 +270,11 @@ fn the_help_describes_screens_and_agents_and_nothing_it_cannot_see() {
         assert!(!help.contains(word), "the help text says {word:?}: {help}");
     }
     for word in ["screen", "agent", "manifest", "stdin"] {
+        assert!(help.contains(word), "the help text omits {word:?}: {help}");
+    }
+    // Sending is a loop, and a loop has a cadence: somebody reading this has to
+    // be told what it is, because the bus's own patience is what depends on it.
+    for word in ["--emit", "--correlation", "every second or two"] {
         assert!(help.contains(word), "the help text omits {word:?}: {help}");
     }
 }

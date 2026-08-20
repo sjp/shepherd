@@ -26,7 +26,8 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 
 use agentbus_protocol::{
-    Event, ForegroundChange, ForegroundEntry, SessionEntry, SessionStatus, Snapshot, StreamLine,
+    Event, ForegroundChange, ForegroundEntry, SessionEntry, SessionStatus, Snapshot,
+    StampedAssertion, StreamLine,
 };
 
 /// How long a test waits for something that should happen immediately.
@@ -405,6 +406,15 @@ impl Subscriber {
     pub fn event(&mut self, what: &str) -> Event {
         self.until(what, |line| match line {
             StreamLine::Event(event) => Some(event.clone()),
+            _ => None,
+        })
+    }
+
+    /// The next claim an observer made, skipping everything else the bus says
+    /// while a test is waiting.
+    pub fn assertion(&mut self, what: &str) -> StampedAssertion {
+        self.until(what, |line| match line {
+            StreamLine::Assertion(claim) => Some(claim.clone()),
             _ => None,
         })
     }

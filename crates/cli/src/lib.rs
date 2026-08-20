@@ -176,6 +176,14 @@ enum Command {
     /// operator wrote first, then one fetched into this machine's state
     /// directory, then the copy inside this binary. Pass --explain to be told
     /// which copy answered and what it made of every rule.
+    ///
+    /// Pass --emit to send the verdict to the bus as a claim about the slot the
+    /// screen came from instead of printing it. A caller doing that is a loop,
+    /// and the cadence that suits the bus is: send when the verdict changes, and
+    /// send the same claim again every second or two for as long as it is still
+    /// on the screen. The bus stops preferring a claim nobody is repeating, so
+    /// an observer that says something once and goes quiet is treated as one
+    /// that has stopped looking — which, from where the bus is standing, it has.
     Detect(DetectArgs),
     /// Read a payload on stdin, normalize it, and send it to the bus.
     Emit(EmitArgs),
@@ -372,6 +380,9 @@ struct ForegroundArgs {
 /// as a test case.
 #[derive(Debug, Args)]
 struct DetectArgs {
+    #[command(flatten)]
+    location: Location,
+
     /// The agent whose screen is on stdin, when the caller already knows
     #[arg(long, value_name = "ID")]
     agent: Option<String>,
@@ -399,6 +410,27 @@ struct DetectArgs {
     /// Print every rule in the agent's manifest that ran, what it saw and why the winner won, as JSON
     #[arg(long)]
     explain: bool,
+
+    /// Send the verdict to the bus as a claim about --correlation instead of printing it
+    ///
+    /// Nothing is printed and the status is 0 whether or not a bus was
+    /// listening, so a loop is safe to leave running across a restart of it.
+    /// What is sent is the state, whether its chrome is live on the screen, and
+    /// which rule concluded it — never any of the screen.
+    #[arg(long, conflicts_with_all = ["json", "explain"])]
+    emit: bool,
+
+    /// What the claim is about, copied verbatim [default: the correlation in this process's environment]
+    #[arg(long, value_name = "TEXT", requires = "emit")]
+    correlation: Option<String>,
+
+    /// The agent's own session id, where the caller knows it
+    #[arg(long, value_name = "ID", requires = "emit")]
+    session: Option<String>,
+
+    /// The directory that session is working in, where the caller knows it
+    #[arg(long, value_name = "DIR", requires = "emit")]
+    cwd: Option<String>,
 }
 
 impl DetectArgs {
@@ -837,6 +869,12 @@ fn tail(stream: &mut stream::Stream, of: Duration, out: &mut impl Write) -> Exit
 /// copies and any that have been fetched already live. A screen that reads
 /// oddly is usually a manifest question, so `--explain` says which copy
 /// answered and repeats on stderr whatever the store passed over to reach it.
+///
+/// The screen is read before anything else is decided, `--emit` included.
+/// Whatever captured it is holding the other end of the pipe, and a process
+/// that exits before draining it leaves that end broken — a way of interfering
+/// with somebody's capture command, and no way to answer a question about a
+/// correlation this was never given.
 fn detect(args: &DetectArgs) -> ExitCode {
     let (screen, truncated) = match detect::read_screen(std::io::stdin().lock()) {
         Ok(read) => read,
@@ -854,6 +892,10 @@ fn detect(args: &DetectArgs) -> ExitCode {
         osc_title: args.osc_title.as_deref().unwrap_or_default(),
         osc_progress: args.osc_progress.as_deref().unwrap_or_default(),
     };
+    if args.emit {
+        return assert_detection(args, &request);
+    }
+
     let form = args.form();
     let Some(answer) = detect::answer(&ManifestStore::from_env(), &request, form) else {
         eprintln!("{DETECT}: {}", detect::UNIDENTIFIED);
@@ -876,6 +918,66 @@ fn detect(args: &DetectArgs) -> ExitCode {
         Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
         Err(error) => fail(DETECT, &error),
     }
+}
+
+/// Sends what the screen was evidence of to the bus, rather than printing it.
+///
+/// Three of the four ways out are zero. A claim that went to a listening bus, a
+/// screen whose verdict was that it says nothing about now, and a machine with
+/// no bus running are all this command working: the caller asked for the screen
+/// to be reported and the screen has been reported as fully as it can be.
+/// Exiting non-zero on the last of them would make an observer loop noisy for
+/// as long as the bus is down, which is exactly when nobody is reading it.
+///
+/// The fourth is the pair of things this cannot report about: a screen nobody
+/// can be named for, and a claim nothing can be attributed to. Both leave with
+/// [`UNIDENTIFIED`], because both are the same shape of answer — this ran, and
+/// there is no claim to be made — and a caller sweeping terminals wants to skip
+/// that one and carry on rather than treat it as a failure of the command.
+fn assert_detection(args: &DetectArgs, request: &detect::Request<'_>) -> ExitCode {
+    // A claim is about something, and nothing here says what: the bus would
+    // have nowhere to file it, so it is not sent. Asked before the manifests
+    // are consulted because it is the caller's own mistake and cannot become
+    // anything else however the screen reads.
+    let Some(correlation) = correlation(args) else {
+        eprintln!("{DETECT}: {}", detect::UNATTRIBUTABLE);
+        return ExitCode::from(UNIDENTIFIED);
+    };
+    let attribution = detect::Attribution {
+        correlation: &correlation,
+        session: args.session.as_deref(),
+        cwd: args.cwd.as_deref(),
+    };
+    let store = ManifestStore::from_env();
+    let Some(claim) = detect::claim(&store, request, &attribution) else {
+        eprintln!("{DETECT}: {}", detect::UNIDENTIFIED);
+        return ExitCode::from(UNIDENTIFIED);
+    };
+    let detect::Claim::Send(assertion) = claim else {
+        return ExitCode::SUCCESS;
+    };
+    match detect::send(&assertion, args.location.paths().emit()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => fail(DETECT, &error),
+    }
+}
+
+/// What a claim about this screen is about: the flag, then the environment.
+///
+/// The two variables are the ones the hook client reads for the same purpose
+/// and are read the same way — copied, never looked at, and an empty value
+/// treated as no value, because a value that says nothing cannot tie anything
+/// to anything. The flag comes first because a program capturing somebody
+/// else's terminal knows which slot it captured, and its own environment is
+/// about the shell it is running in rather than the one it is looking at.
+fn correlation(args: &DetectArgs) -> Option<String> {
+    let named = args.correlation.clone();
+    let pane = std::env::var(emit::PANE_VAR).ok();
+    let fallback = std::env::var(emit::PANE_FALLBACK_VAR).ok();
+    [named, pane, fallback]
+        .into_iter()
+        .flatten()
+        .find(|value| !value.is_empty())
 }
 
 /// Sends one event to the bus, and says nothing whatever about how it went.

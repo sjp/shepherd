@@ -379,7 +379,13 @@ fn readable(fd: RawFd, deadline: Instant) -> bool {
 /// The socket was there when [`send`] looked for it. A daemon that has gone
 /// away since fails on connect below, which is the same outcome as its socket
 /// having been missing all along: nothing is sent and nothing is said.
-fn deliver(line: &[u8], socket: &Path, deadline: Instant) -> io::Result<()> {
+///
+/// Shared with the one other thing in this binary that writes to that socket
+/// without being a hook. It has the same two ways of hanging — a full backlog
+/// and a receiver that has stopped reading — and there is no version of either
+/// that is worth waiting out, so it gets the same deadlines rather than a
+/// second opinion about them.
+pub(crate) fn deliver(line: &[u8], socket: &Path, deadline: Instant) -> io::Result<()> {
     let mut stream = connect(socket, deadline)?;
     write_within(&mut stream, line, deadline)
 }
