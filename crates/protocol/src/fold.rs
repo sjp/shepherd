@@ -275,7 +275,11 @@ fn next_status(current: SessionStatus, kind: &Kind) -> SessionStatus {
 }
 
 /// Moves `current` forward to `candidate`, never backwards.
-fn advance(current: &mut Timestamp, candidate: &Timestamp) {
+///
+/// Shared with the session table, which applies the same rule to the claims an
+/// observer makes about a session: there is one answer to "an older timestamp
+/// arrived" in this crate and it lives here.
+pub(crate) fn advance(current: &mut Timestamp, candidate: &Timestamp) {
     if candidate > current {
         *current = candidate.clone();
     }

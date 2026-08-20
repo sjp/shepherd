@@ -22,7 +22,8 @@
 //! Something watching a session from the outside sends a [`StateAssertion`]
 //! instead — the same socket, a second line shape, telling the daemon what the
 //! state *is* rather than what happened. [`parse_emit_line`] is what tells the
-//! two apart.
+//! two apart, and [`SessionTable::apply_assertion`] settles it against what the
+//! agents are saying for themselves.
 //!
 //! # Two rules that keep this stable
 //!
@@ -60,8 +61,9 @@ pub use stream::{
     Snapshot, StreamLine,
 };
 pub use table::{
-    DEFAULT_DONE_RETENTION, OBSERVED_SESSION_PREFIX, OriginConflict, SessionKey, SessionTable,
-    TrackedSession, is_observed_session_id, observed_session_id,
+    DEFAULT_ASSERT_HOLD, DEFAULT_DONE_RETENTION, HeldAssertion, OBSERVED_SESSION_PREFIX,
+    OriginConflict, SessionKey, SessionTable, TrackedSession, is_observed_session_id,
+    observed_session_id,
 };
 pub use timestamp::{Timestamp, TimestampError};
 

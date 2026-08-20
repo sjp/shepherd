@@ -31,14 +31,43 @@
 //!    observations against each other; it never suppresses a hook-backed
 //!    session, because one correlated slot may legitimately host two agents.
 //!
+//! # The one thing a watcher can still put on the screen
+//!
+//! Shadowing decides whole rows, and it decides them right nearly always: an
+//! agent speaking for itself beats a guess about it. It has one bounded
+//! exception, and the exception is about a single field. `blocked` is the state
+//! this bus exists to report, and the way it goes missing is that an agent's
+//! hooks never said it — while something watching that terminal can see the
+//! prompt sitting there. So a live claim of `blocked` about a slot a hook is
+//! already speaking for is shown on that session's snapshot entry, and nowhere
+//! else:
+//!
+//! - **Live only.** The claim must be [`visible`](StateAssertion::visible) —
+//!   the observer can see the evidence as it speaks — must have arrived after
+//!   the session's last hook event, and must still be fresh within
+//!   [`SessionTable::assert_hold`]. Any hook event for that correlation drops it
+//!   at once, because an agent calling tools is not sitting on a prompt.
+//! - **Upgrade only.** It applies to `working`, `idle` and `stale`. On `blocked`
+//!   it would be saying the same thing twice, and `done` is a session that is
+//!   over.
+//! - **Never a rewrite.** The record goes on saying what the hooks said. The
+//!   claim is put on the entry as it is built, labelled with
+//!   [`status_source`](SessionEntry::status_source) so that nobody can mistake a
+//!   guess for the agent's own word, and it leaves nothing behind when it goes.
+//!
+//! No other claim has that power. One that is not `blocked`, or not visible, is
+//! a floor, and a floor is exactly what [`SessionTable::apply_assertion`] gives
+//! it: a session of its own, reported whenever no hook is speaking for the slot.
+//!
 //! `correlation` is an opaque string throughout. It is compared with `==` and
 //! nothing else: never split, never prefixed, never assumed to have a shape.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use crate::assertion::{AssertedState, StateAssertion};
 use crate::event::{Agent, Event, OriginHop, Source};
-use crate::fold::{Fold, Input, SessionState};
+use crate::fold::{Fold, Input, SessionState, advance};
 use crate::status::SessionStatus;
 use crate::stream::{SessionEntry, Snapshot};
 use crate::timestamp::Timestamp;
@@ -49,6 +78,15 @@ use crate::timestamp::Timestamp;
 /// short enough that a finished session is not still cluttering the list when
 /// they next start one.
 pub const DEFAULT_DONE_RETENTION: Duration = Duration::from_secs(30);
+
+/// How long a claim made by an observer keeps the standing to be shown over a
+/// hook-backed session's own record.
+///
+/// An observer that can still see what it claimed says so again every second or
+/// two, so five seconds is several missed repeats: long enough to ride out one
+/// that stutters, short enough that a claim nobody is making any more stops
+/// being shown at about the moment it stops being true.
+pub const DEFAULT_ASSERT_HOLD: Duration = Duration::from_secs(5);
 
 /// The prefix of a session id synthesized for an observed session.
 pub const OBSERVED_SESSION_PREFIX: &str = "observed:";
@@ -130,6 +168,29 @@ pub struct TrackedSession {
     pub origin: Vec<OriginHop>,
 }
 
+/// The claim standing for one correlated slot, and when it was made.
+///
+/// At most one of these exists per correlation: a claim is level-triggered, so
+/// the newest one is the whole of what the observer is saying and there is no
+/// history to keep. It survives until it is contradicted, withdrawn, cancelled
+/// by the agent's own hooks, or simply not repeated for
+/// [`SessionTable::assert_hold`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldAssertion {
+    /// The claimed level. Never [`AssertedState::Unknown`]: a withdrawal takes
+    /// the hold away rather than being held.
+    pub assert: AssertedState,
+    /// Whether the observer could see the evidence as it made the latest claim.
+    pub visible: bool,
+    /// When the most recent claim of this state arrived. Freshness is measured
+    /// from here, so repeating a claim keeps it alive.
+    pub received_at: Timestamp,
+    /// When this state was first claimed, unbroken since. Repeating a state that
+    /// is already held does not move it — that is what makes an assertion a
+    /// level and not a transition.
+    pub since: Timestamp,
+}
+
 /// An event whose `origin` disagrees with the chain recorded for its session.
 ///
 /// A session does not move: one key names one session on one machine, so a
@@ -157,7 +218,12 @@ pub struct OriginConflict {
 pub struct SessionTable {
     fold: Fold,
     done_retention: Duration,
+    assert_hold: Duration,
     sessions: BTreeMap<SessionKey, TrackedSession>,
+    /// What an observer currently claims about each correlation. Keyed by the
+    /// opaque string, which is only ever compared for equality; the ordering is
+    /// the map's own business and gives the table a stable shape to compare.
+    holds: BTreeMap<String, HeldAssertion>,
 }
 
 impl Default for SessionTable {
@@ -172,7 +238,9 @@ impl SessionTable {
         Self {
             fold: Fold::new(),
             done_retention: DEFAULT_DONE_RETENTION,
+            assert_hold: DEFAULT_ASSERT_HOLD,
             sessions: BTreeMap::new(),
+            holds: BTreeMap::new(),
         }
     }
 
@@ -190,6 +258,13 @@ impl SessionTable {
         self
     }
 
+    /// Keeps an observer's claim standing for `assert_hold` after it is made.
+    #[must_use]
+    pub const fn with_assert_hold(mut self, assert_hold: Duration) -> Self {
+        self.assert_hold = assert_hold;
+        self
+    }
+
     /// The fold this table applies to every session.
     pub const fn fold(&self) -> &Fold {
         &self.fold
@@ -198,6 +273,16 @@ impl SessionTable {
     /// How long this table keeps reporting a session that is over.
     pub const fn done_retention(&self) -> Duration {
         self.done_retention
+    }
+
+    /// How long a claim by an observer stands before it needs repeating.
+    pub const fn assert_hold(&self) -> Duration {
+        self.assert_hold
+    }
+
+    /// What an observer currently claims about one correlated slot, if anything.
+    pub fn held_assertion(&self, correlation: &str) -> Option<&HeldAssertion> {
+        self.holds.get(correlation)
     }
 
     /// How many sessions the table holds, reported or shadowed.
@@ -227,6 +312,16 @@ impl SessionTable {
     /// Returns the conflict to report when the event's `origin` disagrees with
     /// the chain the session was first seen with.
     pub fn apply_event(&mut self, event: &Event) -> Option<OriginConflict> {
+        // The agent has just spoken for this slot, which settles anything an
+        // observer was claiming about it: whatever it thought it could see, an
+        // agent that is emitting is not sitting in front of a prompt waiting for
+        // its human. Withdrawing the claim here rather than at snapshot time is
+        // what makes it instant.
+        if event.source == Source::Hook {
+            if let Some(correlation) = reported(&event.correlation) {
+                self.holds.remove(correlation);
+            }
+        }
         let key = SessionKey::of(event);
         let Some(session) = self.sessions.get_mut(&key) else {
             let state = self
@@ -264,6 +359,123 @@ impl SessionTable {
         conflict
     }
 
+    /// Records what an observer claims about one correlated slot.
+    ///
+    /// Two things happen, and they are independent. The claim becomes the one
+    /// held for its correlation, where the snapshot builder may show it over a
+    /// hook-backed session for as long as it stays live. And, unless it is a
+    /// withdrawal, it drives an observed session of its own — the session that
+    /// covers an agent whose hooks are not installed, and which is shadowed the
+    /// moment one is.
+    ///
+    /// The claim is level-triggered, so it *sets* a status rather than moving
+    /// one: repeating it changes nothing at all, `since` included, and a
+    /// different state begins at the moment the claim making it arrived.
+    /// `received_at` is when this table heard the claim, which is the only
+    /// timing an observer's word can be trusted on — it cannot tell a state that
+    /// just began from one that has been true for a minute.
+    ///
+    /// A claim never touches a session an agent speaks for, even when it names
+    /// that session's id: an observer's word is a floor, and the record of a
+    /// session reporting itself is not a floor's to rewrite. Returns the key the
+    /// claim drove, or `None` where it drove no session at all.
+    pub fn apply_assertion(
+        &mut self,
+        assertion: &StateAssertion,
+        received_at: &Timestamp,
+    ) -> Option<SessionKey> {
+        // A claim is *about* something, and the correlation is the only thing
+        // that says what. One nobody can attribute is not a weak claim, it is
+        // not a claim.
+        let correlation = given(&assertion.correlation)?;
+        self.hold(correlation, assertion, received_at);
+
+        let status = match assertion.assert {
+            AssertedState::Working => SessionStatus::Working,
+            AssertedState::Idle => SessionStatus::Idle,
+            AssertedState::Blocked => SessionStatus::Blocked,
+            // "I no longer know" takes back the hold above and says nothing
+            // else. It is not a claim that anything changed, so the session is
+            // left sitting in the last state somebody did know.
+            AssertedState::Unknown => return None,
+        };
+        let key = SessionKey::new(
+            assertion.agent.clone(),
+            reported(&assertion.session)
+                .map_or_else(|| observed_session_id(correlation), str::to_owned),
+        );
+
+        match self.sessions.get_mut(&key) {
+            // The key belongs to an agent reporting itself, which an observer
+            // that read the session id off the screen can easily land on. The
+            // claim is held above, where the snapshot may show it; the record
+            // it would be overwriting here is not a guess's to touch.
+            Some(session) if session.source == Source::Hook => return None,
+            Some(session) => {
+                if let Some(cwd) = reported(&assertion.cwd) {
+                    session.cwd = Some(cwd.to_owned());
+                }
+                session.correlation = Some(correlation.to_owned());
+                session.state.source = Source::Observed;
+                advance(&mut session.state.last_event, received_at);
+                if session.state.status != status {
+                    session.state.status = status;
+                    // As in the fold: the status begins at the newest moment
+                    // this table knows about, never at a straggler's.
+                    let began = session.state.last_event.clone();
+                    advance(&mut session.state.since, &began);
+                }
+            }
+            None => {
+                self.sessions.insert(
+                    key.clone(),
+                    TrackedSession {
+                        state: SessionState {
+                            status,
+                            since: received_at.clone(),
+                            last_event: received_at.clone(),
+                            source: Source::Observed,
+                            last_error: None,
+                        },
+                        source: Source::Observed,
+                        cwd: reported(&assertion.cwd).map(str::to_owned),
+                        correlation: Some(correlation.to_owned()),
+                        origin: Vec::new(),
+                    },
+                );
+            }
+        }
+        Some(key)
+    }
+
+    /// Files a claim as the one standing for its correlation.
+    fn hold(&mut self, correlation: &str, assertion: &StateAssertion, received_at: &Timestamp) {
+        if assertion.assert.is_withdrawal() {
+            self.holds.remove(correlation);
+            return;
+        }
+        let held = self
+            .holds
+            .entry(correlation.to_owned())
+            .or_insert_with(|| HeldAssertion {
+                assert: assertion.assert,
+                visible: assertion.visible,
+                received_at: received_at.clone(),
+                since: received_at.clone(),
+            });
+        advance(&mut held.received_at, received_at);
+        // Confidence is a property of the latest claim, not of the state: an
+        // observer that can no longer see what it still infers says so by
+        // sending the same state without `visible`, and loses its standing to be
+        // shown over a hook without the state flapping.
+        held.visible = assertion.visible;
+        if held.assert != assertion.assert {
+            held.assert = assertion.assert;
+            let began = held.received_at.clone();
+            advance(&mut held.since, &began);
+        }
+    }
+
     /// Moves every session's clock to `now`, then drops the ones that have been
     /// over for longer than [`SessionTable::done_retention`].
     ///
@@ -278,6 +490,12 @@ impl SessionTable {
                 .apply(Some(session.state.clone()), Input::Tick { now })
                 .expect("a session that exists still exists after a tick");
         }
+        // A claim is only worth anything while somebody keeps making it, so one
+        // that has not been repeated for the hold window is dropped rather than
+        // left to be shown over an agent's own record indefinitely.
+        let hold = i64::try_from(self.assert_hold.as_millis()).unwrap_or(i64::MAX);
+        self.holds
+            .retain(|_, held| now.millis_since(&held.received_at) < hold);
         let retention = i64::try_from(self.done_retention.as_millis()).unwrap_or(i64::MAX);
         self.sessions.retain(|_, session| {
             session.state.status != SessionStatus::Done
@@ -419,19 +637,24 @@ impl SessionTable {
                     .is_some_and(|deepest| session.origin.len() < *deepest);
                 !outranked_by_a_hook && !outranked_by_a_deeper_view
             })
-            .map(|(key, session)| SessionEntry {
-                session: key.session.clone(),
-                agent: key.agent.clone(),
-                status: session.state.status,
-                source: session.source,
-                // What the table concluded, which is the only thing it has to
-                // report: an entry names a second source only where something
-                // is being shown over the record rather than from it.
-                status_source: None,
-                cwd: session.cwd.clone(),
-                correlation: session.correlation.clone(),
-                origin: session.origin.clone(),
-                since: session.state.since.clone(),
+            .map(|(key, session)| {
+                // Nearly always nothing: an entry names a second source only
+                // where something is being shown over the record rather than
+                // from it.
+                let shown = self.visible_blocker(session);
+                SessionEntry {
+                    session: key.session.clone(),
+                    agent: key.agent.clone(),
+                    status: shown.map_or(session.state.status, |_| SessionStatus::Blocked),
+                    source: session.source,
+                    status_source: shown.map(|_| Source::Observed),
+                    cwd: session.cwd.clone(),
+                    correlation: session.correlation.clone(),
+                    origin: session.origin.clone(),
+                    since: shown
+                        .map_or(&session.state.since, |held| &held.since)
+                        .clone(),
+                }
             })
             .collect();
         entries.sort_by(|a, b| {
@@ -441,6 +664,35 @@ impl SessionTable {
                 .then_with(|| a.session.cmp(&b.session))
         });
         entries
+    }
+
+    /// The claim to show over `session`'s own record, where there is one with
+    /// the standing to be shown at all.
+    ///
+    /// This is the whole of the exception described at the top of this module,
+    /// and the whole of what `status_source` ever reports. Everything it tests
+    /// is a bound on it: `blocked` because that is the state worth overriding
+    /// anything for, `visible` because only live evidence outranks an agent's
+    /// own word, later than `last_event` because a claim older than the agent's
+    /// latest news is stale evidence by definition, and a status the agent's own
+    /// record leaves room to improve on.
+    ///
+    /// Freshness is not tested here, because this module has no clock: an
+    /// expired claim is one [`SessionTable::tick`] has already dropped.
+    fn visible_blocker(&self, session: &TrackedSession) -> Option<&HeldAssertion> {
+        if session.source != Source::Hook
+            || !matches!(
+                session.state.status,
+                SessionStatus::Working | SessionStatus::Idle | SessionStatus::Stale
+            )
+        {
+            return None;
+        }
+        let held = self.holds.get(session.correlation.as_deref()?)?;
+        (held.assert == AssertedState::Blocked
+            && held.visible
+            && held.received_at > session.state.last_event)
+            .then_some(held)
     }
 }
 
@@ -464,7 +716,13 @@ fn settled_by_depth<'a>(key: &SessionKey, session: &'a TrackedSession) -> Option
 /// emitter with nothing to say leaves a field out, but an agent handing on an
 /// unset environment variable produces an empty one, and neither is news.
 fn reported(field: &Option<String>) -> Option<&str> {
-    field.as_deref().filter(|value| !value.is_empty())
+    field.as_deref().and_then(given)
+}
+
+/// The same rule for a field whose type makes it mandatory: an emitter can still
+/// fill one in with nothing, and nothing is not an answer.
+fn given(value: &str) -> Option<&str> {
+    (!value.is_empty()).then_some(value)
 }
 
 /// Whether two origin chains describe the same path. `name` is display only —
@@ -1190,5 +1448,346 @@ mod tests {
                 .get(&SessionKey::new(agent("claude"), "abc123"))
                 .is_none()
         );
+    }
+
+    /// An observer's claim about the slot every test works in.
+    fn claim(state: AssertedState) -> StateAssertion {
+        StateAssertion::new(agent("claude"), SLOT, state)
+    }
+
+    /// The one that can be shown over an agent's own record, and the only one.
+    fn live_block() -> StateAssertion {
+        claim(AssertedState::Blocked).with_visible(true)
+    }
+
+    /// When the agent in the truth table below last said anything for itself.
+    const LAST_EVENT: u64 = 200;
+
+    /// A hook-backed session sitting in `status`, last heard from at
+    /// [`LAST_EVENT`].
+    ///
+    /// Seeding is how a status is chosen outright: the fold reaches `stale`
+    /// only by two minutes of silence, and a truth table that spent them would
+    /// be a truth table nobody runs.
+    fn hook_session_in(status: SessionStatus) -> SessionTable {
+        let mut table = SessionTable::new();
+        table.seed(
+            &SessionEntry {
+                session: "abc123".to_owned(),
+                agent: agent("claude"),
+                status,
+                source: Source::Hook,
+                status_source: None,
+                cwd: None,
+                correlation: Some(SLOT.to_owned()),
+                origin: Vec::new(),
+                since: at(LAST_EVENT),
+            },
+            &at(LAST_EVENT),
+        );
+        table
+    }
+
+    /// The single row a snapshot of a one-slot table has.
+    fn only_row(table: &SessionTable) -> SessionEntry {
+        let mut entries = table.snapshot_sessions();
+        assert_eq!(entries.len(), 1, "one slot is one row: {entries:?}");
+        entries.remove(0)
+    }
+
+    /// What an agent's own record says, which no claim may ever change.
+    fn record(table: &SessionTable) -> (SessionStatus, Timestamp) {
+        let session = table
+            .get(&SessionKey::new(agent("claude"), "abc123"))
+            .expect("the session went missing");
+        (session.state.status, session.state.since.clone())
+    }
+
+    #[test]
+    fn a_claim_drives_a_session_of_its_own_where_nothing_else_speaks_for_the_slot() {
+        let mut table = SessionTable::new();
+
+        let key = table
+            .apply_assertion(&claim(AssertedState::Working), &at(10))
+            .expect("a claim about an unspoken-for slot is a session");
+        assert_eq!(
+            key,
+            SessionKey::new(agent("claude"), observed_session_id(SLOT))
+        );
+        assert_eq!(
+            rows(&table),
+            vec![(observed_session_id(SLOT), Working, Source::Observed)]
+        );
+        let since = |table: &SessionTable| {
+            table
+                .get(&key)
+                .expect("it went missing")
+                .state
+                .since
+                .clone()
+        };
+        assert_eq!(since(&table), at(10));
+        // A claim is a level, not a transition: making it again is making it
+        // once, and the state has been true since it was first claimed.
+        table.apply_assertion(&claim(AssertedState::Working), &at(11));
+        assert_eq!(table.len(), 1);
+        assert_eq!(since(&table), at(10));
+
+        // A different state does begin when it is claimed.
+        table.apply_assertion(&claim(AssertedState::Blocked), &at(12));
+        assert_eq!(
+            rows(&table),
+            vec![(observed_session_id(SLOT), Blocked, Source::Observed)]
+        );
+        assert_eq!(since(&table), at(12));
+        // Nothing about a session anybody is guessing at claims to be the
+        // agent's own word.
+        assert_eq!(only_row(&table).status_source, None);
+
+        // "I no longer know" takes back the claim without pretending to know
+        // something else instead.
+        assert_eq!(
+            table.apply_assertion(&claim(AssertedState::Unknown), &at(13)),
+            None
+        );
+        assert_eq!(table.held_assertion(SLOT), None);
+        assert_eq!(
+            rows(&table),
+            vec![(observed_session_id(SLOT), Blocked, Source::Observed)]
+        );
+        assert_eq!(since(&table), at(12));
+
+        // And it leaves the way an observed session always has.
+        table.process_gone(&key, &at(14));
+        assert_eq!(
+            rows(&table),
+            vec![(observed_session_id(SLOT), Done, Source::Observed)]
+        );
+    }
+
+    #[test]
+    fn a_session_a_claim_drives_is_not_timed_out_for_going_quiet() {
+        // Silence from an observer is not silence from the agent: an agent
+        // waiting on its human changes nothing on screen for as long as it
+        // waits, so there is nothing for the observer to say.
+        let mut table =
+            SessionTable::new().with_fold(Fold::with_stale_after(Duration::from_secs(5)));
+        let key = table
+            .apply_assertion(&claim(AssertedState::Working), &at(10))
+            .expect("a claim is a session");
+
+        table.tick(&at(100));
+
+        let session = table.get(&key).expect("it went missing");
+        assert_eq!(session.state.status, Working);
+        assert_eq!(session.state.since, at(10));
+        // The claim itself is long expired, which is a different question.
+        assert_eq!(table.held_assertion(SLOT), None);
+    }
+
+    #[test]
+    fn a_claim_about_nothing_in_particular_is_not_a_claim() {
+        let mut table = SessionTable::new();
+
+        let unattributable = StateAssertion::new(agent("claude"), "", AssertedState::Blocked);
+        assert_eq!(table.apply_assertion(&unattributable, &at(10)), None);
+
+        assert!(table.is_empty());
+        assert_eq!(table.held_assertion(""), None);
+    }
+
+    #[test]
+    fn only_a_live_visible_block_is_shown_over_what_an_agent_says_about_itself() {
+        // Every claim that can be made about a slot an agent is speaking for,
+        // in every state that agent can be in, made both before and after its
+        // last word and read both inside and outside the hold window. Exactly
+        // three of the combinations are the exception; the rest are the rule.
+        const BEFORE: u64 = LAST_EVENT - 1;
+        const AFTER: u64 = LAST_EVENT + 10;
+
+        for status in [Starting, Working, Blocked, Idle, Stale, Done] {
+            for state in AssertedState::ALL {
+                for visible in [false, true] {
+                    for received in [BEFORE, AFTER] {
+                        for fresh in [true, false] {
+                            let mut table = hook_session_in(status);
+                            table.apply_assertion(
+                                &claim(state).with_visible(visible),
+                                &at(received),
+                            );
+                            // Both ticks are close enough to the agent's last
+                            // word to leave the fold's own reckoning alone; they
+                            // differ only in whether the claim has been left
+                            // unrepeated for longer than the hold window.
+                            table.tick(&at(received + if fresh { 1 } else { 5 }));
+
+                            let upgraded = state == AssertedState::Blocked
+                                && visible
+                                && fresh
+                                && received == AFTER
+                                && matches!(status, Working | Idle | Stale);
+                            let case = format!(
+                                "{status} agent, claimed {state}, visible {visible}, \
+                                 received at {received}, fresh {fresh}"
+                            );
+
+                            let entry = only_row(&table);
+                            assert_eq!(entry.session, "abc123", "{case}");
+                            assert_eq!(entry.source, Source::Hook, "{case}");
+                            if upgraded {
+                                assert_eq!(entry.status, Blocked, "{case}");
+                                assert_eq!(entry.status_source, Some(Source::Observed), "{case}");
+                                assert_eq!(entry.since, at(received), "{case}");
+                            } else {
+                                assert_eq!(entry.status, status, "{case}");
+                                assert_eq!(entry.status_source, None, "{case}");
+                                assert_eq!(entry.since, at(LAST_EVENT), "{case}");
+                            }
+                            // Shown or not, the agent's own record is exactly
+                            // what its hooks left behind.
+                            assert_eq!(record(&table), (status, at(LAST_EVENT)), "{case}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_slot_a_claim_is_shown_on_is_still_one_row() {
+        let mut table = table_of(&[hook("abc123", Kind::ToolStart, LAST_EVENT)]);
+        table.apply_assertion(&live_block(), &at(210));
+
+        // Two sessions are known — the agent's, and the one the observer's
+        // claim drives — and one of them is reported.
+        assert_eq!(table.len(), 2);
+        assert_eq!(
+            rows(&table),
+            vec![("abc123".to_owned(), Blocked, Source::Hook)]
+        );
+        let entry = only_row(&table);
+        assert_eq!(entry.status_source, Some(Source::Observed));
+        assert_eq!(entry.since, at(210));
+        assert_eq!(record(&table), (Working, at(LAST_EVENT)));
+    }
+
+    #[test]
+    fn an_agents_own_word_takes_back_a_claim_about_its_slot_at_once() {
+        let mut table = table_of(&[hook("abc123", Kind::ToolStart, LAST_EVENT)]);
+        table.apply_assertion(&live_block(), &at(210));
+        assert_eq!(only_row(&table).status, Blocked);
+
+        // It is calling a tool, so it is not sitting in front of a prompt
+        // waiting for its human, whatever the observer thought it could see.
+        table.apply_event(&hook("abc123", Kind::ToolStart, 211));
+
+        assert_eq!(table.held_assertion(SLOT), None);
+        let entry = only_row(&table);
+        assert_eq!(entry.status, Working);
+        assert_eq!(entry.status_source, None);
+        assert_eq!(entry.since, at(LAST_EVENT));
+    }
+
+    #[test]
+    fn a_claim_stops_being_shown_when_nobody_repeats_it_and_leaves_nothing_behind() {
+        let mut table = table_of(&[hook("abc123", Kind::ToolStart, LAST_EVENT)]);
+        table.apply_assertion(&live_block(), &at(210));
+
+        // Repeating it keeps it alive without restarting it: the agent has been
+        // blocked since it was first seen to be, not since it was last looked at.
+        table.tick(&at(212));
+        table.apply_assertion(&live_block(), &at(213));
+        table.tick(&at(215));
+        let entry = only_row(&table);
+        assert_eq!(entry.status, Blocked);
+        assert_eq!(entry.since, at(210));
+
+        // Then the observer stops — it was killed, or it lost sight of the
+        // terminal, and either way nothing is speaking for that claim now.
+        table.tick(&at(218));
+
+        assert_eq!(table.held_assertion(SLOT), None);
+        let entry = only_row(&table);
+        assert_eq!(entry.status, Working);
+        assert_eq!(entry.status_source, None);
+        assert_eq!(entry.since, at(LAST_EVENT));
+    }
+
+    #[test]
+    fn a_withdrawal_stops_a_claim_being_shown_as_surely_as_expiry_does() {
+        let mut table = table_of(&[hook("abc123", Kind::ToolStart, LAST_EVENT)]);
+        table.apply_assertion(&live_block(), &at(210));
+
+        table.apply_assertion(&claim(AssertedState::Unknown), &at(211));
+
+        assert_eq!(table.held_assertion(SLOT), None);
+        let entry = only_row(&table);
+        assert_eq!(entry.status, Working);
+        assert_eq!(entry.status_source, None);
+    }
+
+    #[test]
+    fn a_claim_never_rewrites_the_record_of_a_session_speaking_for_itself() {
+        let mut table = table_of(&[hook("abc123", Kind::ToolStart, LAST_EVENT)]);
+
+        // An observer that can read the agent's own session id off the screen
+        // may well name it. That makes the claim easier to attribute; it does
+        // not promote a guess to the agent's own word.
+        let named = live_block().with_session("abc123").with_cwd("/srv/guess");
+        assert_eq!(table.apply_assertion(&named, &at(210)), None);
+
+        assert_eq!(table.len(), 1);
+        let session = table
+            .get(&SessionKey::new(agent("claude"), "abc123"))
+            .expect("the session went missing");
+        assert_eq!(session.state.status, Working);
+        assert_eq!(session.state.since, at(LAST_EVENT));
+        assert_eq!(session.source, Source::Hook);
+        assert_eq!(session.cwd, None);
+        // It is still held, and still shown where a claim is allowed to show.
+        let entry = only_row(&table);
+        assert_eq!(entry.status, Blocked);
+        assert_eq!(entry.status_source, Some(Source::Observed));
+        assert_eq!(entry.since, at(210));
+    }
+
+    #[test]
+    fn a_claim_that_arrives_late_moves_no_clock_backwards() {
+        let mut table = SessionTable::new();
+        table.apply_assertion(&live_block(), &at(210));
+
+        // A straggler, claiming something else, stamped before what is already
+        // held. It is still news about the state; it is not news about when.
+        let key = table
+            .apply_assertion(&claim(AssertedState::Working), &at(205))
+            .expect("a claim is a session");
+
+        let held = table
+            .held_assertion(SLOT)
+            .expect("something is still claimed");
+        assert_eq!(held.assert, AssertedState::Working);
+        assert!(!held.visible);
+        assert_eq!(held.received_at, at(210));
+        assert_eq!(held.since, at(210));
+        let session = table.get(&key).expect("it went missing");
+        assert_eq!(session.state.status, Working);
+        assert_eq!(session.state.since, at(210));
+        assert_eq!(session.state.last_event, at(210));
+    }
+
+    #[test]
+    fn how_long_a_claim_stands_unrepeated_is_the_tables_to_choose() {
+        assert_eq!(SessionTable::new().assert_hold(), DEFAULT_ASSERT_HOLD);
+
+        let mut table = SessionTable::new().with_assert_hold(Duration::from_secs(60));
+        assert_eq!(table.assert_hold(), Duration::from_secs(60));
+        table.apply_assertion(&live_block(), &at(10));
+
+        // Long past the default, and well inside this one.
+        table.tick(&at(60));
+        assert!(table.held_assertion(SLOT).is_some());
+
+        table.tick(&at(70));
+        assert_eq!(table.held_assertion(SLOT), None);
     }
 }
