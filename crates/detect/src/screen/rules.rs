@@ -28,6 +28,7 @@
 use std::collections::HashMap;
 
 use regex::Regex;
+use serde::Serialize;
 
 use crate::screen::region::{RegionSpec, ScreenInput};
 use crate::screen::schema::{Gate, GateView, ManifestFault, Rule, ScreenManifest, ScreenState};
@@ -44,7 +45,12 @@ pub const KNOWN_AGENT_IDLE_FALLBACK: &str = "default_known_agent_idle_fallback";
 pub const UNKNOWN_AGENT_FALLBACK: &str = "unknown_agent";
 
 /// What one screen was evidence of.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializes to JSON with the same stable snake_case field names
+/// [`Explain`](crate::Explain) uses for the fields the two share, so that a
+/// consumer asking for a verdict and a consumer asking for the working read the
+/// answer out of the same place.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Detection {
     /// What the screen says the agent is doing.
     pub state: ScreenState,

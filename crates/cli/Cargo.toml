@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 agentbus-daemon = { workspace = true }
+agentbus-detect = { workspace = true }
 agentbus-install = { workspace = true }
 agentbus-protocol = { workspace = true }
 clap = { workspace = true }

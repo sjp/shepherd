@@ -22,6 +22,7 @@
 //! vector but can always choose the environment.
 
 pub mod adapters;
+pub mod detect;
 pub mod emit;
 pub mod ensure;
 pub mod foreground;
@@ -46,6 +47,7 @@ use agentbus_daemon::remote::ssh;
 use agentbus_daemon::remote::targets::{CONFIG_DIR_VAR, DOCKER, SSH, Targets};
 use agentbus_daemon::remote::transport::Transport;
 use agentbus_daemon::{Daemon, Settings, SocketPaths, clock, paths::DIR_VAR};
+use agentbus_detect::ManifestStore;
 use agentbus_install::{Agent, Environment, Mode, UnknownAgent};
 use agentbus_protocol::ForegroundEntry;
 use clap::{Args, Parser, Subcommand};
@@ -76,6 +78,15 @@ const NOT_WATCHING: u8 = 2;
 /// What is said on stderr when a daemon cannot see a process table.
 const UNAVAILABLE: &str = "foreground monitoring unavailable on this daemon";
 
+/// The status `detect` exits with when it cannot say whose screen it was given.
+///
+/// Distinct from the general failure code because nothing failed: stdin was
+/// read and the manifests were consulted, and the outcome is that no agent on
+/// this machine answers to the evidence. A caller looping over terminals wants
+/// to skip that one and carry on, which it can only do if it can tell this from
+/// a screen it could not read at all.
+const UNIDENTIFIED: u8 = 2;
+
 /// The status a second daemon exits with when one is already running.
 ///
 /// Distinct from the general failure code because it is often not a failure at
@@ -98,6 +109,7 @@ const EMIT: &str = "agentbus emit";
 const SUBSCRIBE: &str = "agentbus subscribe";
 const STATUS: &str = "agentbus status";
 const FOREGROUND: &str = "agentbus foreground";
+const DETECT: &str = "agentbus detect";
 const INSTALL: &str = "agentbus install";
 const UNINSTALL: &str = "agentbus uninstall";
 const ATTACH: &str = "agentbus attach";
@@ -145,6 +157,23 @@ enum Command {
     Status(StatusArgs),
     /// Print what is running in front of each correlated shell, once.
     Foreground(ForegroundArgs),
+    /// Read a captured screen on stdin and say what state it is evidence of.
+    ///
+    /// The screen is plain text: escape sequences already removed, one line per
+    /// row, and the rows the agent is drawing now rather than a scrolled-back
+    /// view of what it drew earlier. Stripping the escape sequences is the
+    /// caller's job, because whatever captured the screen is what knows how.
+    ///
+    /// One word is printed — working, idle, blocked or unknown — and the status
+    /// is 0. A screen no agent on this machine answers for prints nothing and
+    /// exits 2; that is a different answer from unknown, which is a verdict on a
+    /// screen that was read.
+    ///
+    /// The rules come from the manifest in force for that agent: a copy the
+    /// operator wrote first, then one fetched into this machine's state
+    /// directory, then the copy inside this binary. Pass --explain to be told
+    /// which copy answered and what it made of every rule.
+    Detect(DetectArgs),
     /// Read a payload on stdin, normalize it, and send it to the bus.
     Emit(EmitArgs),
     /// Put the hooks that emit events into the coding agents on this machine, or put this program somewhere that is not it.
@@ -321,6 +350,55 @@ struct ForegroundArgs {
     json: bool,
 }
 
+/// Which screen to read, whose it is, and how much to say about it.
+///
+/// Everything the answer depends on arrives here: the text on stdin and these
+/// flags. Nothing is read off the machine this runs on except the manifests
+/// themselves, so the same screen and the same flags give the same answer
+/// wherever they are run, which is what makes a captured screen worth keeping
+/// as a test case.
+#[derive(Debug, Args)]
+struct DetectArgs {
+    /// The agent whose screen is on stdin, when the caller already knows
+    #[arg(long, value_name = "ID")]
+    agent: Option<String>,
+
+    /// The name of the process drawing the screen, used to work out the agent
+    #[arg(long, value_name = "COMM")]
+    process: Option<String>,
+
+    /// The command line that process was started with, used the same way
+    #[arg(long, value_name = "TEXT")]
+    cmdline: Option<String>,
+
+    /// The last title the agent asked the terminal to show
+    #[arg(long, value_name = "TEXT")]
+    osc_title: Option<String>,
+
+    /// The last progress report the agent sent the terminal
+    #[arg(long, value_name = "TEXT")]
+    osc_progress: Option<String>,
+
+    /// Print the whole verdict as one JSON object instead of one word
+    #[arg(long, conflicts_with = "explain")]
+    json: bool,
+
+    /// Print every rule in the agent's manifest that ran, what it saw and why the winner won, as JSON
+    #[arg(long)]
+    explain: bool,
+}
+
+impl DetectArgs {
+    /// How much of the answer was asked for.
+    fn form(&self) -> detect::Form {
+        match (self.json, self.explain) {
+            (_, true) => detect::Form::Explain,
+            (true, _) => detect::Form::Json,
+            _ => detect::Form::Word,
+        }
+    }
+}
+
 /// What to send, and what it is.
 ///
 /// Both flags take a bare string rather than a closed set of values, because
@@ -487,6 +565,7 @@ where
             Command::Subscribe(args) => subscribe(&args),
             Command::Status(args) => status(&args),
             Command::Foreground(args) => foreground(&args),
+            Command::Detect(args) => detect(&args),
             Command::Emit(args) => emit(&args, started),
             Command::Install(args) => elsewhere(&args, install::Direction::Install),
             Command::Uninstall(args) => elsewhere(&args, install::Direction::Uninstall),
@@ -728,6 +807,60 @@ fn tail(stream: &mut stream::Stream, of: Duration, out: &mut impl Write) -> Exit
             }
             Err(error) => return fail(STATUS, &error),
         }
+    }
+}
+
+/// Says what a captured screen is evidence of.
+///
+/// The three exit codes separate three different things, and the middle one is
+/// the reason they cannot collapse. `unknown` on stdout is an answer — the
+/// screen was read against somebody's manifest and says nothing either way —
+/// while [`UNIDENTIFIED`] is the case where there was no manifest to read it
+/// with, and the general failure code stays with the failures: stdin that could
+/// not be read, stdout that could not be written.
+///
+/// The manifests come from the environment, which is where a person's own
+/// copies and any that have been fetched already live. A screen that reads
+/// oddly is usually a manifest question, so `--explain` says which copy
+/// answered and repeats on stderr whatever the store passed over to reach it.
+fn detect(args: &DetectArgs) -> ExitCode {
+    let (screen, truncated) = match detect::read_screen(std::io::stdin().lock()) {
+        Ok(read) => read,
+        Err(error) => return fail(DETECT, &error),
+    };
+    if truncated {
+        eprintln!("{DETECT}: {}", detect::TRUNCATED);
+    }
+
+    let request = detect::Request {
+        agent: args.agent.as_deref(),
+        process: args.process.as_deref().unwrap_or_default(),
+        cmdline: args.cmdline.as_deref().unwrap_or_default(),
+        screen: &screen,
+        osc_title: args.osc_title.as_deref().unwrap_or_default(),
+        osc_progress: args.osc_progress.as_deref().unwrap_or_default(),
+    };
+    let form = args.form();
+    let Some(answer) = detect::answer(&ManifestStore::from_env(), &request, form) else {
+        eprintln!("{DETECT}: {}", detect::UNIDENTIFIED);
+        return ExitCode::from(UNIDENTIFIED);
+    };
+    if form == detect::Form::Explain {
+        for warning in &answer.warnings {
+            eprintln!("{DETECT}: {warning}");
+        }
+    }
+
+    let mut out = std::io::stdout().lock();
+    match out
+        .write_all(answer.text.as_bytes())
+        .and_then(|()| out.flush())
+    {
+        Ok(()) => ExitCode::SUCCESS,
+        // Whoever was reading this has finished, which is how a pipe is
+        // supposed to end rather than something to complain about.
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(error) => fail(DETECT, &error),
     }
 }
 

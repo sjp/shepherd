@@ -13,6 +13,7 @@ name = "agentbus-cli"
 version = "0.1.0"
 dependencies = [
  "agentbus-daemon",
+ "agentbus-detect",
  "agentbus-install",
  "agentbus-protocol",
  "clap",
