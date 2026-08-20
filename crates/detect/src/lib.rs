@@ -85,7 +85,8 @@ pub use screen::schema::{
     ScreenManifestError, ScreenState,
 };
 pub use store::{
-    Family, Hooks, MAX_MANIFEST_BYTES, ManifestStore, ManifestSummary, Screen, StorePaths,
+    ActiveManifest, Family, Hooks, MAX_MANIFEST_BYTES, ManifestStore, ManifestSummary, Screen,
+    StorePaths,
 };
 #[cfg(feature = "remote-updates")]
 pub use update::{

@@ -23,6 +23,7 @@ dependencies = [
  "socket2",
  "tempfile",
  "thiserror",
+ "tiny_http",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -1209,3 +1209,47 @@ it: the arithmetic that turns an instant into a date lives in the crate that
 needs it, and the detection library needs a number it can compare, not a
 calendar. The command line already has the daemon's conversion available for the
 one place a person reads it.
+
+## 2026-08-20 — managing the manifests from the command line
+
+### The store hands back the copy in force; the command line does not re-derive it
+
+**`ManifestStore` keeps the text of the active manifest beside its compiled
+form, and `show` prints that.** The alternative was for the command to walk the
+tiers itself — read the override, then the cached copy, then reach for the
+bundled one — and it would have been a second implementation of precedence that
+could disagree with the first. A command whose whole purpose is to answer
+"which copy is answering?" is the last place a disagreement about that could be
+allowed. Holding the text costs a few kilobytes per agent, borrowed rather than
+copied for the bundled tier, against a compiled manifest that was already
+holding the same content in a parsed form.
+
+### The manifest goes to stdout; where it came from goes to stderr
+
+**`agentbus manifests show claude > claude.toml` writes a file that is
+byte-for-byte the copy that was in force.** Everything about provenance — the
+tier, the path, what was shadowed on the way — is commentary on the answer
+rather than the answer, and the workflow this command exists for is starting an
+override from the copy that is running. So the split the rest of this program
+already uses is exactly right here: the bytes are the output, and the sentences
+about them are diagnostics.
+
+### A check fails only when the catalog does
+
+**Per-manifest refusals are reported and are not a failure of the command.**
+This is the exit code following the update semantics rather than inventing its
+own: one manifest that could not be taken leaves every other manifest checked
+and the machine's record of the check intact, which is a run that did its job.
+A catalog that could not be read is the one outcome where nothing was found out
+at all, and something scripting `manifests update` has to be able to tell that
+apart from a quiet afternoon in which nothing was published.
+
+### The list carries one column of sentences, and both kinds go in it
+
+**What the store passed over and why the last check refused what it was offered
+share the `NOTES` column.** They come from different places — one from
+precedence, one from the status file — and they answer the same question, which
+is why the copy a person is looking at is the copy they are looking at. Keeping
+them in the last column keeps a sentence from pushing the aligned columns
+around, and either kind being present is what marks the row as one worth
+reading.

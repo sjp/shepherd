@@ -36,6 +36,7 @@
 //! the [`Family`] trait, and a family contributes only what is specific to it:
 //! how to parse one, what its identity is, and what ships inside the binary.
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -370,6 +371,22 @@ pub struct ManifestSummary {
     pub warnings: Vec<String>,
 }
 
+/// The copy of one manifest that is in force, as it is written.
+///
+/// The text is what was parsed, byte for byte, so that redirecting it into the
+/// override directory produces a copy that behaves exactly as the one it was
+/// taken from. Which is the point of asking for it: an override starts life as
+/// the active copy plus one edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveManifest {
+    /// Which copy it is.
+    pub source: ManifestSource,
+    /// The manifest itself, as its author wrote it.
+    pub text: String,
+    /// What was passed over on the way to it, in the order it was found.
+    pub warnings: Vec<String>,
+}
+
 /// Which tier a file was read from, for the warnings that name it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tier {
@@ -400,6 +417,11 @@ struct Entry<F: Family> {
 /// The winning copy, ready to be used.
 struct Active<F: Family> {
     compiled: F::Compiled,
+    /// The manifest as its author wrote it, kept beside the compiled form so
+    /// that "show me the copy that is actually in force" is answered with the
+    /// bytes that were parsed rather than with a re-rendering of them. Borrowed
+    /// for the bundled tier, where the text is already in the binary.
+    text: Cow<'static, str>,
     source: ManifestSource,
 }
 
@@ -462,19 +484,28 @@ impl<F: Family> FamilyStore<F> {
         let mut warnings = Vec::new();
 
         let bundled = self.bundled(id);
-        let bundled_version = bundled.as_ref().and_then(F::version).cloned();
+        let bundled_version = bundled
+            .as_ref()
+            .and_then(|(manifest, _)| F::version(manifest))
+            .cloned();
 
         let override_path = self.paths.file(Tier::Override, F::NAME, id);
         let overridden = override_path
             .as_ref()
             .and_then(|path| read_source::<F>(Tier::Override, path, id, &mut warnings));
-        let override_version = overridden.as_ref().and_then(F::version).cloned();
+        let override_version = overridden
+            .as_ref()
+            .and_then(|(manifest, _)| F::version(manifest))
+            .cloned();
 
         let remote_path = self.paths.file(Tier::Remote, F::NAME, id);
         let remote = remote_path
             .as_ref()
             .and_then(|path| read_source::<F>(Tier::Remote, path, id, &mut warnings));
-        let remote_version = remote.as_ref().and_then(F::version).cloned();
+        let remote_version = remote
+            .as_ref()
+            .and_then(|(manifest, _)| F::version(manifest))
+            .cloned();
 
         // Comparing the versions as options is the rule the tiers want: a
         // remote copy that declares nothing cannot show it is at least as new
@@ -483,7 +514,7 @@ impl<F: Family> FamilyStore<F> {
         let remote_is_current = remote_version >= bundled_version;
 
         let remote_present = remote.is_some();
-        let active = if let Some(manifest) = overridden {
+        let active = if let Some((manifest, text)) = overridden {
             if remote_present && let Some(path) = &remote_path {
                 warnings.push(format!(
                     "{} {} is shadowed by the override",
@@ -492,8 +523,12 @@ impl<F: Family> FamilyStore<F> {
                 ));
             }
             let path = override_path.unwrap_or_default();
-            Some((manifest, ManifestSource::Override { path }))
-        } else if let Some(manifest) = remote.filter(|_| remote_is_current) {
+            Some((
+                manifest,
+                Cow::Owned(text),
+                ManifestSource::Override { path },
+            ))
+        } else if let Some((manifest, text)) = remote.filter(|_| remote_is_current) {
             // A fetched copy always declares a version; one that does not is
             // only ever reached when the bundled tier declares none either, and
             // so has nothing to report.
@@ -501,7 +536,11 @@ impl<F: Family> FamilyStore<F> {
                 .as_ref()
                 .map(ToString::to_string)
                 .unwrap_or_default();
-            Some((manifest, ManifestSource::Remote { version }))
+            Some((
+                manifest,
+                Cow::Owned(text),
+                ManifestSource::Remote { version },
+            ))
         } else {
             if remote_present && let Some(path) = &remote_path {
                 warnings.push(format!(
@@ -512,12 +551,13 @@ impl<F: Family> FamilyStore<F> {
                     describe(bundled_version.as_ref()),
                 ));
             }
-            bundled.map(|manifest| (manifest, ManifestSource::Bundled))
+            bundled.map(|(manifest, text)| (manifest, Cow::Borrowed(text), ManifestSource::Bundled))
         };
 
         Entry {
-            active: active.map(|(manifest, source)| Active {
+            active: active.map(|(manifest, text, source)| Active {
                 compiled: F::compile(manifest),
+                text,
                 source,
             }),
             bundled_version,
@@ -532,17 +572,18 @@ impl<F: Family> FamilyStore<F> {
     /// A bundled manifest that does not load is this library's own data being
     /// wrong, which no user can fix and no fallback can hide: it panics, and
     /// the corpus's own tests reach it long before a release does.
-    fn bundled(&self, id: &str) -> Option<F::Manifest> {
+    fn bundled(&self, id: &str) -> Option<(F::Manifest, &'static str)> {
         F::bundled()
             .iter()
             .find(|(key, _)| same(key, id))
             .map(|(key, content)| {
-                F::parse(content).unwrap_or_else(|message| {
+                let manifest = F::parse(content).unwrap_or_else(|message| {
                     panic!(
                         "bundled {} manifest {key:?} is not loadable: {message}",
                         F::NAME,
                     )
-                })
+                });
+                (manifest, *content)
             })
     }
 
@@ -564,6 +605,17 @@ impl<F: Family> FamilyStore<F> {
             }
         }
         ids.into_iter().collect()
+    }
+
+    /// The copy of `id` that answers, as it is written.
+    fn source(&self, id: &str) -> Option<ActiveManifest> {
+        let entry = self.entry(id);
+        let active = entry.active.as_ref()?;
+        Some(ActiveManifest {
+            source: active.source.clone(),
+            text: active.text.clone().into_owned(),
+            warnings: entry.warnings.clone(),
+        })
     }
 
     /// One line per id about which copy answers for it.
@@ -621,7 +673,7 @@ fn read_source<F: Family>(
     path: &Path,
     requested: &str,
     warnings: &mut Vec<String>,
-) -> Option<F::Manifest> {
+) -> Option<(F::Manifest, String)> {
     let mut refuse = |reason: String| {
         warnings.push(format!("{} {}: {reason}", tier.label(), path.display()));
         None
@@ -641,7 +693,7 @@ fn read_source<F: Family>(
             F::id(&manifest),
         ));
     }
-    Some(manifest)
+    Some((manifest, content))
 }
 
 /// Whether a manifest answers to the id it was looked up under.
@@ -745,6 +797,22 @@ impl ManifestStore {
         let mut summaries = self.screen.summaries();
         summaries.append(&mut self.hooks.summaries());
         summaries
+    }
+
+    /// The screen manifest in force for `agent`, as it is written, or nothing
+    /// when no copy of one describes that agent.
+    ///
+    /// Reported as the store decided it, by the same rules and with the same
+    /// findings as everything else here: what comes back is the copy detection
+    /// is running on, not whichever file happens to sort first on disk.
+    pub fn screen_source(&self, agent: &str) -> Option<ActiveManifest> {
+        self.screen.source(agent)
+    }
+
+    /// The hook mapping in force for `agent`, as it is written, or nothing when
+    /// no copy of one describes that agent.
+    pub fn hook_source(&self, agent: &str) -> Option<ActiveManifest> {
+        self.hooks.source(agent)
     }
 
     /// What one screen says `agent` is doing.
@@ -1564,5 +1632,79 @@ kind = "{kind}"
 
         store.reload();
         assert_eq!(kind_of(&store), agentbus_protocol::Kind::SessionEnd);
+    }
+
+    #[test]
+    fn the_active_copy_is_handed_back_as_it_was_written() {
+        let (_home, store) = machine();
+        let written = marker_manifest(BUNDLED_AGENT, Some("2999.01.01.1"), "from_the_override");
+        place(&store, Tier::Override, BUNDLED_AGENT, &written);
+
+        let active = store
+            .screen_source(BUNDLED_AGENT)
+            .expect("a manifest for the agent");
+        assert_eq!(active.text, written);
+        assert!(matches!(active.source, ManifestSource::Override { .. }));
+    }
+
+    #[test]
+    fn the_bundled_copy_is_handed_back_when_it_is_the_one_in_force() {
+        let (_home, store) = machine();
+
+        let active = store
+            .screen_source(BUNDLED_AGENT)
+            .expect("a manifest for the agent");
+        assert_eq!(active.source, ManifestSource::Bundled);
+        assert!(active.text.contains(&format!("id = \"{BUNDLED_AGENT}\"")));
+        assert!(active.text.contains(BUNDLED_VERSION));
+        assert!(active.warnings.is_empty(), "{:?}", active.warnings);
+    }
+
+    #[test]
+    fn the_copy_handed_back_carries_what_was_passed_over_to_reach_it() {
+        let (_home, store) = machine();
+        place(
+            &store,
+            Tier::Remote,
+            BUNDLED_AGENT,
+            &marker_manifest(BUNDLED_AGENT, Some("2999.01.01.1"), "from_the_cache"),
+        );
+        place(
+            &store,
+            Tier::Override,
+            BUNDLED_AGENT,
+            &marker_manifest(BUNDLED_AGENT, None, "from_the_override"),
+        );
+
+        let active = store
+            .screen_source(BUNDLED_AGENT)
+            .expect("a manifest for the agent");
+        assert!(active.text.contains("from_the_override"));
+        assert!(
+            warned_about(&active.warnings, &["cached remote", "shadowed"]),
+            "{:?}",
+            active.warnings,
+        );
+    }
+
+    #[test]
+    fn the_two_families_hand_back_their_own_copies() {
+        let (_home, store) = machine();
+        place_in(
+            &store,
+            Tier::Override,
+            Hooks::NAME,
+            "agent",
+            &hook_manifest("agent", &[], "turn_end"),
+        );
+
+        assert!(
+            store
+                .hook_source("agent")
+                .expect("a mapping for the agent")
+                .text
+                .contains("turn_end")
+        );
+        assert!(store.screen_source("agent").is_none());
     }
 }

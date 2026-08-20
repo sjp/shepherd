@@ -27,6 +27,7 @@ pub mod emit;
 pub mod ensure;
 pub mod foreground;
 pub mod install;
+pub mod manifests;
 pub mod status;
 pub mod stream;
 pub mod table;
@@ -47,7 +48,7 @@ use agentbus_daemon::remote::ssh;
 use agentbus_daemon::remote::targets::{CONFIG_DIR_VAR, DOCKER, SSH, Targets};
 use agentbus_daemon::remote::transport::Transport;
 use agentbus_daemon::{Daemon, Settings, SocketPaths, clock, paths::DIR_VAR};
-use agentbus_detect::ManifestStore;
+use agentbus_detect::{CATALOG_URL_VAR, CheckResult, ManifestStore, Status, catalog_url};
 use agentbus_install::{Agent, Environment, Mode, UnknownAgent};
 use agentbus_protocol::ForegroundEntry;
 use clap::{Args, Parser, Subcommand};
@@ -118,6 +119,7 @@ const UNINSTALL: &str = "agentbus uninstall";
 const ATTACH: &str = "agentbus attach";
 const DETACH: &str = "agentbus detach";
 const TARGETS: &str = "agentbus targets";
+const MANIFESTS: &str = "agentbus manifests";
 
 /// What is said after a machine has been provisioned and its agents have been
 /// left alone, which is what happens unless somebody asks for the other half.
@@ -197,6 +199,38 @@ enum Command {
     Detach(DeclarationArgs),
     /// Print what has been declared and what the bus is doing about it, once.
     Targets(TargetsArgs),
+    /// Report on the manifests this machine reads screens and hook payloads with, and fetch newer ones.
+    #[command(subcommand)]
+    Manifests(ManifestsCommand),
+}
+
+/// What to do about the manifests on this machine.
+///
+/// Three copies of one agent's manifest can sit here at once — the copy inside
+/// this binary, a copy fetched from a catalog, and a copy somebody wrote — and
+/// these are the commands for finding out which of them is in force, taking
+/// whatever has been published since, and reading the one that is answering.
+#[derive(Debug, Subcommand)]
+enum ManifestsCommand {
+    /// Print which copy of each manifest is in force, and what the last check made of it.
+    List(ListArgs),
+    /// Fetch whatever the catalog publishes that is newer than what is held here.
+    ///
+    /// Every manifest listed is checked. One that cannot be fetched, does not
+    /// validate, or is not newer than what is already here costs itself and
+    /// nothing else: the rest are still taken, and the reason is printed and
+    /// recorded. The status is non-zero only when the catalog itself could not
+    /// be read, because that is the one outcome where nothing was checked at
+    /// all.
+    Update(UpdateArgs),
+    /// Print the manifest that is in force for one agent, exactly as it is written.
+    ///
+    /// The copy that answers goes to stdout and everything about where it came
+    /// from goes to stderr, so redirecting stdout into the override directory
+    /// is the way to start editing one:
+    ///
+    ///   agentbus manifests show claude > ~/.config/agentbus/manifests/screen/claude.toml
+    Show(ShowArgs),
 }
 
 /// Which bus a command is about.
@@ -589,6 +623,50 @@ struct TargetsArgs {
     json: bool,
 }
 
+/// What to report about the manifests here, and how.
+#[derive(Debug, Args)]
+struct ListArgs {
+    /// Print the list as JSON instead of as a table
+    #[arg(long)]
+    json: bool,
+}
+
+/// Where to check, and how to report what came of it.
+#[derive(Debug, Args)]
+struct UpdateArgs {
+    /// The catalog to read [default: the one this build was published alongside]
+    #[arg(long, value_name = "URL", env = CATALOG_URL_VAR)]
+    catalog: Option<String>,
+
+    /// Print what happened as JSON instead of as a table
+    #[arg(long)]
+    json: bool,
+}
+
+impl UpdateArgs {
+    /// The catalog to read. An empty value names none, so it falls through to
+    /// the default rather than being checked as a url with nothing in it.
+    fn url(&self) -> String {
+        self.catalog
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map_or_else(catalog_url, ToOwned::to_owned)
+    }
+}
+
+/// Which manifest to print.
+#[derive(Debug, Args)]
+struct ShowArgs {
+    /// The agent it describes
+    #[arg(value_name = "AGENT")]
+    agent: String,
+
+    /// Which kind of manifest to print
+    #[arg(long, value_name = "FAMILY", default_value = "screen")]
+    family: manifests::Family,
+}
+
 /// Parses `args` (including the program name at position zero) and runs the
 /// requested command, returning the process exit code.
 ///
@@ -617,6 +695,11 @@ where
             Command::Attach(args) => attach(&args),
             Command::Detach(args) => detach(&args),
             Command::Targets(args) => targets(&args),
+            Command::Manifests(command) => match command {
+                ManifestsCommand::List(args) => list_manifests(&args),
+                ManifestsCommand::Update(args) => update_manifests(&args),
+                ManifestsCommand::Show(args) => show_manifest(&args),
+            },
         },
         // `--version` and `--help` arrive here too: clap reports them as errors
         // that carry the rendered text, a zero exit code and stdout as their
@@ -1319,19 +1402,104 @@ fn targets(args: &TargetsArgs) -> ExitCode {
     };
     let known = targets::merge(&declared, attached.as_deref());
 
-    let stdout = std::io::stdout();
-    let styled = stdout.is_terminal();
-    let mut out = stdout.lock();
+    let styled = std::io::stdout().is_terminal();
     let text = match args.json {
         true => targets::json(&known, attached.is_some()),
         false => targets::render(&known, &clock::now(), styled),
     };
+    wrote(TARGETS, &text)
+}
+
+/// Prints which copy of each manifest is in force here.
+///
+/// Nothing has to exist for this to answer: a machine that has never fetched
+/// anything and overridden nothing still reads every screen with the copies
+/// inside this binary, and saying so is the answer rather than an absence of
+/// one.
+fn list_manifests(args: &ListArgs) -> ExitCode {
+    let store = ManifestStore::from_env();
+    let status = Status::read(store.paths());
+    let summaries = store.summaries();
+    let listed = manifests::list(&summaries, &status);
+
+    let styled = std::io::stdout().is_terminal();
+    let text = match args.json {
+        true => manifests::json(&listed, &status),
+        false => manifests::render(&listed, &status, &clock::now(), styled),
+    };
+    wrote(MANIFESTS, &text)
+}
+
+/// Takes whatever the catalog publishes that is newer than what is here.
+fn update_manifests(args: &UpdateArgs) -> ExitCode {
+    let store = ManifestStore::from_env();
+    let url = args.url();
+    let outcome = agentbus_detect::update(&store, &url);
+    if outcome.committed() {
+        // The files this store's decisions were made from have just been
+        // replaced. Nothing else runs in this process afterwards, but a store
+        // that has been told is a store nothing can later read a stale answer
+        // out of, and forgetting costs a hash map.
+        store.reload();
+    }
+
+    let styled = std::io::stdout().is_terminal();
+    let text = match args.json {
+        true => manifests::outcome_json(&outcome),
+        false => manifests::outcome(&outcome, styled),
+    };
+    let written = wrote(MANIFESTS, &text);
+    match &outcome.result {
+        CheckResult::Checked => written,
+        // The one failure that is a failure of the command: nothing was
+        // checked, so nothing can be said about whether this machine is up to
+        // date. A manifest that was refused is reported and recorded like any
+        // other outcome, and the run it was part of still did its job.
+        CheckResult::Failed(reason) => {
+            eprintln!("{MANIFESTS}: {url}: {reason}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Prints the manifest one agent is read with, as it is written.
+fn show_manifest(args: &ShowArgs) -> ExitCode {
+    let store = ManifestStore::from_env();
+    let family = args.family;
+    let active = match family {
+        manifests::Family::Screen => store.screen_source(&args.agent),
+        manifests::Family::Hooks => store.hook_source(&args.agent),
+    };
+    let Some(active) = active else {
+        eprintln!(
+            "{MANIFESTS}: no {} manifest describes {:?}",
+            family.name(),
+            args.agent,
+        );
+        return ExitCode::FAILURE;
+    };
+
+    eprintln!(
+        "{MANIFESTS}: {}/{} is {}",
+        family.name(),
+        args.agent,
+        manifests::describe(&active.source, store.paths(), family, &args.agent),
+    );
+    for warning in &active.warnings {
+        eprintln!("{MANIFESTS}: {warning}");
+    }
+    wrote(MANIFESTS, &active.text)
+}
+
+/// Writes what a command produced to stdout, or fails saying why it could not.
+fn wrote(context: &str, text: &str) -> ExitCode {
+    let mut out = std::io::stdout().lock();
     match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
         Ok(()) => ExitCode::SUCCESS,
         // Whoever was reading this has finished, which is how a pipe is supposed
         // to end rather than something to complain about.
         Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
-        Err(error) => fail(TARGETS, &error),
+        Err(error) => fail(context, &error),
     }
 }
 
