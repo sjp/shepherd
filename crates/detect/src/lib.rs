@@ -39,7 +39,7 @@
 pub mod screen;
 pub mod version;
 
-pub use screen::region::{DEFAULT_REGION, RegionSpec, UnknownRegion};
+pub use screen::region::{DEFAULT_REGION, RegionSpec, ScreenInput, UnknownRegion};
 pub use screen::schema::{
     Gate, GateView, Identify, ManifestFault, Rule, SCREEN_ENGINE_VERSION, ScreenManifest,
     ScreenManifestError, ScreenState,
