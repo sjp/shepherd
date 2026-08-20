@@ -1070,3 +1070,43 @@ The sweep clears both the directory copies go in now and the flat names they
 used to go in, so a host provisioned by an earlier release is not left with
 litter nobody can account for. It skips directories, because the old pattern now
 matches the new directory.
+
+## 2026-08-20 — the emit path reads what a payload means
+
+### The socket is looked for before anything that could cost more than a `stat`
+
+**`emit` asks whether a bus is listening as soon as it has the payload, ahead of
+parsing it and ahead of looking for any manifest.** The promise that a machine
+with nothing running costs its agents one `stat` was previously true because
+there was nothing else on the path worth measuring; now that what a payload
+means is read from a file, it has to be true by construction instead. Putting
+the question first is what makes it so: the file reads, the TOML parse and the
+lookup are all downstream of a check that returns on the ordinary machine, so no
+future addition below that line can quietly start costing an agent something.
+The check moved out of `deliver`, which now assumes what its caller established
+— a daemon that went away in between fails on connect, which was always the same
+outcome as never having been there.
+
+### What the emit path may spend on the filesystem, in full
+
+**Two attempts to open a file, a size check and a bounded read of whichever
+exists, and one TOML parse — strictly after the socket check, and fail-soft at
+every step.** The two are the tiers that can outrank the mapping inside the
+binary: the copy its operator wrote and the copy fetched from a catalog. The
+64 KiB cap that every other reader of a manifest applies is the cap here too. A
+file that cannot be read, one over the cap, one that is not TOML and one
+describing another agent all step down to the next copy and end at the copy
+compiled in, so the worst a half-edited mapping can do is cost its author a
+diagnostic they have to turn on to see. There are no regexes in a hook mapping,
+nothing to compile, and no directory to walk. This extends the emit path's
+existing rules rather than contradicting them: still no runtime, still no retry,
+still nothing on stdout, still exit 0.
+
+### The bundled mappings are parsed on every invocation
+
+**No cache, no precompiled table, no lazily built static.** The process reads one
+payload and exits; the parse is of a string already in memory and does not touch
+the disk, and measuring it against the invocation as a whole puts the whole run
+— payload, mapping, delivered event — around a millisecond against a 100 ms
+budget. A cache would be a second representation to keep in step with the files,
+for a beneficiary who does not exist.

@@ -6,6 +6,10 @@
 //! the other, with the environment's opaque correlation carried across
 //! untouched. Both ways in are covered — an agent's own hook, and the ingestion
 //! path any program that watches a terminal can use.
+//!
+//! What each payload is taken to mean is the mapping inside the binary: every
+//! command here is given an empty home directory of its own, so that a copy on
+//! the machine running the tests cannot answer for the agents in them.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::Shutdown;
@@ -40,11 +44,14 @@ fn command(dir: &Path, args: &[&str]) -> Command {
         .args(args)
         .arg("--dir")
         .arg(dir)
+        .env("HOME", dir.with_file_name("home"))
         .env_remove("AGENTBUS_DIR")
         .env_remove("AGENTBUS_LOG")
         .env_remove("AGENTBUS_PANE")
         .env_remove("AGENTBUS_PROC_ROOT")
+        .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("XDG_STATE_HOME")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command
@@ -324,7 +331,10 @@ fn the_bus_can_be_named_in_the_environment_instead_of_on_the_command_line() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_agentbus"))
         .args(["emit", "--agent", "claude"])
         .env("AGENTBUS_DIR", &dir)
+        .env("HOME", dir.with_file_name("home"))
+        .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("XDG_STATE_HOME")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

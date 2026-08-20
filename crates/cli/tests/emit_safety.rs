@@ -13,14 +13,23 @@
 //! nothing on stdout, and it was finished within a budget an agent would never
 //! notice. The cases are the ways this is likely to go wrong — no daemon, a
 //! daemon that has stopped listening, one that hangs up mid-sentence, a payload
-//! that is nonsense, an agent nobody has written an adapter for, a command line
-//! that is a typo, and a panic.
+//! that is nonsense, an agent nothing on the machine describes, a command line
+//! that is a typo, a panic, and every way the file that says what a payload
+//! means can be unusable.
+//!
+//! Each run is given a home directory of its own, empty unless the test put
+//! something in it, so that what a payload is taken to mean here is decided by
+//! the mappings inside the binary and never by the machine the tests are
+//! running on.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
+
+use serde_json::Value;
 
 /// The whole of one invocation's wall-clock allowance, as seen from outside.
 ///
@@ -73,6 +82,22 @@ fn bus_dir() -> (tempfile::TempDir, PathBuf) {
     (temp, dir)
 }
 
+/// The home directory a run against `dir` is given, beside the bus itself.
+///
+/// It need not exist: a home directory with nothing in it and one that is not
+/// there are the same answer, which is that this machine has said nothing about
+/// what any payload means.
+fn home(dir: &Path) -> PathBuf {
+    dir.with_file_name("home")
+}
+
+/// Where a person's own copy of one agent's hook mapping goes.
+fn mapping(dir: &Path, agent: &str) -> PathBuf {
+    let mappings = home(dir).join(".config/agentbus/manifests/hooks");
+    std::fs::create_dir_all(&mappings).expect("cannot make the mapping directory");
+    mappings.join(format!("{agent}.toml"))
+}
+
 /// `agentbus emit` on `dir`, with nothing inherited from whoever is running the
 /// tests.
 ///
@@ -86,10 +111,13 @@ fn command(dir: &Path, args: &[&str]) -> Command {
         .arg("emit")
         .args(args)
         .env("AGENTBUS_DIR", dir)
+        .env("HOME", home(dir))
         .env_remove("AGENTBUS_LOG")
         .env_remove("AGENTBUS_LOG_FILE")
         .env_remove("AGENTBUS_PANE")
+        .env_remove("XDG_CONFIG_HOME")
         .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("XDG_STATE_HOME")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -120,6 +148,43 @@ fn emit(dir: &Path, args: &[&str], payload: &[u8]) -> Ran {
         stderr: output.stderr,
         took,
     }
+}
+
+/// Puts a bus on the emit socket that keeps whatever it is told, so that a test
+/// can assert what an invocation made of its payload.
+///
+/// Everything the manifest work exists for is on the far side of the socket
+/// check, so a test about a mapping has to have something listening — with no
+/// socket there, no file is read and there is nothing to have got right or
+/// wrong.
+fn collect(dir: &Path) -> Receiver<Value> {
+    let listener = UnixListener::bind(dir.join("emit.sock")).expect("cannot bind");
+    let (sent, received) = channel();
+    std::thread::spawn(move || {
+        for connection in listener.incoming().flatten() {
+            let mut line = String::new();
+            if BufReader::new(connection).read_line(&mut line).is_err() {
+                continue;
+            }
+            let event = serde_json::from_str(&line).unwrap_or(Value::Null);
+            if sent.send(event).is_err() {
+                return;
+            }
+        }
+    });
+    received
+}
+
+/// The event one invocation delivered, or nothing where it delivered none.
+///
+/// The wait is for the receiving side of a hand-over that has already happened:
+/// the process being asked about has exited by the time this is called, so what
+/// is being allowed for is the thread above getting round to it, and a wait this
+/// long means nothing arrived rather than that the machine was busy.
+fn delivered(events: &Receiver<Value>) -> Option<Value> {
+    const PATIENCE: Duration = Duration::from_secs(5);
+
+    events.recv_timeout(PATIENCE).ok()
 }
 
 /// Puts something on the emit socket that answers connections in a chosen way.
@@ -262,6 +327,10 @@ fn a_command_line_that_makes_no_sense_still_exits_zero_and_says_nothing() {
 #[cfg(debug_assertions)]
 fn a_panic_anywhere_inside_is_still_a_silent_exit_zero() {
     let (_temp, dir) = bus_dir();
+    // Something is listening, because everything that could panic over a
+    // payload happens only once there is somewhere to send one: against an
+    // empty directory this would exit before reaching what it is testing.
+    listen(&dir, drop);
     // A build with debug assertions on carries one agent name that panics, so
     // that this guarantee can be tested against the real process rather than
     // against something standing in for it.
@@ -380,5 +449,195 @@ fn starting_up_with_no_bus_to_talk_to_costs_almost_nothing() {
         runs[0],
         runs[runs.len() / 2],
         runs.len()
+    );
+}
+
+/// What the payload above means, once something has read it: the same event
+/// whichever way the mapping was reached.
+fn is_the_prompt_from_claude(event: &Value) {
+    assert_eq!(event["agent"], "claude", "{event}");
+    assert_eq!(event["kind"], "turn_start", "{event}");
+    assert_eq!(event["session"], "abc123", "{event}");
+}
+
+/// A mapping file over the size any tier is read under.
+fn oversized_mapping() -> String {
+    format!("# {}\n", "x".repeat(64 * 1024))
+}
+
+#[test]
+fn a_mapping_somebody_broke_costs_them_nothing_but_the_mapping() {
+    let (_temp, dir) = bus_dir();
+    let events = collect(&dir);
+    // Every way a copy on disk can be unusable, one run each: not TOML at all,
+    // bigger than any tier is read under, and describing somebody else. The
+    // mapping inside the binary answers in all three, so the event is the one
+    // this payload always meant.
+    for broken in [
+        "this is not a mapping".to_owned(),
+        oversized_mapping(),
+        r#"id = "somebody-else"
+
+[payload]
+event = "hook_event_name"
+session = ["session_id"]
+
+[[events]]
+name = "UserPromptSubmit"
+kind = "session_end"
+"#
+        .to_owned(),
+    ] {
+        std::fs::write(mapping(&dir, "claude"), &broken).expect("cannot write the mapping");
+
+        emit(&dir, &["--agent", "claude"], HOOK_PAYLOAD.as_bytes()).is_harmless();
+
+        let event = delivered(&events).expect("nothing was delivered");
+        is_the_prompt_from_claude(&event);
+    }
+}
+
+#[test]
+fn a_directory_of_mappings_that_cannot_be_read_is_not_an_event_lost() {
+    let (_temp, dir) = bus_dir();
+    let events = collect(&dir);
+    let mappings = mapping(&dir, "claude");
+    let mappings = mappings.parent().expect("a directory").to_owned();
+    std::fs::write(mappings.join("claude.toml"), "id = \"claude\"\n").expect("cannot write");
+    set_mode(&mappings, 0o000);
+
+    emit(&dir, &["--agent", "claude"], HOOK_PAYLOAD.as_bytes()).is_harmless();
+
+    let event = delivered(&events).expect("nothing was delivered");
+    is_the_prompt_from_claude(&event);
+
+    // Put back, so that the directory can be removed with the test.
+    set_mode(&mappings, 0o755);
+}
+
+/// Sets one directory's permissions, which is how a test makes something
+/// unreadable and how it undoes that afterwards.
+fn set_mode(path: &Path, mode: u32) {
+    let permissions = std::os::unix::fs::PermissionsExt::from_mode(mode);
+    std::fs::set_permissions(path, permissions).expect("cannot change the permissions");
+}
+
+#[test]
+fn a_hook_run_by_something_with_no_home_directory_still_says_what_it_means() {
+    let (_temp, dir) = bus_dir();
+    let events = collect(&dir);
+    // No home directory means no tier to look in and no path to compose one
+    // from, which is the ordinary condition inside a container: what ships in
+    // the binary is the whole of what this machine knows.
+    let mut child = command(&dir, &["--agent", "claude"])
+        .env_remove("HOME")
+        .spawn()
+        .expect("cannot run agentbus");
+    let mut stdin = child.stdin.take().expect("no stdin");
+    let _ = stdin.write_all(HOOK_PAYLOAD.as_bytes());
+    drop(stdin);
+    let output = child.wait_with_output().expect("cannot wait for agentbus");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+
+    is_the_prompt_from_claude(&delivered(&events).expect("nothing was delivered"));
+}
+
+#[test]
+fn a_payload_no_mapping_maps_is_delivered_as_nothing_at_all() {
+    let (_temp, dir) = bus_dir();
+    let events = collect(&dir);
+
+    // A real payload from a real agent, deliberately one nothing maps: the
+    // event this run does not send is the whole of the assertion.
+    emit(
+        &dir,
+        &["--agent", "claude"],
+        br#"{"session_id":"abc123","hook_event_name":"Notification","notification_type":"idle"}"#,
+    )
+    .is_harmless();
+
+    assert_eq!(delivered(&events), None);
+}
+
+#[test]
+fn with_nobody_listening_no_mapping_is_read_at_all() {
+    let (_temp, dir) = bus_dir();
+    std::fs::write(mapping(&dir, "claude"), "this is not a mapping").expect("cannot write");
+
+    // The same broken file twice over, with diagnostics on and everything else
+    // held still. The only difference between the runs is whether there is a
+    // bus to send to, and the file is named in one of them and not the other:
+    // the check for a socket is therefore what stands between an agent and
+    // every cost below it, structurally rather than by inspection.
+    let quiet = with_logging(&dir);
+    quiet.is_harmless();
+    assert!(
+        !String::from_utf8_lossy(&quiet.stderr).contains("claude.toml"),
+        "a mapping was read on a machine with no bus running: {}",
+        String::from_utf8_lossy(&quiet.stderr),
+    );
+
+    let events = collect(&dir);
+    let asked = with_logging(&dir);
+    asked.is_harmless();
+    assert!(
+        String::from_utf8_lossy(&asked.stderr).contains("claude.toml"),
+        "the skipped file is never named, so the run above proves nothing: {}",
+        String::from_utf8_lossy(&asked.stderr),
+    );
+    is_the_prompt_from_claude(&delivered(&events).expect("nothing was delivered"));
+}
+
+/// One run with diagnostics turned on, which is the only way any of this is
+/// visible from outside.
+fn with_logging(dir: &Path) -> Ran {
+    let started = Instant::now();
+    let mut child = command(dir, &["--agent", "claude"])
+        .env("AGENTBUS_LOG", "debug")
+        .spawn()
+        .expect("cannot run agentbus");
+    let mut stdin = child.stdin.take().expect("no stdin");
+    let _ = stdin.write_all(HOOK_PAYLOAD.as_bytes());
+    drop(stdin);
+    let output = child.wait_with_output().expect("cannot wait for agentbus");
+    Ran {
+        status: output.status,
+        stdout: output.stdout,
+        stderr: output.stderr,
+        took: started.elapsed(),
+    }
+}
+
+#[test]
+fn reading_a_mapping_and_sending_an_event_is_still_inside_the_budget() {
+    let (_temp, dir) = bus_dir();
+    let events = collect(&dir);
+    // The whole of an ordinary invocation on a machine where the bus is
+    // running: the payload read, the mapping inside the binary parsed, the
+    // event delivered. Ten runs reported as the best of them, because what is
+    // being measured is the cost of the client rather than of whatever else the
+    // machine running the tests is doing.
+    let mut runs: Vec<Duration> = (0..10)
+        .map(|_| {
+            let took = emit(&dir, &["--agent", "claude"], HOOK_PAYLOAD.as_bytes())
+                .is_harmless()
+                .took;
+            is_the_prompt_from_claude(&delivered(&events).expect("nothing was delivered"));
+            took
+        })
+        .collect();
+    runs.sort();
+    println!(
+        "an event over the bundled mappings: best {:?}, median {:?} (of {} runs)",
+        runs[0],
+        runs[runs.len() / 2],
+        runs.len()
+    );
+    assert!(
+        runs[0] < LIMIT,
+        "the best of {} runs took {:?}, over the {LIMIT:?} an agent would wait",
+        runs.len(),
+        runs[0],
     );
 }

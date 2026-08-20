@@ -13,8 +13,8 @@
 //!   they go to stderr or to a file. The one exception is the usage text, which
 //!   goes where a person asking for it by hand expects to find it; no hook's
 //!   command line asks for it.
-//! - **The process always exits 0.** An unreadable payload, an agent this build
-//!   has no adapter for, no daemon running, a daemon that is running but wedged,
+//! - **The process always exits 0.** An unreadable payload, an agent no mapping
+//!   on this machine describes, no daemon running, a daemon that is wedged,
 //!   a panic in the middle of any of it: all one outcome — nothing is sent,
 //!   nothing is said, the status is zero. A command line that merely *names*
 //!   this command cannot fail either; that part is in [`crate::run`].
@@ -24,12 +24,37 @@
 //!   Code's default is measured in minutes.
 //! - **No daemon costs nothing.** A machine where the bus is not running has to
 //!   run its agents exactly as if none of this were installed, so the absent
-//!   socket is one `stat` and an immediate return.
+//!   socket is one `stat` and an immediate return — and everything that could
+//!   cost more than that sits on the far side of that check, including working
+//!   out what the payload means.
 //!
 //! Losing an event is the acceptable failure and delaying the agent is not,
 //! which is why nothing below retries, queues or spools. It is also why this
 //! path uses blocking sockets with explicit deadlines and starts no runtime: a
 //! process that lives for a few milliseconds cannot afford to build one.
+//!
+//! # What one invocation may spend on the filesystem
+//!
+//! What an agent's hook payload means is described by a manifest rather than
+//! written into this program, so on a machine with a bus running this path
+//! reads files. The whole of the worst case is two attempts to open one —
+//! the copy of the mapping its operator wrote, then a copy fetched from a
+//! catalog — plus, for whichever of them exists, a size check and a read
+//! bounded well below a megabyte, and a parse of the copy that answers. The
+//! mapping that ships inside the binary is parsed from a string already in
+//! memory. There is no expression language in a mapping and so nothing to
+//! compile, no directory to walk, and no nesting past what the schema itself
+//! allows; the ordinary machine has neither file and pays two failed opens.
+//!
+//! Nothing is kept between invocations, because there is nobody to keep it
+//! for: this process answers one payload and exits, and a cache would be a
+//! second thing to be wrong.
+//!
+//! Every way that can go wrong — a file that cannot be read, one too big to
+//! be one of these, one that is not TOML, one describing a different agent —
+//! steps down to the next copy and ends at the copy inside the binary. A
+//! mapping somebody has half-edited therefore costs them a diagnostic they
+//! have to ask to see, and never costs them their hooks.
 
 use std::fmt;
 use std::fs::OpenOptions;
@@ -41,6 +66,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use agentbus_daemon::SocketPaths;
+use agentbus_detect::ManifestStore;
 use agentbus_protocol::{SSH_CONNECTION_DETAIL, Source, UnstampedEvent};
 use serde_json::Value;
 use socket2::{Domain, SockAddr, Socket, Type};
@@ -178,11 +204,23 @@ fn send(request: &Request<'_>, paths: &SocketPaths, deadline: Instant, stdin: im
     let Some(payload) = read_payload(stdin, deadline.min(Instant::now() + READ_BUDGET)) else {
         return;
     };
+    // Asked here, before the payload is parsed and before any manifest is
+    // looked for, rather than at the point of delivery where it would read
+    // more naturally. A machine where the bus is not running is the ordinary
+    // machine, not an error, and what it is owed is one `stat`: putting the
+    // question first is what makes that a property of the code rather than a
+    // hope about how much the rest of it costs.
+    let socket = paths.emit();
+    if !socket.exists() {
+        return note(format_args!("no bus is listening at {}", socket.display()));
+    }
     let raw: Value = match serde_json::from_slice(&payload) {
         Ok(raw) => raw,
         Err(error) => return note(format_args!("stdin was not JSON: {error}")),
     };
-    let Some(event) = normalize(request, &raw) else {
+    // Opening a store reads nothing; the file behind it, if there is one, is
+    // read by the lookup below and by nothing else.
+    let Some(event) = normalize(&ManifestStore::from_env(), request, &raw) else {
         return note(format_args!("nothing to send"));
     };
     let mut line = match serde_json::to_vec(&event) {
@@ -194,17 +232,19 @@ fn send(request: &Request<'_>, paths: &SocketPaths, deadline: Instant, stdin: im
     // process close the connection.
     line.push(b'\n');
 
-    if let Err(error) = deliver(&line, paths.emit(), deadline) {
+    if let Err(error) = deliver(&line, socket, deadline) {
         note(format_args!("the event was not delivered: {error}"));
     }
 }
 
 /// Turns a payload into the event it means, if it means one.
 ///
-/// The dispatch is a match on the agent's name, so that an agent whose adapter
-/// this build does not have is the same non-event as a payload the adapter had
-/// nothing to say about, and so that adding an agent is adding an arm.
-fn normalize(request: &Request<'_>, raw: &Value) -> Option<UnstampedEvent> {
+/// What a hook payload means is a question for the mapping in force for that
+/// agent, so the dispatch is a lookup in `store` rather than a match on a name:
+/// an agent no copy of any mapping describes is the same non-event as a payload
+/// the mapping had nothing to say about, and teaching this client a harness it
+/// has never met is writing a file rather than building this again.
+fn normalize(store: &ManifestStore, request: &Request<'_>, raw: &Value) -> Option<UnstampedEvent> {
     // Spelled with the protocol's own wire strings rather than with literals of
     // this module's own: there is one vocabulary and this is not where a second
     // one starts.
@@ -216,18 +256,25 @@ fn normalize(request: &Request<'_>, raw: &Value) -> Option<UnstampedEvent> {
     };
     match (source, request.agent) {
         (Source::Hook, Some(agent)) => {
-            let event = match agent {
-                "claude" => adapters::claude::normalize(raw)?,
-                "codex" => adapters::codex::normalize(raw)?,
-                "opencode" => adapters::opencode::normalize(raw)?,
-                // Debug builds carry one agent that is not an agent: it panics,
-                // so that the guarantee this module exists for can be tested
-                // against a real process rather than against a closure standing
-                // in for one. A released build does not contain this arm.
-                #[cfg(debug_assertions)]
-                PANIC_AGENT => panic!("{PANIC_AGENT}"),
-                _ => return None,
-            };
+            // Debug builds answer to one agent that is not an agent: it panics,
+            // so that the guarantee this module exists for can be tested
+            // against a real process rather than against a closure standing in
+            // for one. A released build does not contain this.
+            #[cfg(debug_assertions)]
+            if agent == PANIC_AGENT {
+                panic!("{PANIC_AGENT}");
+            }
+            let normalized = store.normalize_hook(agent, raw);
+            // What the store passed over on the way to the mapping that
+            // answered — a copy it could not read, one describing somebody
+            // else. Said whether or not there was an event, because the file a
+            // warning names is almost always the one whose author is wondering
+            // why nothing changed, and said only to whoever asked to be told
+            // anything at all.
+            for skipped in store.hook_warnings(agent) {
+                note(format_args!("{skipped}"));
+            }
+            let event = normalized?;
             match (request.correlation, request.ssh_connection) {
                 (Some(correlation), _) => Some(event.with_correlation(correlation)),
                 // No correlation to copy, so the connection this process was
@@ -328,15 +375,11 @@ fn readable(fd: RawFd, deadline: Instant) -> bool {
 /// never reads a byte back. There is nothing the daemon could say that would
 /// change what happens next, and waiting to be told it would be the one thing a
 /// hook must not do.
+///
+/// The socket was there when [`send`] looked for it. A daemon that has gone
+/// away since fails on connect below, which is the same outcome as its socket
+/// having been missing all along: nothing is sent and nothing is said.
 fn deliver(line: &[u8], socket: &Path, deadline: Instant) -> io::Result<()> {
-    // A machine with no bus running is the ordinary case, not an error, and it
-    // is answered with one `stat` rather than with a connection attempt. A
-    // socket that exists but has nobody behind it fails on connect below, and
-    // the two are the same outcome.
-    if !socket.exists() {
-        note(format_args!("no bus is listening at {}", socket.display()));
-        return Ok(());
-    }
     let mut stream = connect(socket, deadline)?;
     write_within(&mut stream, line, deadline)
 }
@@ -434,6 +477,7 @@ mod tests {
     use std::fs::File;
     use std::io::Seek;
 
+    use agentbus_detect::StorePaths;
     use agentbus_protocol::{Agent, Kind};
 
     /// Builds an agent id from a literal, which is what every one of these is.
@@ -444,6 +488,17 @@ mod tests {
 
     use super::*;
 
+    /// A store over the mappings inside the binary and nothing else.
+    ///
+    /// Rooted at a directory that has just been made, so that a mapping
+    /// somebody wrote on the machine running the tests cannot decide what a
+    /// payload here means.
+    fn bundled() -> (tempfile::TempDir, ManifestStore) {
+        let home = tempfile::tempdir().expect("cannot make a temporary directory");
+        let store = ManifestStore::open(StorePaths::rooted(home.path()));
+        (home, store)
+    }
+
     /// A readable stream holding `bytes`, on a real descriptor because that is
     /// what the payload arrives on.
     fn stdin(bytes: &[u8]) -> File {
@@ -453,7 +508,7 @@ mod tests {
         file
     }
 
-    /// A payload the Claude adapter has something to say about.
+    /// A payload the bundled mapping for Claude has something to say about.
     fn hook_payload() -> Value {
         json!({
             "session_id": "abc123",
@@ -465,7 +520,13 @@ mod tests {
     #[test]
     #[cfg(debug_assertions)]
     fn a_panic_anywhere_below_is_swallowed() {
-        let paths = SocketPaths::in_dir("/nonexistent");
+        // With something listening, because the work that can panic is all on
+        // the far side of asking whether anybody is: a directory with no socket
+        // in it would prove the guard by never reaching what it guards.
+        let temp = tempfile::tempdir().expect("cannot make a temporary directory");
+        let paths = SocketPaths::in_dir(temp.path());
+        let _listener =
+            std::os::unix::net::UnixListener::bind(paths.emit()).expect("cannot listen");
         let request = Request {
             agent: Some(PANIC_AGENT),
             ..Request::default()
@@ -480,12 +541,14 @@ mod tests {
 
     #[test]
     fn a_hook_event_carries_the_correlation_it_was_given_verbatim() {
+        let (_home, store) = bundled();
         let request = Request {
             agent: Some("claude"),
             correlation: Some("  w9:p3 / anything at all  "),
             ..Request::default()
         };
-        let event = normalize(&request, &hook_payload()).expect("that should have been an event");
+        let event =
+            normalize(&store, &request, &hook_payload()).expect("that should have been an event");
         assert_eq!(event.agent, agent("claude"));
         assert_eq!(event.kind, Kind::TurnStart);
         assert_eq!(event.source, Source::Hook);
@@ -496,48 +559,53 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_with_no_adapter_produces_nothing() {
+    fn an_agent_no_mapping_describes_produces_nothing() {
+        let (_home, store) = bundled();
         let request = Request {
             agent: Some("an-agent-from-the-future"),
             ..Request::default()
         };
-        assert!(normalize(&request, &hook_payload()).is_none());
+        assert!(normalize(&store, &request, &hook_payload()).is_none());
     }
 
     #[test]
     fn naming_an_agent_and_an_observation_at_once_produces_nothing() {
+        let (_home, store) = bundled();
         let request = Request {
             agent: Some("claude"),
             source: Some("observed"),
             ..Request::default()
         };
-        assert!(normalize(&request, &hook_payload()).is_none());
+        assert!(normalize(&store, &request, &hook_payload()).is_none());
     }
 
     #[test]
     fn a_source_nobody_defined_produces_nothing() {
+        let (_home, store) = bundled();
         let request = Request {
             agent: Some("claude"),
             source: Some("guessed"),
             ..Request::default()
         };
-        assert!(normalize(&request, &hook_payload()).is_none());
+        assert!(normalize(&store, &request, &hook_payload()).is_none());
     }
 
     #[test]
     fn the_default_source_is_a_hook_and_may_be_said_out_loud() {
+        let (_home, store) = bundled();
         for source in [None, Some("hook")] {
             let request = Request {
                 agent: Some("claude"),
                 source,
                 ..Request::default()
             };
-            assert!(normalize(&request, &hook_payload()).is_some());
+            assert!(normalize(&store, &request, &hook_payload()).is_some());
         }
     }
 
     #[test]
     fn an_observation_ignores_the_environments_correlation() {
+        let (_home, store) = bundled();
         let request = Request {
             agent: None,
             source: Some("observed"),
@@ -545,7 +613,7 @@ mod tests {
             ..Request::default()
         };
         let payload = json!({"kind": "blocked", "correlation": "stated-by-the-observer"});
-        let event = normalize(&request, &payload).expect("that should have been an event");
+        let event = normalize(&store, &request, &payload).expect("that should have been an event");
         assert_eq!(event.source, Source::Observed);
         assert_eq!(event.correlation.as_deref(), Some("stated-by-the-observer"));
     }

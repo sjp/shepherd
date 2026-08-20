@@ -767,6 +767,18 @@ impl ManifestStore {
         active.compiled.normalize(payload)
     }
 
+    /// What was passed over on the way to the mapping that answers for
+    /// `agent`.
+    ///
+    /// A screen verdict carries these inside its explanation; a normalized
+    /// event has nowhere to put them, and they are worth just as much — the
+    /// file a warning names is nearly always the one whose author is wondering
+    /// why nothing changed. Empty is the ordinary case, and a caller with
+    /// nowhere to show a sentence is free never to ask.
+    pub fn hook_warnings(&self, agent: &str) -> Vec<String> {
+        self.hooks.entry(agent).warnings.clone()
+    }
+
     /// Whose manifest a screen should be read with, over the active copies.
     ///
     /// Identification is a question about the manifests in force on this
@@ -1412,6 +1424,37 @@ kind = "{kind}"
                 .normalize_hook(SCREEN_ONLY_AGENT, &stop_payload())
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_mapping_that_could_not_be_used_is_reported_to_whoever_asks() {
+        let (_home, store) = machine();
+        place_in(
+            &store,
+            Tier::Override,
+            Hooks::NAME,
+            BUNDLED_AGENT,
+            "this is not a mapping",
+        );
+
+        // The mapping inside the binary answers, so nothing about the payload
+        // changes; the sentence is the only trace the skipped file leaves.
+        assert!(
+            store
+                .normalize_hook(BUNDLED_AGENT, &stop_payload())
+                .is_some()
+        );
+        let warnings = store.hook_warnings(BUNDLED_AGENT);
+        assert!(
+            warned_about(&warnings, &["override", "hooks"]),
+            "{warnings:?}",
+        );
+    }
+
+    #[test]
+    fn a_mapping_nothing_was_wrong_with_is_reported_as_nothing() {
+        let (_home, store) = machine();
+        assert!(store.hook_warnings(BUNDLED_AGENT).is_empty());
     }
 
     #[test]
