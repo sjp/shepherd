@@ -1,0 +1,28 @@
+agentbus-detect
+Copyright the agentbus authors
+
+This product includes software developed as part of the herdr project
+(https://herdr.dev).
+
+The screen-detection manifest data bundled under manifests/screen/ is derived
+from the agent-detection manifests of the herdr project, used under the Apache
+License, Version 2.0. A copy of that license is in LICENSE-APACHE-2.0 in this
+directory; you may also obtain it at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Modifications to the manifest data as vendored here:
+
+  - Alias entries carrying the upstream project's own "herdr:" namespace prefix
+    were removed from the pi, opencode and kilo manifests. Those aliases name
+    the upstream project's internal identifiers and mean nothing outside it.
+
+  - One comment in the grok manifest named the upstream project as the reader of
+    an OSC 9;4 payload; it now says "the engine", which is what it describes.
+
+Everything else in the vendored files - identifiers, versions, timestamps, rule
+bodies and comments - is carried verbatim, so that a copy held here can be
+compared byte for byte against the upstream release it came from.
+
+No source code from the herdr project is used. The herdr name appears in this
+crate only in this file and in LICENSE-APACHE-2.0.

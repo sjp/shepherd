@@ -5,6 +5,7 @@
 //! What each agent's drawing *means* is described by a manifest, so the code
 //! here is agent-agnostic and the knowledge that goes stale lives in data.
 
+pub(crate) mod bundled;
 pub mod region;
 pub mod rules;
 pub mod schema;
