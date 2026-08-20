@@ -31,7 +31,13 @@ fn start() -> Running {
     let dir = tempfile::tempdir().expect("cannot make a temporary directory");
     let daemon = Daemon::bind(
         SocketPaths::in_dir(dir.path().join("agentbus")),
-        Settings::default(),
+        Settings {
+            // No process table to read. These tests count what they sent, and a
+            // daemon watching this machine's own would number its observations
+            // of whatever else is running here in among them.
+            proc_root: dir.path().join("no-process-table"),
+            ..Settings::default()
+        },
     )
     .expect("cannot start the daemon")
     // Nothing on the machine this is running on is to be reached into: what is

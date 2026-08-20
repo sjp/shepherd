@@ -29,6 +29,13 @@ impl Drop for Killed {
 fn start(bus_dir: Option<&Path>, runtime_dir: Option<&Path>) -> Killed {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agentbus"));
     command.arg("daemon");
+    // Somewhere there is no process table, since these tests are about where a
+    // daemon puts its files rather than about what it can see. The path is
+    // never created; a daemon that cannot read one simply reports nothing.
+    command.env(
+        "AGENTBUS_PROC_ROOT",
+        std::env::temp_dir().join(format!("agentbus-no-process-table-{}", std::process::id())),
+    );
     match bus_dir {
         Some(dir) => command.env("AGENTBUS_DIR", dir),
         None => command.env_remove("AGENTBUS_DIR"),

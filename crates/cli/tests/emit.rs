@@ -43,6 +43,7 @@ fn command(dir: &Path, args: &[&str]) -> Command {
         .env_remove("AGENTBUS_DIR")
         .env_remove("AGENTBUS_LOG")
         .env_remove("AGENTBUS_PANE")
+        .env_remove("AGENTBUS_PROC_ROOT")
         .env_remove("XDG_RUNTIME_DIR")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -56,10 +57,12 @@ fn bus_dir() -> (tempfile::TempDir, PathBuf) {
     (temp, dir)
 }
 
-/// Starts a daemon on `dir` and waits until it is serving.
+/// Starts a daemon on `dir` and waits until it is serving, with no process
+/// table to read: what these tests read on the stream is what they put there.
 fn start_daemon(dir: &Path) -> Process {
     let daemon = Process(
         command(dir, &["daemon"])
+            .env("AGENTBUS_PROC_ROOT", dir.with_file_name("no-process-table"))
             .stdout(Stdio::null())
             .spawn()
             .expect("cannot run agentbus"),

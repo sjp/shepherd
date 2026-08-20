@@ -48,6 +48,7 @@ fn command(dir: &Path, args: &[&str]) -> Command {
         .arg(dir)
         .env_remove("AGENTBUS_DIR")
         .env_remove("AGENTBUS_LOG")
+        .env_remove("AGENTBUS_PROC_ROOT")
         .env_remove("XDG_RUNTIME_DIR")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -62,10 +63,17 @@ fn bus_dir() -> (tempfile::TempDir, PathBuf) {
 }
 
 /// Starts a daemon on `dir` and waits until it is publishing.
+///
+/// With no process table to read, so that it says nothing whatever about the
+/// foreground. These tests assert on exactly what comes down the stream, and a
+/// daemon watching this machine's own table would report the correlated shells
+/// that happen to be open on it — somebody else's terminal, arriving in the
+/// middle of a test's output and failing it on a machine that is merely in use.
 fn start_daemon(dir: &Path) -> Process {
     let mut daemon = command(dir, &["daemon"]);
     let daemon = Process(Some(
         daemon
+            .env("AGENTBUS_PROC_ROOT", dir.with_file_name("no-process-table"))
             .stdout(Stdio::null())
             .spawn()
             .expect("cannot run agentbus"),

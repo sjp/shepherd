@@ -121,6 +121,10 @@ fn command(dir: &Path) -> Command {
         .arg("daemon")
         .arg("--dir")
         .arg(dir)
+        // No process table to read: these tests are about how a daemon starts,
+        // stops and cleans up after itself, and watching this machine's own
+        // table would mean watching whoever is running them.
+        .env("AGENTBUS_PROC_ROOT", dir.with_file_name("no-process-table"))
         .env_remove("AGENTBUS_DIR")
         .env_remove("AGENTBUS_LOG")
         .env_remove("AGENTBUS_STALE_SECS")
