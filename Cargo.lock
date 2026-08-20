@@ -33,6 +33,7 @@ dependencies = [
 name = "agentbus-daemon"
 version = "0.1.0"
 dependencies = [
+ "agentbus-detect",
  "agentbus-protocol",
  "libc",
  "rustls-graviola",

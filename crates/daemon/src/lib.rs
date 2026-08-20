@@ -47,6 +47,13 @@
 //! `SIGHUP`; and it writes down what came of each declaration beside its
 //! sockets, where the file is as ephemeral as the daemon is. See [`remote`].
 //!
+//! # Manifests that were published later
+//!
+//! Screens and hook payloads are read from data files, and a daemon is the one
+//! long-running thing here, so it is what keeps that data current: it takes
+//! newer copies from the published catalog on a timer and writes them where
+//! the manifest store reads them. It never reads one itself. See [`manifests`].
+//!
 //! There is one code path, wherever this runs. Nothing in this crate asks what
 //! kind of machine, session or container it is in, or what started it; the
 //! socket directory rules in [`paths`] cover those differences by construction.
@@ -60,6 +67,7 @@ pub mod emit;
 pub mod foreground;
 pub mod identity;
 pub mod lock;
+pub mod manifests;
 pub mod paths;
 pub mod procfs;
 pub mod remote;
@@ -154,6 +162,15 @@ pub struct Settings {
     /// daemon in front of it, which is the only way to hold the table still long
     /// enough to assert anything about it.
     pub proc_root: PathBuf,
+    /// Whether to take newer detection manifests from the published catalog.
+    ///
+    /// On, because data that is only current on the machines whose owners
+    /// remembered to ask is data that cannot be relied on. Off is for whoever
+    /// wants their machine to read screens with exactly what it was given and
+    /// nothing that arrived later, and for anything that may not reach the
+    /// network at all. Where to look and how often is [`manifests::Updates`],
+    /// which a daemon resolves from its environment.
+    pub update_manifests: bool,
 }
 
 impl Default for Settings {
@@ -165,6 +182,7 @@ impl Default for Settings {
             heartbeat: DEFAULT_HEARTBEAT,
             reconcile_every: reconcile::INTERVAL,
             proc_root: PathBuf::from(procfs::DEFAULT_ROOT),
+            update_manifests: true,
         }
     }
 }
@@ -262,6 +280,7 @@ pub struct Daemon {
     targets: Targets,
     transports: Registry,
     discoveries: Vec<Arc<dyn Discovery>>,
+    updates: manifests::Updates,
 }
 
 impl Daemon {
@@ -331,6 +350,7 @@ impl Daemon {
             targets: Targets::resolve(),
             transports: Registry::standard(),
             discoveries: remote::discover::standard(),
+            updates: manifests::Updates::from_env(),
         })
     }
 
@@ -358,6 +378,18 @@ impl Daemon {
     #[must_use]
     pub fn discovering(mut self, discoveries: Vec<Arc<dyn Discovery>>) -> Self {
         self.discoveries = discoveries;
+        self
+    }
+
+    /// The same daemon, taking newer manifests from `updates` rather than from
+    /// wherever this machine's environment says they are published.
+    ///
+    /// Whether it looks at all is [`Settings::update_manifests`]; this is where
+    /// it looks and how often, which is one decision because anything pointing
+    /// a daemon at a catalog of its own wants it read on its own cadence too.
+    #[must_use]
+    pub fn updating(mut self, updates: manifests::Updates) -> Self {
+        self.updates = updates;
         self
     }
 
@@ -402,6 +434,7 @@ impl Daemon {
             targets,
             transports,
             discoveries,
+            updates,
         } = self;
         info!(socket = %emit.path().display(), "listening for events");
         info!(socket = %subscribe.path().display(), "publishing the stream");
@@ -417,6 +450,13 @@ impl Daemon {
             attach: attach::Settings::default(),
             every: settings.reconcile_every,
         });
+        let refreshing = match settings.update_manifests {
+            true => Some(manifests::Refreshing::start(updates)),
+            false => {
+                info!("not checking for newer manifests");
+                None
+            }
+        };
         let (stops, hangups) = split(signals);
 
         let stopped = tokio::select! {
@@ -432,6 +472,9 @@ impl Daemon {
         // sessions the far ends were speaking for, and because it is what takes
         // the record of them away.
         drop(reconciling);
+        // In no particular order relative to anything: it holds nothing this
+        // daemon shares and speaks to nothing that is being taken down.
+        drop(refreshing);
         for file in paths.ephemeral() {
             remove_if_present(file);
         }

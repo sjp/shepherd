@@ -6,6 +6,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+agentbus-detect = { workspace = true, features = ["remote-updates"] }
 agentbus-protocol = { workspace = true }
 libc = { workspace = true }
 rustls-graviola = { workspace = true }

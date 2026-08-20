@@ -1253,3 +1253,52 @@ is why the copy a person is looking at is the copy they are looking at. Keeping
 them in the last column keeps a sentence from pushing the aligned columns
 around, and either kind being present is what marks the row as one worth
 reading.
+
+## 2026-08-20 — checking for newer manifests on a timer
+
+### The daemon carries the clock, and still reads nothing
+
+**A daemon fetches manifests and never consults one.** The bus is the only thing
+in this program that runs long enough to notice that a file was published, so it
+is where a timer belongs; but what it does with what arrives is put it on the
+disk. Nothing in the daemon then has to be told: the commands that read
+manifests are one-shot and open a store per invocation, and a long-lived program
+embedding the store decides for itself when to reload. That keeps the property
+that made the manifests worth having — the thing that reads them and the thing
+that fetches them are not the same thing — and it keeps every code path that
+touches an event free of manifest parsing.
+
+### A thread with a sleep, not a task with a timer
+
+**One dedicated thread, waiting on a condition variable between checks.** A
+check is blocking http with timeouts measured in seconds and a few files written
+under it, which is the same shape as the process table sweep and the endpoint
+reconciler, and for the same reason it stays off the runtime's workers: a worker
+parked in a network read is a worker not accepting the connection a hook is
+waiting on. It is stopped by being dropped and it is not joined — it owns
+nothing anybody else can see, and the one thing it might be doing is waiting out
+a request timeout, which is not a wait worth making shutdown carry.
+
+### On by default, with the flag named for the thing and not for its negation
+
+**Checks are on, `--no-update-manifests` turns them off, and
+`AGENTBUS_UPDATE_MANIFESTS` is the variable behind it.** Detection data that is
+only current on the machines whose owners remembered to ask is data nothing can
+rely on, and the whole point of moving detection into files was that a UI change
+could be answered without a release reaching every machine by hand. The variable
+speaks positively because a supervisor setting `..._NO_UPDATE_MANIFESTS=0` is
+being asked to read a double negative; anything falsey in it turns the checks
+off, and the flag on the command line wins over it in the usual way. It joins
+the list in "Configuration is flags, with an environment variable behind each"
+above, and follows that rule so that there is one way to configure a daemon.
+
+### The first check is a minute late, and the rest are half an hour apart
+
+**Sixty seconds, then thirty minutes.** The delay is there because a fleet
+restarted together would otherwise arrive at the catalog as one crowd, and
+because a daemon that is started and stopped inside a minute — which is what
+most of this program's own tests do — should not reach the network at all. Half
+an hour is far finer than the thing being watched, which changes on the scale of
+days. Both, and the catalog location, are one value a caller can replace, so
+that anything pointing a daemon at a catalog of its own gets to say how often it
+is read as well as where it is.

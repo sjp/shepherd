@@ -97,6 +97,7 @@ async fn the_settings_a_daemon_was_started_with_are_readable_from_it() {
         heartbeat: Duration::from_secs(13),
         reconcile_every: Duration::from_secs(17),
         proc_root: PathBuf::from("/proc/somewhere/else"),
+        update_manifests: false,
     };
 
     let started = start(settings.clone());

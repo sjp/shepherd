@@ -71,6 +71,14 @@ const ASSERT_HOLD_SECS_VAR: &str = "AGENTBUS_ASSERT_HOLD_SECS";
 /// The environment variable behind `--proc-root`.
 const PROC_ROOT_VAR: &str = "AGENTBUS_PROC_ROOT";
 
+/// The environment variable behind `--no-update-manifests`.
+///
+/// Named for the thing rather than for the flag: a variable spelled as a
+/// negation is read as a double negative by whoever has to set it to zero in a
+/// unit file. Anything falsey — `0`, `false`, `off`, `no` — turns the checks
+/// off, and the flag is the same answer given on the command line.
+const UPDATE_MANIFESTS_VAR: &str = "AGENTBUS_UPDATE_MANIFESTS";
+
 /// The status `foreground` exits with when there is nothing to report from: no
 /// daemon to ask, or one that is not watching a process table.
 ///
@@ -332,6 +340,16 @@ struct DaemonArgs {
     )]
     log_level: String,
 
+    /// Do not take newer detection manifests from the published catalog
+    #[arg(
+        long = "no-update-manifests",
+        action = clap::ArgAction::SetFalse,
+        env = UPDATE_MANIFESTS_VAR,
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = Settings::default().update_manifests,
+    )]
+    update_manifests: bool,
+
     /// Where the process table is read from. For tests: a machine has exactly
     /// one and it is the default. Hidden from the usage text for that reason,
     /// and left as a flag rather than a constant so that a test can put a
@@ -354,6 +372,7 @@ impl DaemonArgs {
             done_retention: Duration::from_secs(self.done_retention_secs),
             assert_hold: Duration::from_secs(self.assert_hold_secs),
             proc_root: self.proc_root.clone(),
+            update_manifests: self.update_manifests,
             ..Settings::default()
         }
     }
@@ -746,6 +765,7 @@ fn daemon(args: &DaemonArgs) -> ExitCode {
         stale_secs = args.stale_secs,
         done_retention_secs = args.done_retention_secs,
         assert_hold_secs = args.assert_hold_secs,
+        update_manifests = args.update_manifests,
         log_level = args.log_level,
         "starting"
     );

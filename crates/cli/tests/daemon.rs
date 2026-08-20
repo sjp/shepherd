@@ -6,11 +6,11 @@
 //! daemon's own process cannot safely do. So the precedence rules are checked
 //! here, on a real child process, rather than by unit tests calling `resolve`.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Kills the daemon when the test ends, however it ends.
@@ -44,6 +44,10 @@ fn start(bus_dir: Option<&Path>, runtime_dir: Option<&Path>) -> Killed {
         Some(dir) => command.env("XDG_RUNTIME_DIR", dir),
         None => command.env_remove("XDG_RUNTIME_DIR"),
     };
+    // These tests are about where a daemon puts its files. Nothing here is to
+    // reach the network on its own or write into the manifests of whoever is
+    // running the tests.
+    command.env("AGENTBUS_UPDATE_MANIFESTS", "0");
     Killed(command.spawn().expect("failed to run agentbus"))
 }
 
@@ -110,4 +114,89 @@ fn without_an_explicit_directory_the_daemon_uses_the_runtime_directory() {
     let dir = temp.path().join("agentbus");
     wait_for(&dir.join("emit.sock"));
     assert_eq!(mode(&dir), 0o700);
+}
+
+#[test]
+fn the_help_says_how_to_stop_a_daemon_fetching_manifests() {
+    let output = Command::new(env!("CARGO_BIN_EXE_agentbus"))
+        .args(["daemon", "--help"])
+        .output()
+        .expect("failed to run agentbus");
+    let help = String::from_utf8_lossy(&output.stdout);
+
+    // The flag and the variable behind it: whatever supervises a daemon often
+    // cannot choose its arguments, and has to be able to find the other way.
+    for word in ["--no-update-manifests", "AGENTBUS_UPDATE_MANIFESTS"] {
+        assert!(help.contains(word), "the help omits {word:?}: {help}");
+    }
+}
+
+/// The line a daemon logs about itself as it starts, from a child given exactly
+/// `environment` on top of a directory of its own.
+///
+/// Reading it back is the only way to see what a real command line and a real
+/// environment settled on, which is the thing being asserted: a test in this
+/// process could set neither safely.
+fn starting_line(environment: &[(&str, &str)]) -> String {
+    let temp = tempfile::tempdir().expect("cannot make a temporary directory");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agentbus"));
+    command
+        .arg("daemon")
+        .env("AGENTBUS_DIR", temp.path().join("bus"))
+        .env("AGENTBUS_PROC_ROOT", temp.path().join("no-process-table"))
+        .env_remove("AGENTBUS_UPDATE_MANIFESTS")
+        .stderr(Stdio::piped());
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    let mut daemon = Killed(command.spawn().expect("failed to run agentbus"));
+    let stderr = daemon.0.stderr.take().expect("the daemon has no stderr");
+
+    for line in BufReader::new(stderr).lines().take(20) {
+        let line = line.expect("cannot read what the daemon said");
+        if line.contains("starting") {
+            return line;
+        }
+    }
+    panic!("the daemon never said what it was starting with");
+}
+
+#[test]
+fn whether_manifests_are_checked_for_is_settable_from_the_environment() {
+    // A daemon that is checking is killed long before its first check, which is
+    // a minute away; nothing here reaches the network.
+    assert!(
+        starting_line(&[]).contains("update_manifests=true"),
+        "a daemon given nothing does not check for newer manifests",
+    );
+
+    for said in ["0", "false", "off", "no"] {
+        let line = starting_line(&[("AGENTBUS_UPDATE_MANIFESTS", said)]);
+        assert!(
+            line.contains("update_manifests=false"),
+            "{said:?} did not turn the checks off: {line}",
+        );
+    }
+    assert!(
+        starting_line(&[("AGENTBUS_UPDATE_MANIFESTS", "1")]).contains("update_manifests=true"),
+        "a daemon told to check does not",
+    );
+}
+
+#[test]
+fn a_daemon_told_not_to_update_manifests_still_starts() {
+    let temp = tempfile::tempdir().expect("cannot make a temporary directory");
+    let bus = temp.path().join("bus");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agentbus"));
+    command
+        .arg("daemon")
+        .arg("--no-update-manifests")
+        .env("AGENTBUS_DIR", &bus)
+        .env("AGENTBUS_PROC_ROOT", temp.path().join("no-process-table"))
+        // Deliberately contradicting the flag, which is the way round that
+        // matters: whoever typed the flag meant it.
+        .env("AGENTBUS_UPDATE_MANIFESTS", "1");
+    let _daemon = Killed(command.spawn().expect("failed to run agentbus"));
+
+    wait_for(&bus.join("emit.sock"));
 }
