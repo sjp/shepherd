@@ -5,17 +5,26 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+# The manifest update channel. Off by default so that a program embedding this
+# library for detection alone does not acquire an http client and a TLS stack
+# along with it; the command line and the daemon turn it on.
+remote-updates = ["dep:rustls-graviola", "dep:ureq"]
+
 [dependencies]
 agentbus-protocol = { workspace = true }
 regex = { workspace = true }
+rustls-graviola = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
+ureq = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tiny_http = { workspace = true }
 
 [lints]
 workspace = true

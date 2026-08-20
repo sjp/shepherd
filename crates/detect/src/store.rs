@@ -163,6 +163,17 @@ impl StorePaths {
         self.state.join(REMOTE_DIR).join(family)
     }
 
+    /// The file a fetched copy of one agent's manifest belongs at, or nothing
+    /// when this machine has nowhere to keep one — an id that could not name a
+    /// file on its own, or a state root that is not absolute.
+    ///
+    /// This is the path a fetch writes and the path the store then reads, so
+    /// the two are the same expression rather than two spellings that have to
+    /// be kept agreeing.
+    pub fn remote_file(&self, family: &str, id: &str) -> Option<PathBuf> {
+        self.file(Tier::Remote, family, id)
+    }
+
     /// The file one agent's manifest would be read from, or nothing when this
     /// tier cannot be consulted for that id at all.
     fn file(&self, tier: Tier, family: &str, id: &str) -> Option<PathBuf> {
@@ -199,7 +210,7 @@ fn base(home: Option<&OsStr>, named: Option<OsString>, default: &str) -> PathBuf
 /// in this library would be harmed by `../../elsewhere`, but a manifest names
 /// the rules a screen is read with, and choosing which file that is by walking
 /// out of the manifest directory is not a capability a caller should have.
-fn manifest_file_name(id: &str) -> Option<String> {
+pub(crate) fn manifest_file_name(id: &str) -> Option<String> {
     let mut components = Path::new(id).components();
     match (components.next(), components.next()) {
         (Some(Component::Normal(only)), None) if only == OsStr::new(id) => {
@@ -218,6 +229,13 @@ fn manifest_file_name(id: &str) -> Option<String> {
 pub trait Family: 'static {
     /// The family's name, which is also its directory under each tier's root.
     const NAME: &'static str;
+
+    /// The highest manifest engine this build of the family implements.
+    ///
+    /// A manifest may say which engine it needs; one that needs a later engine
+    /// than this describes behaviour that is not here yet, and is refused
+    /// rather than half-understood.
+    const ENGINE_VERSION: u32;
 
     /// One parsed and validated manifest.
     type Manifest;
@@ -241,6 +259,9 @@ pub trait Family: 'static {
     /// The manifest's own version, when it declares one.
     fn version(manifest: &Self::Manifest) -> Option<&ManifestVersion>;
 
+    /// The lowest engine the manifest says it needs, when it says.
+    fn min_engine_version(manifest: &Self::Manifest) -> Option<u32>;
+
     /// Prepares a manifest for use.
     fn compile(manifest: Self::Manifest) -> Self::Compiled;
 
@@ -256,6 +277,7 @@ pub struct Screen;
 
 impl Family for Screen {
     const NAME: &'static str = "screen";
+    const ENGINE_VERSION: u32 = crate::screen::schema::SCREEN_ENGINE_VERSION;
 
     type Manifest = ScreenManifest;
     type Compiled = CompiledManifest;
@@ -276,6 +298,10 @@ impl Family for Screen {
         manifest.version.as_ref()
     }
 
+    fn min_engine_version(manifest: &Self::Manifest) -> Option<u32> {
+        manifest.min_engine_version
+    }
+
     fn compile(manifest: Self::Manifest) -> Self::Compiled {
         CompiledManifest::compile(manifest)
     }
@@ -291,6 +317,7 @@ pub struct Hooks;
 
 impl Family for Hooks {
     const NAME: &'static str = "hooks";
+    const ENGINE_VERSION: u32 = crate::hooks::schema::HOOKS_ENGINE_VERSION;
 
     type Manifest = HookManifest;
     type Compiled = CompiledHookManifest;
@@ -309,6 +336,10 @@ impl Family for Hooks {
 
     fn version(manifest: &Self::Manifest) -> Option<&ManifestVersion> {
         manifest.version.as_ref()
+    }
+
+    fn min_engine_version(manifest: &Self::Manifest) -> Option<u32> {
+        manifest.min_engine_version
     }
 
     fn compile(manifest: Self::Manifest) -> Self::Compiled {
@@ -618,7 +649,7 @@ fn read_source<F: Family>(
 /// A file named after one agent holding another agent's manifest is a mistake
 /// worth refusing rather than honouring: whichever of the two names is wrong,
 /// reading a screen with it would attribute one agent's UI to another.
-fn covers<F: Family>(manifest: &F::Manifest, requested: &str) -> bool {
+pub(crate) fn covers<F: Family>(manifest: &F::Manifest, requested: &str) -> bool {
     same(F::id(manifest), requested)
         || F::aliases(manifest)
             .iter()
@@ -627,7 +658,7 @@ fn covers<F: Family>(manifest: &F::Manifest, requested: &str) -> bool {
 
 /// Reads a file that must be small, reporting an absent one as no content
 /// rather than as a failure.
-fn read_bounded(path: &Path) -> Result<Option<String>, String> {
+pub(crate) fn read_bounded(path: &Path) -> Result<Option<String>, String> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),

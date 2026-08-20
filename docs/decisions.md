@@ -1151,3 +1151,61 @@ construction and says which rule concluded what, which is what a subscriber
 needs to render or debug the claim. Anything that genuinely needs to see what
 was seen is better off running the observer itself, where the evidence already
 is.
+
+## 2026-08-20 — taking manifests from a catalog
+
+### The manifest channel uses `ureq` too, behind a feature
+
+**The same client the release fetch uses, compiled into `agentbus-detect` only
+when `remote-updates` is on.** The client decision above stands and is not
+re-litigated: a blocking client on a thread with nothing else to do, with
+Graviola behind its TLS so that a release still cross-compiles. What is new is
+where it lives. Detection is a library, and the useful thing about it is that
+reading a screen needs nothing but the screen — a host embedding it to watch its
+own terminals should not acquire an http client, a TLS stack and a certificate
+store by doing so. So the update channel is a feature that is off by default and
+that the command line turns on, and the crate without it is exactly the
+network-free library it was before.
+
+### What arrives is compared against the bundled copy as well as the cached one
+
+**A fetched manifest must be strictly newer than every copy the machine already
+has, the compiled-in one included.** The cached tier alone would have been the
+obvious comparison, and it is not enough: a machine that has never fetched
+anything has a bundled manifest that may already be newer than what a stale
+mirror publishes, and taking that copy would write a file the store then has to
+notice is old and step over. Comparing against both means the tier below is
+never populated with something that could not win.
+
+The tie is the interesting case. Two copies claiming one version have to *be*
+one copy, so an equal version is accepted only when the bytes are identical —
+in which case nothing is written at all, which is what makes a check that finds
+nothing new cost one request and no disk. Equal with different bytes is refused
+rather than taken, because one version number meaning two different things is a
+fleet where no two machines can be shown to agree, and the publisher who edited
+without bumping is the one who can fix it.
+
+### A catalog is refused whole; an entry is refused alone
+
+**Schema, path safety and duplicate listings stop the run; anything about a
+single manifest costs that manifest.** The split follows what the failure says.
+A catalog in an unknown schema, one naming a path that climbs out of its own
+directory, or one listing a manifest twice has been shown to be untrustworthy as
+a document — reading the rest of it would be trusting a file that has just
+demonstrated it should not be. A manifest that is missing, oversized, unparseable
+or older is one publisher's mistake about one agent, and letting it stop the
+other nineteen would turn a typo into an outage of the whole channel.
+
+The exception in the other direction is a family this build has never heard of,
+which is skipped with a note rather than refused: that is the forward
+compatibility hatch that lets one catalog serve builds from both sides of a new
+family being added.
+
+### The status file counts seconds, and does not spell out a date
+
+**`last_checked_unix` is an integer, and whatever displays it owns the
+calendar.** This follows the datetime decision above rather than departing from
+it: the arithmetic that turns an instant into a date lives in the crate that
+needs it, and the detection library needs a number it can compare, not a
+calendar. The command line already has the daemon's conversion available for the
+one place a person reads it.

@@ -1,0 +1,8 @@
+# claude, blocked-bash
+#
+# Replace the line below with what you saw: one of working, idle,
+# blocked, unknown, then 'visible' if the state's chrome was live on
+# the screen and 'skip' if the screen was showing the past.
+#
+# The rules currently read it as: {"state":"idle","visible":true,"skip":false,"matched_rule":"live_prompt_box","fallback":null}
+TODO

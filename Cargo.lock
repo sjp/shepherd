@@ -52,12 +52,15 @@ version = "0.1.0"
 dependencies = [
  "agentbus-protocol",
  "regex",
+ "rustls-graviola",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
+ "tiny_http",
  "toml",
  "tracing",
+ "ureq",
 ]
 
 [[package]]

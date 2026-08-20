@@ -31,6 +31,11 @@
 //! that once per family, by the same rules, because "which copy is active" is
 //! not a question that changes with what the file describes.
 //!
+//! Where a fetched copy comes *from* is the `update` module, which this crate
+//! only has when it is built with the `remote-updates` feature: reading a
+//! screen needs no network, and a program embedding this library should not
+//! acquire an http client by doing so.
+//!
 //! # Who this is for
 //!
 //! Any program holding a payload or a screen: a client that a harness runs its
@@ -55,6 +60,8 @@ pub mod hooks;
 pub mod identify;
 pub mod screen;
 pub mod store;
+#[cfg(feature = "remote-updates")]
+pub mod update;
 pub mod version;
 
 pub use explain::{
@@ -79,5 +86,11 @@ pub use screen::schema::{
 };
 pub use store::{
     Family, Hooks, MAX_MANIFEST_BYTES, ManifestStore, ManifestSummary, Screen, StorePaths,
+};
+#[cfg(feature = "remote-updates")]
+pub use update::{
+    CATALOG_SCHEMA_VERSION, CATALOG_URL_VAR, CheckResult, DEFAULT_CATALOG_URL, ItemResult,
+    MAX_FETCH_BYTES, ManifestOutcome, ManifestStatus, STATUS_FILE, Status, UpdateOutcome,
+    catalog_url, update, update_from_env,
 };
 pub use version::{InvalidVersion, ManifestVersion};
