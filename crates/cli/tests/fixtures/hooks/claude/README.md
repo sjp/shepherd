@@ -1,8 +1,11 @@
 # Claude Code hook payloads
 
-One file per hook event the adapter maps, named after the event as Claude spells
-it in `hook_event_name`. Each is a whole payload as it would arrive on the hook
-command's stdin.
+One file per hook event, named after the event as Claude spells it in
+`hook_event_name`. Each is a whole payload as it would arrive on the hook
+command's stdin. Where one event has several shapes worth recording — a tool
+call that failed and one that did not, a notification that means somebody is
+waiting and one that does not — a `-suffix` says which shape the file holds, and
+the ones that must produce no event at all are recorded beside the rest.
 
 **These are synthetic.** They were written by hand from Claude Code's documented
 hook schema, not captured from a running session, so the field *shapes* are the

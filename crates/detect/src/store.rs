@@ -812,8 +812,17 @@ mod tests {
     /// can only have come from a manifest one of these tests wrote.
     const SCREEN: &str = "a screen with the marker on it\n";
 
-    /// How many agents the bundled corpus covers.
-    const BUNDLED_COUNT: usize = 20;
+    /// How many agents the bundled corpus covers, screen manifests and hook
+    /// mappings counted separately: the two families describe overlapping sets
+    /// of agents and a summary is per family, not per agent.
+    const BUNDLED_SCREEN_COUNT: usize = 20;
+    const BUNDLED_HOOK_COUNT: usize = 3;
+    const BUNDLED_COUNT: usize = BUNDLED_SCREEN_COUNT + BUNDLED_HOOK_COUNT;
+
+    /// An agent the bundled corpus describes the screen of and says nothing
+    /// about the hooks of, for the tests about one family answering for the
+    /// other.
+    const SCREEN_ONLY_AGENT: &str = "gemini";
 
     /// A manifest whose one rule fires on [`SCREEN`] and names itself.
     fn marker_manifest(id: &str, version: Option<&str>, rule: &str) -> String {
@@ -1156,11 +1165,21 @@ contains = ["the marker"]
                 .iter()
                 .all(|summary| summary.source == Some(ManifestSource::Bundled)),
         );
-        assert!(summaries.iter().all(|summary| summary.family == "screen"));
-        assert!(
-            summaries.windows(2).all(|pair| pair[0].id < pair[1].id),
-            "summaries should read in id order",
-        );
+
+        for (family, count) in [
+            (Screen::NAME, BUNDLED_SCREEN_COUNT),
+            (Hooks::NAME, BUNDLED_HOOK_COUNT),
+        ] {
+            let of_family: Vec<&ManifestSummary> = summaries
+                .iter()
+                .filter(|summary| summary.family == family)
+                .collect();
+            assert_eq!(of_family.len(), count, "{family}");
+            assert!(
+                of_family.windows(2).all(|pair| pair[0].id < pair[1].id),
+                "{family} summaries should read in id order",
+            );
+        }
     }
 
     #[test]
@@ -1390,7 +1409,7 @@ kind = "{kind}"
         // about its hooks; one family is never an answer for the other.
         assert!(
             store
-                .normalize_hook(BUNDLED_AGENT, &stop_payload())
+                .normalize_hook(SCREEN_ONLY_AGENT, &stop_payload())
                 .is_none()
         );
     }
@@ -1430,9 +1449,8 @@ kind = "{kind}"
         assert_eq!(summaries.len(), BUNDLED_COUNT + 1);
         let mapping = summaries
             .iter()
-            .find(|summary| summary.family == Hooks::NAME)
+            .find(|summary| summary.family == Hooks::NAME && summary.id == "agent")
             .expect("a summary for the mapping");
-        assert_eq!(mapping.id, "agent");
         assert!(matches!(
             mapping.source,
             Some(ManifestSource::Override { .. })

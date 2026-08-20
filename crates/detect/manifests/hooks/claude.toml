@@ -1,0 +1,85 @@
+id = "claude"
+version = "2026.08.20.1"
+min_engine_version = 1
+updated_at = "2026-08-20T00:00:00Z"
+aliases = ["claude-code"]
+
+[payload]
+event = "hook_event_name"
+session = ["session_id"]
+cwd = ["cwd"]
+
+[[events]]
+name = "SessionStart"
+kind = "session_start"
+
+[[events]]
+name = "SessionEnd"
+kind = "session_end"
+
+[[events]]
+name = "UserPromptSubmit"
+kind = "turn_start"
+
+[[events]]
+name = "Stop"
+kind = "turn_end"
+
+[[events]]
+name = "PreToolUse"
+kind = "tool_start"
+detail = [{ field = "tool", from = "tool_name" }]
+
+# A failed tool call is still the end of a tool call: the failure is an extra
+# beside the name, not a kind of its own. This agent is the only one here that
+# says whether a call went wrong, which is why the field it says it in is
+# reported as a flag rather than copied — what a subscriber wants to know is
+# which of the two it was.
+[[events]]
+name = "PostToolUse"
+kind = "tool_end"
+detail = [
+  { field = "tool", from = "tool_name" },
+  { field = "error", from = "tool_error", transform = "nonempty" },
+]
+
+# There is no dedicated "waiting for permission" hook here. This one is the
+# closest thing and it is broader than that, so only the notification types that
+# mean somebody is being asked for a decision become a block; everything else —
+# idleness above all, which the end of a turn already reports — produces nothing
+# rather than crying wolf in the one place this is expected to be precise.
+# Revising the list below is the whole of revising the mapping.
+[[events]]
+name = "Notification"
+kind = "blocked"
+when = { field = "notification_type", in = ["permission_prompt", "elicitation_dialog"] }
+detail = [{ field = "notification_type", from = "notification_type" }]
+
+[[events]]
+name = "StopFailure"
+kind = "error"
+detail = [{ field = "message", from = "message" }]
+
+[[events]]
+name = "SubagentStart"
+kind = "subagent_start"
+detail = [
+  { field = "agent_id", from = "agent_id" },
+  { field = "agent_type", from = "agent_type" },
+]
+
+[[events]]
+name = "SubagentStop"
+kind = "subagent_end"
+detail = [
+  { field = "agent_id", from = "agent_id" },
+  { field = "agent_type", from = "agent_type" },
+]
+
+# The name says which side of the compaction this is, so the detail says so too:
+# an agent that grows a matching hook for the far side would otherwise be
+# indistinguishable in the stream.
+[[events]]
+name = "PreCompact"
+kind = "compact"
+detail = [{ field = "phase", value = "pre" }]

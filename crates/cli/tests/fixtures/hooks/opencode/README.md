@@ -1,10 +1,14 @@
 # OpenCode plugin payloads
 
-One file per event the adapter maps, named after the event's `type`. Each is a
-whole payload as the installed plugin writes it to the emit command's stdin:
-the event's `type`, the `directory` the plugin was loaded for, and the event's
-own properties spread out beside them. OpenCode has no hook commands, so there
-is no payload of the agent's own to record — this shape is the plugin's.
+One file per event, named after the event's `type`. Each is a whole payload as
+the installed plugin writes it to the emit command's stdin: the event's `type`,
+the `directory` the plugin was loaded for, and the event's own properties spread
+out beside them. OpenCode has no hook commands, so there is no payload of the
+agent's own to record — this shape is the plugin's.
+
+Two files are here for something other than the event they name: one records the
+second spelling of the session id, with a `-suffix` saying so, and one records an
+event nothing normalizes, so that it must go on producing nothing.
 
 **These are synthetic.** They were written by hand from OpenCode's documented
 event list, not captured from a running session, so the *shape* is the

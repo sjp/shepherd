@@ -23,8 +23,9 @@ fn agent(name: &str) -> Agent {
 struct Expected {
     /// The fixture's file name, without its extension.
     stem: &'static str,
-    /// The normalized kind.
-    kind: Kind,
+    /// The normalized kind, or nothing where the payload deliberately produces
+    /// no event at all.
+    kind: Option<Kind>,
     /// The detail, built when the assertion runs because a JSON value cannot be
     /// a constant. `None` where the mapping carries no extras.
     detail: Option<fn() -> Value>,
@@ -34,49 +35,76 @@ struct Expected {
 const EXPECTED: &[Expected] = &[
     Expected {
         stem: "SessionStart",
-        kind: Kind::SessionStart,
+        kind: Some(Kind::SessionStart),
         detail: None,
     },
     Expected {
         stem: "SessionEnd",
-        kind: Kind::SessionEnd,
+        kind: Some(Kind::SessionEnd),
         detail: None,
     },
     Expected {
         stem: "UserPromptSubmit",
-        kind: Kind::TurnStart,
+        kind: Some(Kind::TurnStart),
         detail: None,
     },
     Expected {
         stem: "Stop",
-        kind: Kind::TurnEnd,
+        kind: Some(Kind::TurnEnd),
         detail: None,
     },
     Expected {
         stem: "PreToolUse",
-        kind: Kind::ToolStart,
+        kind: Some(Kind::ToolStart),
         detail: Some(|| json!({"tool": "Bash"})),
     },
     Expected {
         stem: "PostToolUse",
-        kind: Kind::ToolEnd,
+        kind: Some(Kind::ToolEnd),
         detail: Some(|| json!({"tool": "Bash"})),
     },
     Expected {
+        stem: "PostToolUse-error-empty",
+        kind: Some(Kind::ToolEnd),
+        detail: Some(|| json!({"tool": "Bash"})),
+    },
+    Expected {
+        stem: "PostToolUse-error-message",
+        kind: Some(Kind::ToolEnd),
+        detail: Some(|| json!({"tool": "Bash", "error": true})),
+    },
+    Expected {
         stem: "Notification",
-        kind: Kind::Blocked,
+        kind: Some(Kind::Blocked),
         detail: Some(|| json!({"notification_type": "permission_prompt"})),
     },
     Expected {
+        stem: "Notification-elicitation",
+        kind: Some(Kind::Blocked),
+        detail: Some(|| json!({"notification_type": "elicitation_dialog"})),
+    },
+    // A notification that is not somebody being asked for a decision, and an
+    // event the bus does not model: both produce nothing.
+    Expected {
+        stem: "Notification-idle",
+        kind: None,
+        detail: None,
+    },
+    Expected {
+        stem: "FileChanged",
+        kind: None,
+        detail: None,
+    },
+    Expected {
         stem: "StopFailure",
-        kind: Kind::Error,
+        kind: Some(Kind::Error),
         detail: Some(
             || json!({"message": "the model connection was reset before the turn finished"}),
         ),
     },
     Expected {
         stem: "SubagentStart",
-        kind: Kind::SubagentStart,
+        kind: Some(Kind::SubagentStart),
         detail: Some(|| {
             json!({"agent_id": "1a7d33c9-58f0-4b2e-9d64-c0a7e5b41f22",
                                "agent_type": "general-purpose"})
@@ -84,7 +112,7 @@ const EXPECTED: &[Expected] = &[
     },
     Expected {
         stem: "SubagentStop",
-        kind: Kind::SubagentEnd,
+        kind: Some(Kind::SubagentEnd),
         detail: Some(|| {
             json!({"agent_id": "1a7d33c9-58f0-4b2e-9d64-c0a7e5b41f22",
                                "agent_type": "general-purpose"})
@@ -92,7 +120,7 @@ const EXPECTED: &[Expected] = &[
     },
     Expected {
         stem: "PreCompact",
-        kind: Kind::Compact,
+        kind: Some(Kind::Compact),
         detail: Some(|| json!({"phase": "pre"})),
     },
 ];
@@ -113,6 +141,13 @@ fn fixture(stem: &str) -> Value {
 fn every_fixture_maps_to_its_expected_kind_and_detail() {
     for Expected { stem, kind, detail } in EXPECTED {
         let raw = fixture(stem);
+        let Some(kind) = kind else {
+            assert!(
+                claude::normalize(&raw).is_none(),
+                "{stem} should have produced nothing",
+            );
+            continue;
+        };
         let event = claude::normalize(&raw).unwrap_or_else(|| panic!("{stem} produced no event"));
 
         assert_eq!(&event.kind, kind, "{stem}");

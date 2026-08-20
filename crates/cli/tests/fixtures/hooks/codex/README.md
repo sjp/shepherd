@@ -1,8 +1,10 @@
 # Codex CLI hook payloads
 
-One file per hook event the adapter maps, named after the event as Codex spells
-it in `hook_event_name`. Each is a whole payload as it would arrive on the hook
-command's stdin.
+One file per hook event, named after the event as Codex spells it in
+`hook_event_name`. Each is a whole payload as it would arrive on the hook
+command's stdin. Not all of them produce an event: an event another agent has
+and this one does not is recorded here too, so that answering for it would be a
+failure rather than a silence.
 
 **These are synthetic.** They were written by hand from Codex's documented hook
 surface, not captured from a running session, so the field *shapes* are the

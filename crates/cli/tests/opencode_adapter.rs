@@ -23,8 +23,9 @@ fn agent(name: &str) -> Agent {
 struct Expected {
     /// The fixture's file name, without its extension.
     stem: &'static str,
-    /// The normalized kind.
-    kind: Kind,
+    /// The normalized kind, or nothing where the payload deliberately produces
+    /// no event at all.
+    kind: Option<Kind>,
     /// The detail, built when the assertion runs because a JSON value cannot be
     /// a constant. `None` where the mapping carries no extras.
     detail: Option<fn() -> Value>,
@@ -34,47 +35,59 @@ struct Expected {
 const EXPECTED: &[Expected] = &[
     Expected {
         stem: "session.created",
-        kind: Kind::SessionStart,
+        kind: Some(Kind::SessionStart),
         detail: None,
     },
     Expected {
         stem: "session.deleted",
-        kind: Kind::SessionEnd,
+        kind: Some(Kind::SessionEnd),
         detail: None,
     },
     Expected {
         stem: "session.idle",
-        kind: Kind::TurnEnd,
+        kind: Some(Kind::TurnEnd),
+        detail: None,
+    },
+    // The same event with the session spelled the other way round.
+    Expected {
+        stem: "session.idle-session_id",
+        kind: Some(Kind::TurnEnd),
         detail: None,
     },
     Expected {
         stem: "session.compacted",
-        kind: Kind::Compact,
+        kind: Some(Kind::Compact),
         detail: None,
     },
     Expected {
         stem: "session.error",
-        kind: Kind::Error,
+        kind: Some(Kind::Error),
         detail: None,
     },
     Expected {
         stem: "tool.execute.before",
-        kind: Kind::ToolStart,
+        kind: Some(Kind::ToolStart),
         detail: Some(|| json!({"tool": "bash"})),
     },
     Expected {
         stem: "tool.execute.after",
-        kind: Kind::ToolEnd,
+        kind: Some(Kind::ToolEnd),
         detail: Some(|| json!({"tool": "bash"})),
     },
     Expected {
         stem: "permission.updated",
-        kind: Kind::Blocked,
+        kind: Some(Kind::Blocked),
         detail: Some(|| json!({"tool": "edit"})),
     },
     Expected {
         stem: "permission.replied",
-        kind: Kind::Unblocked,
+        kind: Some(Kind::Unblocked),
+        detail: None,
+    },
+    // One of the events this agent reports that no other agent has a word for.
+    Expected {
+        stem: "message.updated",
+        kind: None,
         detail: None,
     },
 ];
@@ -95,6 +108,13 @@ fn fixture(stem: &str) -> Value {
 fn every_fixture_maps_to_its_expected_kind_and_detail() {
     for Expected { stem, kind, detail } in EXPECTED {
         let raw = fixture(stem);
+        let Some(kind) = kind else {
+            assert!(
+                opencode::normalize(&raw).is_none(),
+                "{stem} should have produced nothing",
+            );
+            continue;
+        };
         let event = opencode::normalize(&raw).unwrap_or_else(|| panic!("{stem} produced no event"));
 
         assert_eq!(&event.kind, kind, "{stem}");
@@ -105,7 +125,9 @@ fn every_fixture_maps_to_its_expected_kind_and_detail() {
         );
         assert_eq!(event.agent, agent("opencode"), "{stem}");
         assert_eq!(event.source, Source::Hook, "{stem}");
-        assert_eq!(event.session, raw["sessionID"].as_str().unwrap(), "{stem}");
+        // Either spelling of the session identifies the same session.
+        let session = raw["sessionID"].as_str().or(raw["session_id"].as_str());
+        assert_eq!(Some(event.session.as_str()), session, "{stem}");
         // The directory the plugin was loaded for is the nearest thing OpenCode
         // has to the working directory the other agents report.
         assert_eq!(event.cwd.as_deref(), raw["directory"].as_str(), "{stem}");
@@ -135,7 +157,9 @@ fn the_table_and_the_fixture_directory_describe_the_same_set() {
 #[test]
 fn nothing_reports_the_start_of_a_turn_because_the_agent_has_no_such_event() {
     for Expected { stem, .. } in EXPECTED {
-        let event = opencode::normalize(&fixture(stem)).expect("an event");
+        let Some(event) = opencode::normalize(&fixture(stem)) else {
+            continue;
+        };
         assert_ne!(event.kind, Kind::TurnStart, "{stem}");
     }
 }

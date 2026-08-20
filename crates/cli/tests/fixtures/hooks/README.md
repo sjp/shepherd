@@ -8,6 +8,18 @@ The tests replay every directory found here through the real client into a real
 daemon. Nothing in them names an agent: an agent is added to the replay by adding
 its directory, and removed by removing it.
 
+## File names
+
+A file is named after the event it carries. Where one event arrives in more than
+one shape worth recording, a `-suffix` after the event name says which shape
+this one is, as in `PostToolUse-error-empty.json`.
+
+Not every payload here produces an event. The directories also hold the shapes
+that must produce *nothing* — an event nobody normalizes, a notification that is
+not somebody being asked for a decision — because "nothing to say about this
+one" is a mapping decision like any other and deserves pinning just as much.
+Those files are simply left out of `sequence.txt`.
+
 ## `sequence.txt`
 
 One line per step — the payload file to send, and the status the bus should

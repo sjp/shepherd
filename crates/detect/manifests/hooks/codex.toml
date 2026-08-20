@@ -1,0 +1,67 @@
+id = "codex"
+version = "2026.08.20.1"
+min_engine_version = 1
+updated_at = "2026-08-20T00:00:00Z"
+
+[payload]
+event = "hook_event_name"
+session = ["session_id"]
+cwd = ["cwd"]
+
+[[events]]
+name = "SessionStart"
+kind = "session_start"
+
+[[events]]
+name = "SessionEnd"
+kind = "session_end"
+
+[[events]]
+name = "UserPromptSubmit"
+kind = "turn_start"
+
+[[events]]
+name = "Stop"
+kind = "turn_end"
+
+[[events]]
+name = "PreToolUse"
+kind = "tool_start"
+detail = [{ field = "tool", from = "tool_name" }]
+
+[[events]]
+name = "PostToolUse"
+kind = "tool_end"
+detail = [{ field = "tool", from = "tool_name" }]
+
+# The block is asked for outright here, so nothing has to discriminate a
+# general-purpose notification into "waiting on a person" and "not". The tool
+# being asked about is the whole of what a person needs in order to answer, so
+# it travels with the block when the payload names one. Leaving the block is
+# still inferred from the activity that follows — that gap is the agent's.
+[[events]]
+name = "PermissionRequest"
+kind = "blocked"
+detail = [{ field = "tool", from = "tool_name" }]
+
+[[events]]
+name = "SubagentStart"
+kind = "subagent_start"
+
+[[events]]
+name = "SubagentStop"
+kind = "subagent_end"
+
+# Compaction is reported from both sides, and the two are one kind with a phase
+# beside it rather than two kinds: what happened is the same thing, and a
+# subscriber that only cares that a compaction occurred should not have to know
+# there are two spellings of it.
+[[events]]
+name = "PreCompact"
+kind = "compact"
+detail = [{ field = "phase", value = "pre" }]
+
+[[events]]
+name = "PostCompact"
+kind = "compact"
+detail = [{ field = "phase", value = "post" }]

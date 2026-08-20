@@ -1,0 +1,64 @@
+id = "opencode"
+version = "2026.08.20.1"
+min_engine_version = 1
+updated_at = "2026-08-20T00:00:00Z"
+
+# This agent has no hook commands: it loads plugins and hands each one an event
+# object, so the payload described here is the one the installed plugin writes —
+# the event's own `type`, the directory the plugin was loaded for, and the
+# event's properties spread out beside them. Two spellings of the session are
+# accepted because those properties are the agent's own and this file does not
+# control them; taking both costs a lookup and saves every event in a session
+# from being dropped over a convention that changed.
+[payload]
+event = "type"
+session = ["sessionID", "session_id"]
+cwd = ["directory"]
+
+[[events]]
+name = "session.created"
+kind = "session_start"
+
+[[events]]
+name = "session.deleted"
+kind = "session_end"
+
+# There is no start of a turn below, because this agent has no user-prompt event
+# and nothing here invents one: nothing is put on the wire that no agent
+# produced. A session that has gone idle is reported as working again the moment
+# it calls a tool, because any tool call is activity. What is lost is the count —
+# these turns cannot be counted by counting the starts of turns, because there
+# will not be any.
+[[events]]
+name = "session.idle"
+kind = "turn_end"
+
+[[events]]
+name = "session.compacted"
+kind = "compact"
+
+[[events]]
+name = "session.error"
+kind = "error"
+
+[[events]]
+name = "tool.execute.before"
+kind = "tool_start"
+detail = [{ field = "tool", from = "tool" }]
+
+[[events]]
+name = "tool.execute.after"
+kind = "tool_end"
+detail = [{ field = "tool", from = "tool" }]
+
+# Asked and answered. This is the only agent here that says when a permission
+# was answered as well as when one was asked for, so leaving the block comes
+# from the agent rather than being inferred from the activity that follows.
+[[events]]
+name = "permission.updated"
+kind = "blocked"
+detail = [{ field = "tool", from = "tool" }]
+
+[[events]]
+name = "permission.replied"
+kind = "unblocked"
