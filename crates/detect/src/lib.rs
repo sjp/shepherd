@@ -39,7 +39,12 @@
 pub mod screen;
 pub mod version;
 
+pub use screen::detect;
 pub use screen::region::{DEFAULT_REGION, RegionSpec, ScreenInput, UnknownRegion};
+pub use screen::rules::{
+    CompiledManifest, Detection, KNOWN_AGENT_IDLE_FALLBACK, RuleVerdict, UNKNOWN_AGENT_FALLBACK,
+    Verdicts,
+};
 pub use screen::schema::{
     Gate, GateView, Identify, ManifestFault, Rule, SCREEN_ENGINE_VERSION, ScreenManifest,
     ScreenManifestError, ScreenState,

@@ -19,7 +19,7 @@ const TOP_NON_EMPTY_LINES_SINCE: u32 = 3;
 ///
 /// The two OSC variants read the side-channels a terminal host can capture; all
 /// the others read the screen text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RegionSpec {
     /// The whole screen text.
     WholeRecent,
