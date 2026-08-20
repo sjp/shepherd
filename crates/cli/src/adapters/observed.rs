@@ -11,12 +11,15 @@
 //! Two fields are required and everything else degrades:
 //!
 //! - `kind` must be one this build knows. An observation is a guess, and a guess
-//!   spelled in a vocabulary the receiver does not share is not worth carrying;
-//!   this is also the one place a typo can be caught, since nothing else here
-//!   validates anything.
+//!   spelled in a vocabulary the receiver does not share is not worth carrying.
 //! - `correlation` must be there, because it is the only thing that says what
 //!   was observed. An observation nobody can attribute would land in the table
 //!   as a session that never existed, so it is dropped instead.
+//!
+//! An `agent`, if the payload names one, must be usable as an identifier; an
+//! observation that names an unusable one is dropped rather than silently
+//! relabelled, since relabelling would attribute somebody's session to the wrong
+//! agent. Omitting the field is always fine and is the ordinary case.
 //!
 //! `source` on the way out is always `observed`, whatever the payload said.
 //! Provenance is a promise made to the receiver — an inferred status presented
@@ -48,7 +51,10 @@ pub fn normalize(raw: &Value) -> Option<UnstampedEvent> {
     // the agent it could not identify, and the id no agent told it. Synthesizing
     // the session from the correlation is what keeps two observations of one
     // terminal from being two sessions.
-    let agent = string(payload, "agent").unwrap_or(Agent::UNKNOWN);
+    let agent = match string(payload, "agent") {
+        Some(named) => Agent::new(named).ok()?,
+        None => Agent::unknown(),
+    };
     let session = string(payload, "session")
         .map(str::to_owned)
         .unwrap_or_else(|| observed_session_id(correlation));
@@ -76,6 +82,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Builds an agent id from a literal, which is what every one of these is.
+    fn agent(name: &str) -> Agent {
+        Agent::new(name).expect("a test's own agent id is a valid one")
+    }
+
     /// The shape this path documents, in full.
     fn documented() -> Value {
         json!({
@@ -90,7 +101,7 @@ mod tests {
     #[test]
     fn the_documented_payload_normalizes() {
         let event = normalize(&documented()).expect("that should have been an event");
-        assert_eq!(event.agent, Agent::Other("unknown".to_owned()));
+        assert_eq!(event.agent, Agent::unknown());
         assert_eq!(event.session, "observed:w9:p3");
         assert_eq!(event.kind, Kind::Blocked);
         assert_eq!(event.source, Source::Observed);
@@ -104,7 +115,7 @@ mod tests {
     fn the_smallest_observation_is_a_kind_and_what_it_is_about() {
         let event = normalize(&json!({"kind": "turn_end", "correlation": "anything"}))
             .expect("that should have been an event");
-        assert_eq!(event.agent, Agent::Other(Agent::UNKNOWN.to_owned()));
+        assert_eq!(event.agent, Agent::unknown());
         assert_eq!(event.session, "observed:anything");
         assert_eq!(event.cwd, None);
         assert_eq!(event.detail, None);
@@ -117,7 +128,7 @@ mod tests {
             "agent": "claude", "session": "abc123",
         }))
         .expect("that should have been an event");
-        assert_eq!(event.agent, Agent::Claude);
+        assert_eq!(event.agent, agent("claude"));
         assert_eq!(event.session, "abc123");
         // Still an observation. Naming the session an agent reported does not
         // make the claim the agent's.

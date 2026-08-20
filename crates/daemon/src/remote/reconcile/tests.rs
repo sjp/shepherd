@@ -27,6 +27,11 @@ use crate::remote::transport::{
     Backoff, Error as TransportError, Made, Registry, Running, Transport,
 };
 
+/// Builds an agent id from a literal, which is what every one of these is.
+fn agent(name: &str) -> Agent {
+    Agent::new(name).expect("a test's own agent id is a valid one")
+}
+
 /// How long a test waits for something that should happen almost at once.
 const PATIENCE: Duration = Duration::from_secs(10);
 
@@ -213,7 +218,7 @@ fn snapshot(id: &str) -> Snapshot {
         1,
         vec![SessionEntry {
             session: format!("session-at-{id}"),
-            agent: Agent::Claude,
+            agent: agent("claude"),
             status: SessionStatus::Blocked,
             source: Source::Hook,
             cwd: None,

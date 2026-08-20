@@ -27,10 +27,10 @@
 //! revising against sessions in the wild, which is why the set is one const and
 //! nothing else in the file mentions a notification type by name.
 
-use agentbus_protocol::{Agent, Kind, UnstampedEvent};
+use agentbus_protocol::{Kind, UnstampedEvent};
 use serde_json::{Map, Value};
 
-use super::{field, string};
+use super::{agent, field, string};
 
 /// The `notification_type` values that mean "this session is waiting on a
 /// person", and so are the ones reported as `blocked`.
@@ -85,7 +85,7 @@ pub fn normalize(raw: &Value) -> Option<UnstampedEvent> {
         _ => return None,
     };
 
-    let mut event = UnstampedEvent::new(Agent::Claude, session, kind).with_raw(raw.clone());
+    let mut event = UnstampedEvent::new(agent("claude"), session, kind).with_raw(raw.clone());
     if let Some(cwd) = string(payload, "cwd") {
         event = event.with_cwd(cwd);
     }

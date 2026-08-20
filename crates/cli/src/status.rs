@@ -72,6 +72,11 @@ mod tests {
 
     use agentbus_protocol::{Agent, OriginHop, Source};
 
+    /// Builds an agent id from a literal, which is what every one of these is.
+    fn agent(name: &str) -> Agent {
+        Agent::new(name).expect("a test's own agent id is a valid one")
+    }
+
     fn timestamp(text: &str) -> Timestamp {
         Timestamp::parse(text).expect("not a timestamp")
     }
@@ -83,7 +88,7 @@ mod tests {
     fn session(session: &str, status: SessionStatus) -> SessionEntry {
         SessionEntry {
             session: session.to_owned(),
-            agent: Agent::Claude,
+            agent: agent("claude"),
             status,
             source: Source::Hook,
             cwd: Some("/workspaces/foo".to_owned()),

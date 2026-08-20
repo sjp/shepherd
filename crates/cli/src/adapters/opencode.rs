@@ -32,10 +32,10 @@
 //! against all of them; giving these ones a kind of their own would make the
 //! envelope a claim about agents that cannot make it.
 
-use agentbus_protocol::{Agent, Kind, UnstampedEvent};
+use agentbus_protocol::{Kind, UnstampedEvent};
 use serde_json::{Map, Value};
 
-use super::{field, string};
+use super::{agent, field, string};
 
 /// Normalizes one payload from the OpenCode plugin.
 ///
@@ -65,7 +65,7 @@ pub fn normalize(raw: &Value) -> Option<UnstampedEvent> {
         _ => return None,
     };
 
-    let mut event = UnstampedEvent::new(Agent::OpenCode, session, kind).with_raw(raw.clone());
+    let mut event = UnstampedEvent::new(agent("opencode"), session, kind).with_raw(raw.clone());
     // The plugin is loaded for a directory and says which one; that is the
     // nearest thing OpenCode offers to the working directory the other agents
     // report, and it is what a receiver groups a session by.

@@ -145,7 +145,8 @@ mod tests {
     use super::*;
 
     fn session(name: &str) -> SessionKey {
-        SessionKey::new("claude", name)
+        let agent = agentbus_protocol::Agent::new("claude").expect("that is a valid agent id");
+        SessionKey::new(agent, name)
     }
 
     #[test]

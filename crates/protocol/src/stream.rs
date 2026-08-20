@@ -417,6 +417,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Builds an agent id from a literal, which is what every one of these is.
+    fn agent(name: &str) -> Agent {
+        Agent::new(name).expect("a test's own agent id is a valid one")
+    }
+
     const SNAPSHOT_LINE: &str = r#"
       {"v":1,"kind":"snapshot","seq":1041,
        "daemon":{"id":"9f3c1000:1000"},
@@ -470,7 +475,7 @@ mod tests {
         assert_eq!(snapshot.daemon.unwrap().id, "9f3c1000:1000");
         assert_eq!(snapshot.sessions.len(), 1);
         assert_eq!(snapshot.sessions[0].status, SessionStatus::Working);
-        assert_eq!(snapshot.sessions[0].agent, Agent::Claude);
+        assert_eq!(snapshot.sessions[0].agent, agent("claude"));
         assert_eq!(snapshot.sessions[0].source, Source::Hook);
         let foreground = snapshot.foreground.unwrap();
         assert_eq!(foreground[0].pid, 4471);

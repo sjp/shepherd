@@ -435,6 +435,11 @@ mod tests {
     use std::io::Seek;
 
     use agentbus_protocol::{Agent, Kind};
+
+    /// Builds an agent id from a literal, which is what every one of these is.
+    fn agent(name: &str) -> Agent {
+        Agent::new(name).expect("a test's own agent id is a valid one")
+    }
     use serde_json::json;
 
     use super::*;
@@ -481,7 +486,7 @@ mod tests {
             ..Request::default()
         };
         let event = normalize(&request, &hook_payload()).expect("that should have been an event");
-        assert_eq!(event.agent, Agent::Claude);
+        assert_eq!(event.agent, agent("claude"));
         assert_eq!(event.kind, Kind::TurnStart);
         assert_eq!(event.source, Source::Hook);
         assert_eq!(

@@ -25,6 +25,11 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Builds an agent id from a literal, which is what every one of these is.
+fn agent(name: &str) -> Agent {
+    Agent::new(name).expect("a test's own agent id is a valid one")
+}
+
 /// How long a test waits for something that should happen almost at once.
 const PATIENCE: Duration = Duration::from_secs(10);
 
@@ -214,7 +219,7 @@ fn now() -> Timestamp {
 fn reported(session: &str, status: SessionStatus, origin: Vec<OriginHop>) -> SessionEntry {
     SessionEntry {
         session: session.to_owned(),
-        agent: Agent::Claude,
+        agent: agent("claude"),
         status,
         source: Source::Hook,
         cwd: Some("/srv/project".to_owned()),
@@ -361,14 +366,14 @@ fn an_event_from_there_is_renumbered_here_and_keeps_the_number_it_had() {
     let far = Canned::saying(&[
         line(&Snapshot::new(41, Vec::new())),
         line(
-            &UnstampedEvent::new(Agent::Claude, "abc123", Kind::ToolStart)
+            &UnstampedEvent::new(agent("claude"), "abc123", Kind::ToolStart)
                 .with_correlation(SLOT)
                 .with_raw(json!({"tool": "Bash"}))
                 .stamp(77, now()),
         ),
-        line(&UnstampedEvent::new(Agent::Claude, "abc123", Kind::TurnEnd).stamp(78, now())),
+        line(&UnstampedEvent::new(agent("claude"), "abc123", Kind::TurnEnd).stamp(78, now())),
         line(
-            &UnstampedEvent::new(Agent::Claude, "abc123", Kind::Error)
+            &UnstampedEvent::new(agent("claude"), "abc123", Kind::Error)
                 .with_raw(json!("it went wrong"))
                 .stamp(79, now()),
         ),
@@ -431,7 +436,7 @@ fn a_heartbeat_from_there_is_never_passed_on() {
         line(&Snapshot::new(41, Vec::new())),
         line(&Heartbeat::new(42, now())),
         line(&Heartbeat::new(43, now())),
-        line(&UnstampedEvent::new(Agent::Claude, "abc123", Kind::ToolStart).stamp(44, now())),
+        line(&UnstampedEvent::new(agent("claude"), "abc123", Kind::ToolStart).stamp(44, now())),
     ]);
     let _attachment = attached(&bus, Arc::new(far));
 
@@ -458,7 +463,7 @@ fn a_chain_the_far_end_already_carried_stays_behind_this_one() {
             )],
         )),
         line(
-            &UnstampedEvent::new(Agent::Claude, "abc123", Kind::ToolStart)
+            &UnstampedEvent::new(agent("claude"), "abc123", Kind::ToolStart)
                 .with_origin(vec![container()])
                 .stamp(42, now()),
         ),
@@ -707,9 +712,9 @@ fn detaching_ends_what_the_far_end_was_speaking_for_and_leaves_it_running() {
 #[test]
 fn the_deeper_of_two_views_of_one_slot_is_the_one_that_is_reported() {
     let bus = Arc::new(Bus::new());
-    let observed = |agent: &str, origin: Vec<OriginHop>| SessionEntry {
+    let observed = |agent: Agent, origin: Vec<OriginHop>| SessionEntry {
         session: observed_session_id(SLOT),
-        agent: agent.into(),
+        agent,
         status: SessionStatus::Working,
         source: Source::Observed,
         cwd: None,
@@ -721,12 +726,12 @@ fn the_deeper_of_two_views_of_one_slot_is_the_one_that_is_reported() {
     // further in can see that it is claude. Both are guesses about one slot.
     let near = Canned::running(&[held(&[line(&Snapshot::new(
         1,
-        vec![observed(Agent::UNKNOWN, Vec::new())],
+        vec![observed(Agent::unknown(), Vec::new())],
     ))])])
     .identified("near", "near");
     let far = Canned::running(&[held(&[line(&Snapshot::new(
         1,
-        vec![observed("claude", vec![container()])],
+        vec![observed(agent("claude"), vec![container()])],
     ))])])
     .identified("far", "far");
 
@@ -834,7 +839,7 @@ fn a_line_of_a_kind_this_build_has_never_heard_of_is_skipped() {
         line(&Snapshot::new(41, Vec::new())),
         line(&json!({"v": 1, "kind": "invented_later", "seq": 42})),
         String::from("this is not json at all"),
-        line(&UnstampedEvent::new(Agent::Claude, "abc123", Kind::ToolStart).stamp(43, now())),
+        line(&UnstampedEvent::new(agent("claude"), "abc123", Kind::ToolStart).stamp(43, now())),
     ]);
     let _attachment = attached(&bus, Arc::new(far));
 

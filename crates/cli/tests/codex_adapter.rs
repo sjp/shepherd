@@ -14,6 +14,11 @@ use agentbus_cli::adapters::codex;
 use agentbus_protocol::{Agent, Kind, Source};
 use serde_json::{Value, json};
 
+/// Builds an agent id from a literal, which is what every one of these is.
+fn agent(name: &str) -> Agent {
+    Agent::new(name).expect("a test's own agent id is a valid one")
+}
+
 /// The event a fixture must produce.
 struct Expected {
     /// The fixture's file name, without its extension.
@@ -108,7 +113,7 @@ fn every_fixture_maps_to_its_expected_kind_and_detail() {
             detail.map(|build| build()),
             "{stem}"
         );
-        assert_eq!(event.agent, Agent::Codex, "{stem}");
+        assert_eq!(event.agent, agent("codex"), "{stem}");
         assert_eq!(event.source, Source::Hook, "{stem}");
         assert_eq!(event.session, raw["session_id"].as_str().unwrap(), "{stem}");
         assert_eq!(event.cwd.as_deref(), raw["cwd"].as_str(), "{stem}");

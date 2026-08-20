@@ -286,6 +286,11 @@ mod tests {
     use super::*;
     use crate::event::{Agent, UnstampedEvent};
 
+    /// Builds an agent id from a literal, which is what every one of these is.
+    fn agent(name: &str) -> Agent {
+        Agent::new(name).expect("a test's own agent id is a valid one")
+    }
+
     use SessionStatus::{Blocked, Done, Idle, Stale, Starting, Working};
 
     /// A timestamp `seconds` after 2026-08-17T10:00:00Z. Every test works in
@@ -308,11 +313,11 @@ mod tests {
     }
 
     fn event(kind: Kind, seconds: u64) -> Event {
-        UnstampedEvent::new(Agent::Claude, "abc123", kind).stamp(seconds, at(seconds))
+        UnstampedEvent::new(agent("claude"), "abc123", kind).stamp(seconds, at(seconds))
     }
 
     fn observed(kind: Kind, seconds: u64) -> Event {
-        UnstampedEvent::new(Agent::Claude, "observed:w9:p3", kind)
+        UnstampedEvent::new(agent("claude"), "observed:w9:p3", kind)
             .with_source(Source::Observed)
             .stamp(seconds, at(seconds))
     }
@@ -424,7 +429,7 @@ mod tests {
     #[test]
     fn a_kind_this_build_does_not_know_is_alive_but_says_nothing() {
         let fold = Fold::new();
-        let unknown = UnstampedEvent::new(Agent::Claude, "abc123", Kind::from("invented_later"))
+        let unknown = UnstampedEvent::new(agent("claude"), "abc123", Kind::from("invented_later"))
             .stamp(1, at(10));
         for status in SessionStatus::ALL {
             let next = feed(&fold, Some(state_in(status)), Input::Event(&unknown));

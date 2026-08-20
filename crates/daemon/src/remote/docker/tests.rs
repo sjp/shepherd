@@ -30,6 +30,11 @@ use super::{Containers, Docker, listing, project};
 use crate::bus::Bus;
 use crate::remote::attach;
 
+/// Builds an agent id from a literal, which is what every one of these is.
+fn agent(name: &str) -> Agent {
+    Agent::new(name).expect("a test's own agent id is a valid one")
+}
+
 /// The version these tests provision.
 ///
 /// Deliberately not this build's: the bootstrap script looks for a person's own
@@ -290,7 +295,7 @@ fn said() -> (String, String) {
         1,
         vec![SessionEntry {
             session: format!("session-in-{WHERE}"),
-            agent: Agent::Claude,
+            agent: agent("claude"),
             status: SessionStatus::Blocked,
             source: Source::Hook,
             cwd: None,

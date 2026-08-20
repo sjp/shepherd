@@ -1004,6 +1004,11 @@ mod tests {
     use agentbus_protocol::{Agent, Kind, Source, observed_session_id};
     use serde_json::{Map, json};
 
+    /// Builds an agent id from a literal, which is what every one of these is.
+    fn agent(name: &str) -> Agent {
+        Agent::new(name).expect("a test's own agent id is a valid one")
+    }
+
     /// A bus that is watching a process table, as one with a monitor behind it
     /// is.
     fn watching() -> Bus {
@@ -1069,7 +1074,7 @@ mod tests {
     }
 
     fn key(session: &str) -> SessionKey {
-        SessionKey::new("claude", session)
+        SessionKey::new(agent("claude"), session)
     }
 
     /// What the bus says about one session, which it was expected to know.
@@ -1089,7 +1094,7 @@ mod tests {
         let event = bus.ingest(&line(&tool_start())).unwrap();
 
         assert_eq!(event.seq, 1);
-        assert_eq!(event.agent, Agent::Claude);
+        assert_eq!(event.agent, agent("claude"));
         assert_eq!(event.kind, Kind::ToolStart);
         assert_eq!(bus.last_seq(), 1);
         assert_eq!(bus.recent(), vec![event.clone()]);
@@ -1336,7 +1341,7 @@ mod tests {
     fn relayed(session: &str) -> SessionEntry {
         SessionEntry {
             session: session.to_owned(),
-            agent: Agent::Claude,
+            agent: agent("claude"),
             status: SessionStatus::Blocked,
             source: Source::Hook,
             cwd: None,
@@ -1529,7 +1534,7 @@ mod tests {
         event["source"] = json!("observed");
         event["correlation"] = json!("w9:p3");
         bus.ingest(&line(&event));
-        let observed = SessionKey::new(Agent::UNKNOWN, observed_session_id("w9:p3"));
+        let observed = SessionKey::new(Agent::unknown(), observed_session_id("w9:p3"));
         assert_eq!(bus.bound_to(&observed), Some(4471));
 
         bus.observed(&[withdrawn("w9:p3", 100, Some(4471))], &now());

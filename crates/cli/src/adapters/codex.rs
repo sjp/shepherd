@@ -22,10 +22,10 @@
 //! happened is the same thing, and a subscriber that only cares that a
 //! compaction occurred should not have to know there are two spellings of it.
 
-use agentbus_protocol::{Agent, Kind, UnstampedEvent};
+use agentbus_protocol::{Kind, UnstampedEvent};
 use serde_json::Value;
 
-use super::{field, string, tool};
+use super::{agent, field, string, tool};
 
 /// Normalizes one Codex CLI hook payload.
 ///
@@ -57,7 +57,7 @@ pub fn normalize(raw: &Value) -> Option<UnstampedEvent> {
         _ => return None,
     };
 
-    let mut event = UnstampedEvent::new(Agent::Codex, session, kind).with_raw(raw.clone());
+    let mut event = UnstampedEvent::new(agent("codex"), session, kind).with_raw(raw.clone());
     if let Some(cwd) = string(payload, "cwd") {
         event = event.with_cwd(cwd);
     }

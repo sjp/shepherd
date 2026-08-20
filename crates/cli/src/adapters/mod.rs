@@ -20,7 +20,19 @@ pub mod codex;
 pub mod observed;
 pub mod opencode;
 
+use agentbus_protocol::Agent;
 use serde_json::{Map, Value};
+
+/// The agent id a module here emits under.
+///
+/// The id is a literal this crate chose for a payload shape it understands, so
+/// the validation [`Agent::new`] performs cannot fail on it. Going through the
+/// constructor anyway is what keeps that true: a module that changed its own id
+/// to something unusable fails here, loudly and in its own tests, rather than
+/// putting it on the wire.
+fn agent(name: &str) -> Agent {
+    Agent::new(name).expect("an adapter's own agent id is valid by construction")
+}
 
 /// The value of a string field, if it is there and is a string.
 ///

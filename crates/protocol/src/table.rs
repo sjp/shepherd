@@ -478,6 +478,11 @@ mod tests {
     use super::*;
     use crate::event::{Kind, UnstampedEvent};
 
+    /// Builds an agent id from a literal, which is what every one of these is.
+    fn agent(name: &str) -> Agent {
+        Agent::new(name).expect("a test's own agent id is a valid one")
+    }
+
     use SessionStatus::{Blocked, Done, Idle, Stale, Starting, Working};
 
     /// The opaque string every session in these tests is correlated to. Its
@@ -504,7 +509,7 @@ mod tests {
 
     /// An agent reporting itself from the slot every test works in.
     fn hook(session: &str, kind: Kind, second: u64) -> Event {
-        UnstampedEvent::new(Agent::Claude, session, kind)
+        UnstampedEvent::new(agent("claude"), session, kind)
             .with_correlation(SLOT)
             .stamp(second, at(second))
     }
@@ -512,7 +517,7 @@ mod tests {
     /// Something watching that slot from the outside. It knows the slot and
     /// synthesizes a session id from it; it may or may not know the agent.
     fn observed(kind: Kind, second: u64) -> Event {
-        observed_by(Agent::UNKNOWN, Vec::new(), kind, second)
+        observed_by(Agent::unknown(), Vec::new(), kind, second)
     }
 
     /// A watcher `origin` hops away, which named the agent if it could tell.
@@ -618,7 +623,7 @@ mod tests {
     fn a_session_is_created_by_whatever_event_arrives_first() {
         let table = table_of(&[hook("abc123", Kind::ToolStart, 4)]);
         let session = table
-            .get(&SessionKey::new(Agent::Claude, "abc123"))
+            .get(&SessionKey::new(agent("claude"), "abc123"))
             .expect("the event created it");
         assert_eq!(session.state.status, Working);
         assert_eq!(session.state.since, at(4));
@@ -634,19 +639,19 @@ mod tests {
         // twice is one.
         let table = table_of(&[
             hook("s", Kind::ToolStart, 0),
-            UnstampedEvent::new(Agent::Codex, "s", Kind::ToolStart).stamp(1, at(1)),
+            UnstampedEvent::new(agent("codex"), "s", Kind::ToolStart).stamp(1, at(1)),
             hook("s", Kind::TurnEnd, 2),
         ]);
         assert_eq!(table.len(), 2);
-        assert_eq!(status_of(&table, Agent::Claude, "s"), Some(Idle));
-        assert_eq!(status_of(&table, Agent::Codex, "s"), Some(Working));
+        assert_eq!(status_of(&table, agent("claude"), "s"), Some(Idle));
+        assert_eq!(status_of(&table, agent("codex"), "s"), Some(Working));
     }
 
     #[test]
     fn the_working_directory_and_the_correlation_follow_the_newest_event_to_report_one() {
         let mut table = SessionTable::new();
         let with_cwd = |cwd: Option<&str>, correlation: Option<&str>, second: u64| {
-            let mut event = UnstampedEvent::new(Agent::Claude, "abc123", Kind::ToolStart);
+            let mut event = UnstampedEvent::new(agent("claude"), "abc123", Kind::ToolStart);
             event.cwd = cwd.map(str::to_owned);
             event.correlation = correlation.map(str::to_owned);
             event.stamp(second, at(second))
@@ -655,7 +660,7 @@ mod tests {
         table.apply_event(&with_cwd(Some("/srv/project"), Some(SLOT), 0));
         let known = |table: &SessionTable| {
             let session = table
-                .get(&SessionKey::new(Agent::Claude, "abc123"))
+                .get(&SessionKey::new(agent("claude"), "abc123"))
                 .unwrap();
             (session.cwd.clone(), session.correlation.clone())
         };
@@ -691,7 +696,7 @@ mod tests {
         // worth anything if it never changes under a reader.
         let mut table = SessionTable::new();
         table.apply_event(&observed(Kind::ToolStart, 0));
-        let key = SessionKey::new(Agent::UNKNOWN, observed_session_id(SLOT));
+        let key = SessionKey::new(Agent::unknown(), observed_session_id(SLOT));
         assert_eq!(table.get(&key).unwrap().source, Source::Observed);
 
         let mut claimed = observed(Kind::ToolEnd, 1);
@@ -726,7 +731,7 @@ mod tests {
                     "one agent in one slot is one row, not {}: {so_far:?}",
                     entries.len()
                 );
-                match status_of(&table, Agent::Claude, "abc123") {
+                match status_of(&table, agent("claude"), "abc123") {
                     // The agent is speaking for itself: that is the row, and it
                     // says what the agent says, never what the watcher inferred.
                     Some(status) => {
@@ -798,7 +803,7 @@ mod tests {
         // nothing else: an agent that is really running is never hidden.
         let table = table_of(&[
             hook("abc123", Kind::ToolStart, 0),
-            UnstampedEvent::new(Agent::Codex, "def456", Kind::Blocked)
+            UnstampedEvent::new(agent("codex"), "def456", Kind::Blocked)
                 .with_correlation(SLOT)
                 .with_origin(vec![container("a1b2c3", "eager_mclean")])
                 .stamp(1, at(1)),
@@ -823,23 +828,28 @@ mod tests {
         };
 
         // One view of the slot, from the machine it is on.
-        let table = table_of(&[observed_by(Agent::UNKNOWN, Vec::new(), Kind::ToolStart, 0)]);
+        let table = table_of(&[observed_by(
+            Agent::unknown(),
+            Vec::new(),
+            Kind::ToolStart,
+            0,
+        )]);
         assert_eq!(depths(&table), [0]);
 
         // The host can see that something is running in the slot; the daemon in
         // the container that something is a shell into can see that it is
         // claude. Both are guesses about one slot, and the inner one is better.
         let table = table_of(&[
-            observed_by(Agent::UNKNOWN, Vec::new(), Kind::ToolStart, 0),
+            observed_by(Agent::unknown(), Vec::new(), Kind::ToolStart, 0),
             observed_by(
-                Agent::Claude,
+                agent("claude"),
                 vec![container("a1b2c3", "eager_mclean")],
                 Kind::ToolStart,
                 1,
             ),
         ]);
         assert_eq!(depths(&table), [1]);
-        assert_eq!(table.snapshot_sessions()[0].agent, Agent::Claude);
+        assert_eq!(table.snapshot_sessions()[0].agent, agent("claude"));
         assert_eq!(
             table.len(),
             2,
@@ -848,9 +858,9 @@ mod tests {
 
         // Nesting is ordinary: ssh to a machine that runs containers.
         let table = table_of(&[
-            observed_by(Agent::UNKNOWN, vec![ssh("9f3c:1000")], Kind::ToolStart, 0),
+            observed_by(Agent::unknown(), vec![ssh("9f3c:1000")], Kind::ToolStart, 0),
             observed_by(
-                Agent::Claude,
+                agent("claude"),
                 vec![ssh("9f3c:1000"), container("a1b2c3", "eager_mclean")],
                 Kind::ToolStart,
                 1,
@@ -866,7 +876,7 @@ mod tests {
         // agents.
         let table = table_of(&[
             hook("abc123", Kind::ToolStart, 0),
-            UnstampedEvent::new(Agent::Codex, "def456", Kind::ToolStart)
+            UnstampedEvent::new(agent("codex"), "def456", Kind::ToolStart)
                 .with_correlation(SLOT)
                 .with_origin(vec![container("a1b2c3", "eager_mclean")])
                 .stamp(1, at(1)),
@@ -880,13 +890,13 @@ mod tests {
         // differently; a name that changed is not a session that moved.
         let mut table = SessionTable::new();
         let first = observed_by(
-            Agent::Claude,
+            agent("claude"),
             vec![container("a1b2c3", "eager_mclean")],
             Kind::ToolStart,
             0,
         );
         let renamed = observed_by(
-            Agent::Claude,
+            agent("claude"),
             vec![container("a1b2c3", "brave_hopper")],
             Kind::ToolEnd,
             1,
@@ -907,13 +917,13 @@ mod tests {
     fn a_second_origin_for_one_session_is_reported_rather_than_merged() {
         let mut table = SessionTable::new();
         table.apply_event(&observed_by(
-            Agent::Claude,
+            agent("claude"),
             vec![container("a1b2c3", "eager_mclean")],
             Kind::ToolStart,
             0,
         ));
         let elsewhere = observed_by(
-            Agent::Claude,
+            agent("claude"),
             vec![container("d4e5f6", "eager_mclean")],
             Kind::TurnEnd,
             1,
@@ -922,7 +932,7 @@ mod tests {
         assert_eq!(
             table.apply_event(&elsewhere),
             Some(OriginConflict {
-                key: SessionKey::new(Agent::Claude, observed_session_id(SLOT)),
+                key: SessionKey::new(agent("claude"), observed_session_id(SLOT)),
                 recorded: vec![container("a1b2c3", "eager_mclean")],
                 rejected: vec![container("d4e5f6", "eager_mclean")],
             })
@@ -1004,11 +1014,11 @@ mod tests {
         table.apply_event(&hook("abc123", Kind::ToolStart, 0));
         table.apply_event(&hook("def456", Kind::ToolStart, 1));
         table.tick(&at(5));
-        assert_eq!(status_of(&table, Agent::Claude, "abc123"), Some(Stale));
-        assert_eq!(status_of(&table, Agent::Claude, "def456"), Some(Working));
+        assert_eq!(status_of(&table, agent("claude"), "abc123"), Some(Stale));
+        assert_eq!(status_of(&table, agent("claude"), "def456"), Some(Working));
 
         table.tick(&at(6));
-        assert_eq!(status_of(&table, Agent::Claude, "def456"), Some(Stale));
+        assert_eq!(status_of(&table, agent("claude"), "def456"), Some(Stale));
     }
 
     #[test]
@@ -1019,12 +1029,12 @@ mod tests {
         ]);
 
         // A process nobody has heard of does not conjure a session.
-        table.process_gone(&SessionKey::new(Agent::Codex, "ghi789"), &at(2));
+        table.process_gone(&SessionKey::new(agent("codex"), "ghi789"), &at(2));
         assert_eq!(table.len(), 2);
 
-        table.process_gone(&SessionKey::new(Agent::Claude, "abc123"), &at(2));
-        assert_eq!(status_of(&table, Agent::Claude, "abc123"), Some(Done));
-        assert_eq!(status_of(&table, Agent::Claude, "def456"), Some(Working));
+        table.process_gone(&SessionKey::new(agent("claude"), "abc123"), &at(2));
+        assert_eq!(status_of(&table, agent("claude"), "abc123"), Some(Done));
+        assert_eq!(status_of(&table, agent("claude"), "def456"), Some(Working));
     }
 
     #[test]
@@ -1032,7 +1042,7 @@ mod tests {
         let table = table_of(&[
             hook("later", Kind::ToolStart, 30),
             hook("first", Kind::ToolStart, 10),
-            UnstampedEvent::new(Agent::Codex, "same-moment", Kind::ToolStart).stamp(20, at(20)),
+            UnstampedEvent::new(agent("codex"), "same-moment", Kind::ToolStart).stamp(20, at(20)),
             hook("same-moment", Kind::ToolStart, 20),
         ]);
 
@@ -1044,12 +1054,12 @@ mod tests {
         assert_eq!(
             sessions,
             [
-                (Agent::Claude, "first".to_owned()),
+                (agent("claude"), "first".to_owned()),
                 // Two sessions that began in the same moment fall back to the
                 // key, so the order never depends on which arrived first.
-                (Agent::Claude, "same-moment".to_owned()),
-                (Agent::Codex, "same-moment".to_owned()),
-                (Agent::Claude, "later".to_owned()),
+                (agent("claude"), "same-moment".to_owned()),
+                (agent("codex"), "same-moment".to_owned()),
+                (agent("claude"), "later".to_owned()),
             ]
         );
         assert_eq!(table.snapshot_sessions(), table.snapshot_sessions());
@@ -1084,7 +1094,7 @@ mod tests {
     fn reported_by_another(status: SessionStatus, second: u64) -> SessionEntry {
         SessionEntry {
             session: "abc123".to_owned(),
-            agent: Agent::Claude,
+            agent: agent("claude"),
             status,
             source: Source::Hook,
             cwd: Some("/srv/project".to_owned()),
@@ -1100,7 +1110,7 @@ mod tests {
 
         let key = table.seed(&reported_by_another(Blocked, 5), &at(100));
 
-        assert_eq!(key, SessionKey::new(Agent::Claude, "abc123"));
+        assert_eq!(key, SessionKey::new(agent("claude"), "abc123"));
         let session = table.get(&key).expect("the session was not seeded");
         assert_eq!(session.state.status, Blocked);
         // The far end's own reckoning of how long it has been blocked survives,
@@ -1125,7 +1135,7 @@ mod tests {
 
         assert_eq!(table.len(), 1);
         let session = table
-            .get(&SessionKey::new(Agent::Claude, "abc123"))
+            .get(&SessionKey::new(agent("claude"), "abc123"))
             .expect("the session went missing");
         assert_eq!(session.state.status, Working);
         assert_eq!(session.state.since, at(110));
@@ -1142,9 +1152,9 @@ mod tests {
         table.seed(&reported_by_another(Working, 0), &at(100));
         table.tick(&at(101));
 
-        assert_eq!(status_of(&table, Agent::Claude, "abc123"), Some(Working));
+        assert_eq!(status_of(&table, agent("claude"), "abc123"), Some(Working));
         table.tick(&at(106));
-        assert_eq!(status_of(&table, Agent::Claude, "abc123"), Some(Stale));
+        assert_eq!(status_of(&table, agent("claude"), "abc123"), Some(Stale));
     }
 
     #[test]
@@ -1152,11 +1162,11 @@ mod tests {
         let mut table = SessionTable::new();
         table.seed(&reported_by_another(Blocked, 5), &at(100));
 
-        table.ended(&SessionKey::new(Agent::Codex, "never-heard-of"), &at(101));
+        table.ended(&SessionKey::new(agent("codex"), "never-heard-of"), &at(101));
         assert_eq!(table.len(), 1);
 
-        table.ended(&SessionKey::new(Agent::Claude, "abc123"), &at(101));
-        assert_eq!(status_of(&table, Agent::Claude, "abc123"), Some(Done));
+        table.ended(&SessionKey::new(agent("claude"), "abc123"), &at(101));
+        assert_eq!(status_of(&table, agent("claude"), "abc123"), Some(Done));
         // And it leaves on the ordinary retention, like any finished session.
         table.tick(&at(140));
         assert!(table.is_empty());
@@ -1172,7 +1182,7 @@ mod tests {
         assert!(table.snapshot_sessions().is_empty());
         assert!(
             table
-                .get(&SessionKey::new(Agent::Claude, "abc123"))
+                .get(&SessionKey::new(agent("claude"), "abc123"))
                 .is_none()
         );
     }
