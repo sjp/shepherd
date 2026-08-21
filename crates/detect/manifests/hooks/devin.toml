@@ -1,0 +1,51 @@
+id = "devin"
+version = "2026.08.21.1"
+min_engine_version = 1
+updated_at = "2026-08-21T00:00:00Z"
+aliases = ["devin-cli", "devin cli"]
+
+# The hook payload follows the shape this agent's event names come from: a field
+# naming the event, a session id beside it. Two spellings of the session are
+# accepted because this agent's own hook scripts read both, and taking the second
+# costs one lookup where missing it would cost every event in a session.
+#
+# The working directory has not been seen in a captured payload from this agent —
+# its own scripts take the directory from the environment instead — so the field
+# below is the one the shared shape uses and is a guess until a real payload
+# says otherwise. A payload that does not carry it simply reports no directory,
+# which is what makes the guess cheap to be wrong about.
+[payload]
+event = "hook_event_name"
+session = ["session_id", "sessionId"]
+cwd = ["cwd"]
+
+[[events]]
+name = "SessionStart"
+kind = "session_start"
+
+[[events]]
+name = "UserPromptSubmit"
+kind = "turn_start"
+
+[[events]]
+name = "Stop"
+kind = "turn_end"
+
+# Nothing is projected beside the two tool events. The field naming the tool has
+# not been read off a captured payload from this agent, and a detail projected
+# from a field that turns out to be spelled differently is a key that is silently
+# always absent — worse than not claiming to report the tool at all.
+[[events]]
+name = "PreToolUse"
+kind = "tool_start"
+
+[[events]]
+name = "PostToolUse"
+kind = "tool_end"
+
+# Asked for outright, so nothing has to discriminate a general-purpose
+# notification into "waiting on a person" and "not". Leaving the block is
+# inferred from the activity that follows; that gap is the agent's.
+[[events]]
+name = "PermissionRequest"
+kind = "blocked"

@@ -1,0 +1,16 @@
+id = "droid"
+version = "2026.08.21.1"
+min_engine_version = 1
+updated_at = "2026-08-21T00:00:00Z"
+
+# One event is hooked for this agent, and what it is wanted for is the identity
+# of the session that has just started. The field names below follow the shape
+# this agent's event names come from and are the ones its own hook scripts read.
+[payload]
+event = "hook_event_name"
+session = ["session_id"]
+cwd = ["cwd"]
+
+[[events]]
+name = "SessionStart"
+kind = "session_start"

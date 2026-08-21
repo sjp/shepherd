@@ -1587,3 +1587,44 @@ going to.
 The hook mapping is deliberately not trimmed to match. Mapping is data: it says
 what an event means if one arrives, and payloads for events this build does not
 ask for simply stop arriving.
+
+## 2026-08-21 — the agents configured by a nested `hooks` object
+
+### One installer, four descriptions
+
+**The agents whose settings file holds a `hooks` object of event names share a
+single installer, parameterized by what differs.** Four of them are configured
+identically — a JSON settings file, a `hooks` key, an object of event names, each
+an array of `{matcher?, hooks: [{type, command, timeout}]}` entries — and what
+varies is a path, a list of events, whether the entry carries a matcher, and one
+agent's choice to read the timeout in milliseconds rather than seconds.
+
+Four modules would mean four copies of the same care about backups, marks,
+refusals, ordering and reversal. They would not stay four copies: a fix applied
+where it was noticed and nowhere else is how a family of near-identical
+installers turns into a family of subtly different ones, and the differences that
+matter here are invisible until somebody's session is slower or quieter than it
+should be. So there is one installer and four descriptions of an agent, and a
+fifth agent configured this way is a fifth description.
+
+The line to hold is what goes into the description. Paths, event tables and field
+units belong there. If a fifth agent needs something the shape itself does not
+have — a differently-nested key, a second file, an entry that is not an entry —
+that is a different idiom wearing this one's clothes, and it gets its own module
+rather than a fifth field nothing else sets.
+
+### A configuration directory that is not there is a refusal
+
+**These installers never create the agent's own configuration directory.** Where
+Claude, Codex and OpenCode get theirs made for them, a `~/.factory` that does not
+exist means Droid has never run on this machine, and the install stops and says
+so.
+
+The difference is what the directory is evidence of. For the agents this program
+has installed for longest, the config directory is somewhere hooks are dropped
+and the agent is known to be present by other means. For these four, its absence
+is the only signal available that the agent is not installed — and creating it
+anyway would mean guessing at another program's layout, writing a settings file
+into a directory that program may never read, and leaving this program answerable
+for a directory it invented. Saying "install the agent first" costs a user one
+line and nothing else.

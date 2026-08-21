@@ -109,6 +109,30 @@ pub const CODEX_WRAPPER: Asset = Asset::pair(
     include_str!("../assets/codex/agentbus.ps1"),
 );
 
+/// The wrapper Devin runs on each of its events.
+pub const DEVIN_WRAPPER: Asset = Asset::pair(
+    include_str!("../assets/devin/agentbus.sh"),
+    include_str!("../assets/devin/agentbus.ps1"),
+);
+
+/// The wrapper Droid runs on each of its events.
+pub const DROID_WRAPPER: Asset = Asset::pair(
+    include_str!("../assets/droid/agentbus.sh"),
+    include_str!("../assets/droid/agentbus.ps1"),
+);
+
+/// The wrapper Qoder runs on each of its events.
+pub const QODERCLI_WRAPPER: Asset = Asset::pair(
+    include_str!("../assets/qodercli/agentbus.sh"),
+    include_str!("../assets/qodercli/agentbus.ps1"),
+);
+
+/// The wrapper Qwen runs on each of its events.
+pub const QWEN_WRAPPER: Asset = Asset::pair(
+    include_str!("../assets/qwen/agentbus.sh"),
+    include_str!("../assets/qwen/agentbus.ps1"),
+);
+
 /// The plugin OpenCode loads out of its plugin directory, which is handed every
 /// event its plugin interface produces.
 pub const OPENCODE_PLUGIN: Asset = Asset::portable(include_str!("../assets/opencode/agentbus.js"));

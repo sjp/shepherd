@@ -40,6 +40,7 @@ pub mod file;
 pub mod json;
 mod lines;
 pub mod merge;
+pub mod nested_json;
 pub mod opencode;
 pub mod paths;
 pub mod sentinel;
@@ -115,6 +116,13 @@ pub enum Error {
         #[source]
         source: io::Error,
     },
+    /// The agent keeps its configuration somewhere that is not there, so it is
+    /// not on this machine to install into. Its directory is never made here:
+    /// one program creating another's home on the strength of a guess about its
+    /// layout leaves a directory the agent may never read and this program is
+    /// then answerable for.
+    #[error("{agent} keeps its configuration in {path}, which is not there; install {agent} first")]
+    Absent { agent: Agent, path: PathBuf },
     /// A file this program would write is one somebody else wrote.
     #[error(
         "{path} was not written by this program, so it is not this program's to replace; move it aside to install here"
@@ -208,7 +216,15 @@ pub trait Installer {
 /// command line, the report and the uninstall all agree on the same list
 /// without any of them naming an agent.
 pub fn installers() -> Vec<&'static dyn Installer> {
-    vec![&claude::Claude, &codex::Codex, &opencode::OpenCode]
+    vec![
+        &claude::Claude,
+        &codex::Codex,
+        &nested_json::DEVIN,
+        &nested_json::DROID,
+        &opencode::OpenCode,
+        &nested_json::QODERCLI,
+        &nested_json::QWEN,
+    ]
 }
 
 /// Every agent this build can install for.

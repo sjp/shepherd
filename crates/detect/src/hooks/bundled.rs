@@ -18,10 +18,17 @@
 pub(crate) const BUNDLED_HOOKS: &[(&str, &str)] = &[
     ("claude", include_str!("../../manifests/hooks/claude.toml")),
     ("codex", include_str!("../../manifests/hooks/codex.toml")),
+    ("devin", include_str!("../../manifests/hooks/devin.toml")),
+    ("droid", include_str!("../../manifests/hooks/droid.toml")),
     (
         "opencode",
         include_str!("../../manifests/hooks/opencode.toml"),
     ),
+    (
+        "qodercli",
+        include_str!("../../manifests/hooks/qodercli.toml"),
+    ),
+    ("qwen", include_str!("../../manifests/hooks/qwen.toml")),
 ];
 
 /// The bundled mappings.
@@ -35,13 +42,16 @@ pub(crate) fn bundled_hook_manifests() -> &'static [(&'static str, &'static str)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::CompiledHookManifest;
     use crate::hooks::schema::{HOOKS_ENGINE_VERSION, HookManifest};
     use crate::store::MAX_MANIFEST_BYTES;
+    use agentbus_protocol::Kind;
+    use serde_json::Value;
     use std::collections::HashSet;
 
     /// How many agents the bundled mappings cover. Asserted rather than derived
     /// so that a mapping dropped from the list has to be an explicit decision.
-    const BUNDLED_COUNT: usize = 3;
+    const BUNDLED_COUNT: usize = 7;
 
     #[test]
     fn every_bundled_manifest_loads_cleanly_under_the_key_it_is_filed_by() {
@@ -76,6 +86,121 @@ mod tests {
                 "bundled mapping {id:?} is {} bytes, over the {MAX_MANIFEST_BYTES}-byte limit \
                  every other tier is read under",
                 content.len(),
+            );
+        }
+    }
+
+    /// A payload as its agent delivers it, and what the mapping has to make of
+    /// it.
+    ///
+    /// One per bundled mapping, checked exhaustively below, because a mapping
+    /// that parses is not a mapping that works: every field name in it is a
+    /// claim about somebody else's payload, and the only way to hold a claim
+    /// like that to account is to hand it the payload and look at what comes
+    /// back. The session and the directory are spelled differently by every
+    /// agent here, which is exactly the thing the mapping exists to absorb.
+    const SESSION_STARTS: &[(&str, &str)] = &[
+        (
+            "claude",
+            r#"{"hook_event_name": "SessionStart", "session_id": "s1", "cwd": "/w"}"#,
+        ),
+        (
+            "codex",
+            r#"{"hook_event_name": "SessionStart", "session_id": "s1", "cwd": "/w"}"#,
+        ),
+        (
+            "devin",
+            r#"{"hook_event_name": "SessionStart", "session_id": "s1", "cwd": "/w"}"#,
+        ),
+        (
+            "droid",
+            r#"{"hook_event_name": "SessionStart", "session_id": "s1", "cwd": "/w"}"#,
+        ),
+        (
+            "opencode",
+            r#"{"type": "session.created", "sessionID": "s1", "directory": "/w"}"#,
+        ),
+        (
+            "qodercli",
+            r#"{"hook_event_name": "SessionStart", "session_id": "s1", "cwd": "/w"}"#,
+        ),
+        (
+            "qwen",
+            r#"{"hook_event_name": "SessionStart", "session_id": "s1", "cwd": "/w",                "source": "resume"}"#,
+        ),
+    ];
+
+    /// The mapping filed under `id`, ready to read a payload with.
+    fn compiled(id: &str) -> CompiledHookManifest {
+        let (_, content) = bundled_hook_manifests()
+            .iter()
+            .find(|(name, _)| *name == id)
+            .unwrap_or_else(|| panic!("no bundled mapping for {id:?}"));
+        let manifest = HookManifest::parse(content).expect("loadable");
+        manifest.validate().expect("valid");
+        CompiledHookManifest::compile(manifest)
+    }
+
+    #[test]
+    fn every_bundled_manifest_turns_its_agents_session_start_into_a_session_beginning() {
+        let covered: Vec<&str> = SESSION_STARTS.iter().map(|(id, _)| *id).collect();
+        let bundled: Vec<&str> = bundled_hook_manifests().iter().map(|(id, _)| *id).collect();
+        assert_eq!(covered, bundled, "every mapping needs a payload to answer");
+
+        for (id, payload) in SESSION_STARTS {
+            let payload: Value = serde_json::from_str(payload).expect("a payload");
+            let event = compiled(id)
+                .normalize(&payload)
+                .unwrap_or_else(|| panic!("{id} said nothing about a session starting"));
+
+            assert_eq!(event.agent.as_str(), *id);
+            assert_eq!(event.kind, Kind::SessionStart, "{id}");
+            assert_eq!(event.session, "s1", "{id}");
+            assert_eq!(event.cwd.as_deref(), Some("/w"), "{id}");
+            assert_eq!(event.raw.as_ref(), Some(&payload), "{id}");
+        }
+    }
+
+    #[test]
+    fn an_agent_that_says_why_a_session_began_has_it_reported() {
+        let payload: Value = serde_json::from_str(
+            r#"{"hook_event_name": "SessionStart", "session_id": "s1", "source": "resume"}"#,
+        )
+        .expect("a payload");
+
+        let event = compiled("qwen").normalize(&payload).expect("an event");
+
+        assert_eq!(
+            event.detail.expect("a detail")["source"],
+            Value::from("resume"),
+        );
+    }
+
+    #[test]
+    fn the_agent_registered_for_more_than_one_event_maps_all_of_them() {
+        let manifest = compiled("devin");
+        let expected = [
+            ("SessionStart", Kind::SessionStart),
+            ("UserPromptSubmit", Kind::TurnStart),
+            ("PreToolUse", Kind::ToolStart),
+            ("PostToolUse", Kind::ToolEnd),
+            ("PermissionRequest", Kind::Blocked),
+            ("Stop", Kind::TurnEnd),
+        ];
+
+        for (name, kind) in expected {
+            let payload: Value = serde_json::from_str(&format!(
+                r#"{{"hook_event_name": "{name}", "sessionId": "s1"}}"#
+            ))
+            .expect("a payload");
+
+            let event = manifest
+                .normalize(&payload)
+                .unwrap_or_else(|| panic!("{name} produced nothing"));
+            assert_eq!(event.kind, kind, "{name}");
+            assert_eq!(
+                event.session, "s1",
+                "{name} should read the second spelling of the session",
             );
         }
     }
