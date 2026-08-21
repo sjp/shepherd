@@ -14,7 +14,6 @@
 
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -179,11 +178,17 @@ pub fn remove_with_backups(path: &Path) -> io::Result<()> {
 ///
 /// A name that carries the infix but not a stamp this program could have
 /// written is not one of ours, and is left where it is.
+///
+/// The names are compared as the bytes a filename is made of rather than as
+/// text, because a directory being read may hold names this machine cannot
+/// spell — and one of those sitting next to a file is no reason to fail to find
+/// the backups of it. What is looked for is an infix and a run of digits, both
+/// of which mean the same thing in that encoding as they do in text.
 pub fn backups_of(path: &Path) -> io::Result<Vec<(u128, PathBuf)>> {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
         return Ok(Vec::new());
     };
-    let mut prefix = name.as_bytes().to_vec();
+    let mut prefix = name.as_encoded_bytes().to_vec();
     prefix.extend_from_slice(BACKUP_INFIX.as_bytes());
 
     let mut found = Vec::new();
@@ -194,7 +199,7 @@ pub fn backups_of(path: &Path) -> io::Result<Vec<(u128, PathBuf)>> {
     for entry in entries {
         let entry = entry?;
         let name = entry.file_name();
-        let Some(rest) = name.as_bytes().strip_prefix(&prefix[..]) else {
+        let Some(rest) = name.as_encoded_bytes().strip_prefix(&prefix[..]) else {
             continue;
         };
         let Some(stamp) = std::str::from_utf8(rest)

@@ -76,7 +76,7 @@ pub enum Error {
     /// There is no home directory, so nothing can be located.
     #[error(
         "{} is not set, so there is no way to tell where anything is",
-        paths::HOME_VAR
+        paths::home_vars()
     )]
     NoHome,
     /// A file could not be read.

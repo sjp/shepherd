@@ -59,3 +59,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo check
         run: cargo check --workspace --target x86_64-unknown-linux-musl
+
+  check-windows:
+    name: Check (x86_64-pc-windows-msvc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check
+        run: cargo check -p agentbus-install --target x86_64-pc-windows-msvc

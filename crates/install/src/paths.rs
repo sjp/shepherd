@@ -105,12 +105,10 @@ impl Environment {
     ///
     /// A home directory is the one thing there is no sensible fallback for:
     /// every path an agent's configuration lives at is relative to it, and
-    /// guessing would mean writing hooks into somebody else's dot-files.
+    /// guessing would mean writing hooks into somebody else's dot-files. What
+    /// there is instead is a second variable that names one — see [`home`].
     pub fn from_env() -> Result<Self, Error> {
-        let home = env::var_os(HOME_VAR)
-            .filter(|home| !home.is_empty())
-            .ok_or(Error::NoHome)?;
-        let home = PathBuf::from(home);
+        let home = home().ok_or(Error::NoHome)?;
         let state_dir = below(&home, env::var_os(STATE_HOME_VAR), DEFAULT_STATE_HOME);
         let data_dir = below(&home, env::var_os(DATA_HOME_VAR), DEFAULT_DATA_HOME);
         Ok(Self {
@@ -271,6 +269,57 @@ fn executable(_meta: &Metadata) -> bool {
     true
 }
 
+/// The user's home directory, as this machine says where it is.
+fn home() -> Option<PathBuf> {
+    chosen_home(named(HOME_VAR), named(USER_PROFILE_VAR), Platform::host())
+}
+
+/// Which of the two directories that could be a user's home is, given what a
+/// machine of `platform` says each of them is.
+///
+/// The unix variable first, on either kind of machine. A machine that runs its
+/// scripts by extension gives every user a profile directory and names it in a
+/// variable of its own, but a user of such a machine may also have a home
+/// directory in the unix sense — set by a shell that brings one with it — and
+/// somebody whose shell says where their home is has said where it is. So the
+/// profile directory is the answer only when nothing else is.
+///
+/// The second is only read on the machine it belongs to. Where it is set on the
+/// other kind it is somebody's own, and a program that quietly preferred it to
+/// no home directory at all would be writing hooks somewhere nobody asked for
+/// them.
+fn chosen_home(
+    home: Option<PathBuf>,
+    profile: Option<PathBuf>,
+    platform: Platform,
+) -> Option<PathBuf> {
+    home.or(match platform {
+        Platform::Windows => profile,
+        Platform::Unix => None,
+    })
+}
+
+/// The variables a home directory is read from on this machine, in the order
+/// they are read, as a person would say them.
+///
+/// Named for the message that has to be written when none of them says
+/// anything: somebody on a machine with no home directory has to be told which
+/// variables would have given it one, and being told about a variable their
+/// machine has never heard of would not help them.
+pub fn home_vars() -> &'static str {
+    match Platform::host() {
+        Platform::Windows => "HOME or USERPROFILE",
+        Platform::Unix => HOME_VAR,
+    }
+}
+
+/// What `var` holds, where it holds a path at all.
+fn named(var: &str) -> Option<PathBuf> {
+    env::var_os(var)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
 /// The directories the agents' own variables point their configuration at, and
 /// the ones the machine names for itself.
 ///
@@ -365,6 +414,38 @@ mod tests {
                 DEFAULT_STATE_HOME
             ),
             PathBuf::from("/home/u/.local/state/agentbus")
+        );
+    }
+
+    #[test]
+    fn a_machine_that_names_a_home_directory_twice_is_read_by_the_first_name() {
+        let home = || Some(PathBuf::from("/home/u"));
+        let profile = || Some(PathBuf::from("/c/Users/u"));
+
+        assert_eq!(
+            chosen_home(home(), profile(), Platform::Windows),
+            home(),
+            "a shell that brought a home directory with it has said where it is"
+        );
+        assert_eq!(chosen_home(None, profile(), Platform::Windows), profile());
+        assert_eq!(chosen_home(home(), None, Platform::Windows), home());
+        assert_eq!(chosen_home(None, None, Platform::Windows), None);
+    }
+
+    #[test]
+    fn the_profile_directory_is_not_a_home_directory_on_a_unix_machine() {
+        let profile = Some(PathBuf::from("/c/Users/u"));
+
+        assert_eq!(chosen_home(None, profile, Platform::Unix), None);
+    }
+
+    #[test]
+    fn the_variables_a_machine_is_asked_for_are_the_ones_it_would_answer() {
+        assert!(home_vars().contains(HOME_VAR));
+        assert_eq!(
+            home_vars().contains(USER_PROFILE_VAR),
+            Platform::host() == Platform::Windows,
+            "a variable this machine never reads is not one to name in a refusal"
         );
     }
 

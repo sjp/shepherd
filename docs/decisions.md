@@ -1800,3 +1800,62 @@ It is deliberately a narrower question than the one the report answers: agents
 that have *no* hooks are never mentioned, because having none was somebody's
 choice and a command that has just finished doing what it was told is no place
 to argue with it. Uninstalling says nothing at all, for the same reason.
+
+## 2026-08-21 — what Windows parity means, and where it stops
+
+### Parity is what gets installed, not what runs
+
+**Every one of the seventeen agents installs correctly on a machine that runs
+its scripts by extension, and none of them is gated off it.** That is the whole
+of the claim: the files a Windows machine needs are written where that machine
+keeps them, and the entries pointing at them are spelled the way that machine
+reads a command. Twelve agents get a PowerShell wrapper beside the shell one and
+an entry that runs it as `powershell -NoProfile -ExecutionPolicy Bypass -File
+"…"` — no profile, because a hook has to behave the same for every user on the
+machine, and the execution policy set aside for the one run, because a file this
+program just wrote is not the sort of downloaded script that policy exists to
+stop. One agent's hook runner puts what it is given through a shell of its own
+first, so its command goes over as base64 of UTF-16 instead, where there is
+nothing left for anything to reinterpret. The other five agents load a plugin
+with a runtime they brought with them, and their files are the same bytes on
+either kind of machine.
+
+Underneath that, three things about the machine itself are read rather than
+assumed: a home directory comes from the profile directory the machine gives
+every user when no shell has brought one along, one agent keeps its
+configuration under the application-data directory rather than in the profile
+when that is the case, and a command on the search path is looked for under
+each of the extensions an installer may have left it under as well as under its
+bare name. Nothing anywhere composes a path out of text, so whichever way a
+machine spells its own directories survives into everything built from them.
+
+### An installation that lands ahead of its client is inert, not broken
+
+**A wrapper's first act is to look for the binary it hands events to, and
+finding nothing there it exits reporting success.** This is not a concession for
+Windows: it is exactly what every wrapper does on a machine where the binary has
+been removed, and what the emit path itself does when no daemon is listening. So
+hooks installed on a Windows machine today do nothing at all, safely, and become
+live the day the client arrives without anybody having to install again.
+
+### The emit client and the daemon stay where they are, on purpose
+
+**`agentbus-install`, `agentbus-protocol` and `agentbus-detect` compile for
+`x86_64-pc-windows-msvc`; `agentbus-cli` does not, and is not meant to.** The
+command line links the daemon, and the daemon reaches for the things only a unix
+machine has — a socket that is a file in a directory, an advisory lock on that
+file, permission bits on both, and a user identified by a number. Those are not
+paths to be spelled differently; they are a second implementation of how the bus
+is reached, and doing it properly means a named pipe or a loopback socket in
+place of the unix socket, a lock the operating system holds for the process in
+place of the advisory one, and an identity taken from the account rather than
+from a number. That is a piece of work in its own right, and it is deferred
+until somebody actually wants to run the bus on such a machine.
+
+Continuous integration therefore checks exactly the crate that claims to work
+there, and checks it by compiling: `cargo check -p agentbus-install --target
+x86_64-pc-windows-msvc`, with no Windows runner and nothing executed. Everything
+that could be verified without such a machine is verified by describing one —
+every rule above is exercised from a test machine of that family, described from
+this one — and what is left over is a spot check on real hardware, which is the
+one thing a description cannot stand in for.
