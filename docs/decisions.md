@@ -1532,3 +1532,58 @@ data: it says what an event means if one arrives, and it costs nothing to know
 about events this build does not ask for. Payloads for unhooked events simply
 stop arriving, and an installation that hooks more of them later needs no change
 to the mappings at all.
+
+## 2026-08-21 — Codex moves onto a wrapper, and one key in `config.toml`
+
+### The setting that makes hooks work is switched on, in the file it lives in
+
+**This supersedes *Codex is installed by dropping into `hooks.json`, never into
+`config.toml`*, in one respect and no other.** The entries still go into
+`hooks.json`; what has changed is that `agentbus install --agent codex` now also
+ensures `hooks = true` under `[features]` in `~/.codex/config.toml`.
+
+The old entry was written when that file was purely a matter of taste. It is
+not: a current Codex does not read `hooks.json` at all until the setting is on.
+Without it the install writes the right bytes to the right paths, reports
+success, and produces nothing for the rest of the machine's life — which is the
+worst failure this program can have, because it looks exactly like a working
+installation and there is nowhere for the user to see otherwise.
+
+Against that, the edit is one key. It goes in through the line-by-line editor,
+which changes the line it is changing and copies every other byte of somebody's
+file through untouched, and which refuses the whole run rather than guess at a
+file it cannot read that way — a section written twice, a value that carries on
+past its line, a marker inside a multi-line string. So the envelope of what this
+program writes into a hand-kept file grew by exactly one line, in a file it
+already had to read.
+
+Whether the setting was *already* on is the one fact about it that cannot be
+read back off the disk afterwards: `hooks = true` looks the same whoever wrote
+it, and there is nowhere in a line like that to hang the mark this program's
+entries in a document carry. So it is recorded when it is known, as one more
+thing the record answers that the files cannot, and an uninstall switches the
+setting off only where the record says this program switched it on. A setting
+the user had on before is left exactly as it was found, and so is a `[features]`
+section they wrote.
+
+### Codex is installed the way every other agent is
+
+**A versioned wrapper script in `~/.codex/hooks/`, and one entry that runs it.**
+Codex used to be the one agent whose hooks named this program's binary directly,
+in eleven entries, one per event the mapping reads. Both halves of that are now
+what the rest of the agents get, for the reasons recorded against Claude the
+same week: a JSON entry has nowhere to carry a generation mark, so an
+installation made of entries alone can only be present or absent, and hooking
+every event is a process started inside somebody's session on every tool call
+for events nothing is waiting on. What the install needs from Codex is the
+identity of the session in front of it, which arrives on the first event of the
+session.
+
+The eleven entries an earlier build wrote need no migration code. They carry the
+mark, and a marked merge takes out everything marked before it puts the new
+entry in, so upgrading finds them and replaces them exactly as it was always
+going to.
+
+The hook mapping is deliberately not trimmed to match. Mapping is data: it says
+what an event means if one arrives, and payloads for events this build does not
+ask for simply stop arriving.

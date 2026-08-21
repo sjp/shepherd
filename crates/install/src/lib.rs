@@ -91,6 +91,14 @@ pub enum Error {
         #[source]
         problem: json::Problem,
     },
+    /// A file kept by hand could be read but not safely changed a line at a
+    /// time.
+    #[error("refusing to change {path}, which was left as it was")]
+    NotEditable {
+        path: PathBuf,
+        #[source]
+        problem: toml_text::Problem,
+    },
     /// A file holds something other than what an entry has to go into.
     #[error("{path} holds something unexpected at {at}, where this needs {needed}")]
     Conflict {

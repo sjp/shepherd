@@ -14,6 +14,13 @@
 //! program has no business editing or leaving half the work undone. So running
 //! somebody else's tool is a step like any other, planned alongside the writes
 //! and reported alongside them.
+//!
+//! One step changes nothing on the machine at all. Where an installation
+//! depends on a setting in somebody else's file being switched on, whether this
+//! program was the one to switch it on is a fact that exists only while the
+//! installation is being worked out — the line it wrote is indistinguishable
+//! from the line a user wrote — and the step that carries it is what puts it
+//! into the record before it is lost.
 
 use std::path::{Path, PathBuf};
 
@@ -59,6 +66,22 @@ pub enum Change {
     Run { command: Invocation },
     /// The agent's own tool already reports what running it would achieve.
     Ran { command: Invocation },
+    /// Who a setting in somebody else's file belongs to.
+    ///
+    /// Not a change to anything: the file it names is written by the step
+    /// beside this one, or was already right. What this carries is the one fact
+    /// about such a setting that cannot be read back off the disk afterwards —
+    /// whether this program was the one that switched it on — because a line
+    /// switching something on looks the same whoever wrote it, and an uninstall
+    /// that guessed would either leave it on for ever or switch off something
+    /// the user switched on themselves.
+    Setting {
+        path: PathBuf,
+        /// The setting, named the way the file names it.
+        setting: String,
+        /// Whether it is this program's to switch off again.
+        ours: bool,
+    },
 }
 
 impl Change {
@@ -71,7 +94,10 @@ impl Change {
             | Self::Delete { path }
             | Self::Keep { path }
             | Self::Clear { path } => Some(path),
-            Self::Run { .. } | Self::Ran { .. } => None,
+            // The setting is one line inside a file another step is already
+            // about, and a report that named the file twice would be saying
+            // that two things had happened to it.
+            Self::Run { .. } | Self::Ran { .. } | Self::Setting { .. } => None,
         }
     }
 
@@ -85,7 +111,10 @@ impl Change {
 
     /// Whether carrying this out would change anything.
     pub fn is_change(&self) -> bool {
-        !matches!(self, Self::Keep { .. } | Self::Ran { .. })
+        !matches!(
+            self,
+            Self::Keep { .. } | Self::Ran { .. } | Self::Setting { .. }
+        )
     }
 
     /// Carries it out, recording what became of a file in `state`.
@@ -142,6 +171,14 @@ impl Change {
                 }
             }
             Self::Run { command } => command.run()?,
+            Self::Setting {
+                path,
+                setting,
+                ours,
+            } => match ours {
+                true => state.claim(path, setting),
+                false => state.release(path, setting),
+            },
             Self::Keep { .. } | Self::Ran { .. } => {}
         }
         Ok(())
@@ -189,6 +226,35 @@ mod tests {
         );
         assert!(!Change::Keep { path }.is_change());
         assert!(!Change::Ran { command }.is_change());
+    }
+
+    #[test]
+    fn a_setting_is_remembered_as_this_programs_and_given_back_again() {
+        let path = PathBuf::from("/home/u/.codex/config.toml");
+        let mut state = State::default();
+        let claim = |ours| Change::Setting {
+            path: path.clone(),
+            setting: "features.hooks".to_owned(),
+            ours,
+        };
+
+        claim(true).apply(Agent::Codex, &mut state).unwrap();
+        assert!(state.claimed(&path, "features.hooks"));
+
+        claim(false).apply(Agent::Codex, &mut state).unwrap();
+        assert!(!state.claimed(&path, "features.hooks"));
+    }
+
+    #[test]
+    fn remembering_who_a_setting_belongs_to_is_not_a_change_to_anything() {
+        let step = Change::Setting {
+            path: PathBuf::from("/home/u/.codex/config.toml"),
+            setting: "features.hooks".to_owned(),
+            ours: true,
+        };
+
+        assert!(!step.is_change());
+        assert_eq!(step.path(), None, "the file has a step of its own");
     }
 
     #[test]

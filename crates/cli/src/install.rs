@@ -79,7 +79,9 @@ pub fn render(
     for outcome in outcomes {
         let _ = writeln!(out, "{}", outcome.agent);
         for change in &outcome.changes {
-            let _ = writeln!(out, "  {}", describe(change, mode));
+            if let Some(line) = describe(change, mode) {
+                let _ = writeln!(out, "  {line}");
+            }
         }
         if !outcome.is_change() {
             let _ = writeln!(out, "  {}", direction.settled());
@@ -129,15 +131,20 @@ fn listed(names: Vec<String>) -> String {
     }
 }
 
-/// One step, and what became of it.
+/// One step, and what became of it, or nothing where the step is bookkeeping.
 ///
 /// A directory made and a file written are reported with the same word, and so
 /// are a directory cleared away and a file removed. The distinctions are ones
 /// this program makes because a directory needs more care than a file; to a user
 /// reading what happened to their machine, one of them is now there and the
 /// other is not.
-fn describe(change: &Change, mode: Mode) -> String {
-    match (mode, change) {
+///
+/// The step that says who a setting belongs to has nothing to report. It
+/// changes nothing, and the file it is about is named by the step that writes
+/// it — a second line about the same file would be telling a user that two
+/// things happened to it.
+fn describe(change: &Change, mode: Mode) -> Option<String> {
+    let line = match (mode, change) {
         (Mode::Apply, Change::Make { path } | Change::Create { path, .. }) => {
             format!("created {}", path.display())
         }
@@ -156,7 +163,9 @@ fn describe(change: &Change, mode: Mode) -> String {
         (Mode::Apply, Change::Run { command }) => format!("ran {command}"),
         (Mode::DryRun, Change::Run { command }) => format!("would run {command}"),
         (_, Change::Ran { command }) => format!("already run {command}"),
-    }
+        (_, Change::Setting { .. }) => return None,
+    };
+    Some(line)
 }
 
 #[cfg(test)]

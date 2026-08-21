@@ -215,9 +215,19 @@ impl Machine {
         self.home.join(".claude/settings.json")
     }
 
+    /// The wrapper Codex is told to run.
+    fn codex_wrapper(&self) -> PathBuf {
+        self.home.join(".codex/hooks/agentbus.sh")
+    }
+
     /// Where Codex's hooks are dropped in.
     fn codex_hooks(&self) -> PathBuf {
         self.home.join(".codex/hooks.json")
+    }
+
+    /// The file holding the setting that makes Codex read them at all.
+    fn codex_config(&self) -> PathBuf {
+        self.home.join(".codex/config.toml")
     }
 
     /// The directory OpenCode loads plugins from.
@@ -880,7 +890,11 @@ fn what_an_agent_had_installed_is_remembered_and_forgotten_again() {
         .unwrap_or_else(|| panic!("nothing was remembered about the install: {record}"));
     assert_eq!(
         installed["assets"],
-        serde_json::json!([machine.codex_hooks().to_str().unwrap()]),
+        serde_json::json!([
+            machine.codex_wrapper().to_str().unwrap(),
+            machine.codex_hooks().to_str().unwrap(),
+            machine.codex_config().to_str().unwrap(),
+        ]),
         "{record}"
     );
     assert_eq!(
@@ -902,10 +916,35 @@ fn what_an_agent_had_installed_is_remembered_and_forgotten_again() {
 }
 
 #[test]
-fn installing_for_codex_drops_a_file_in_where_there_was_none() {
+fn installing_for_codex_drops_a_wrapper_in_and_points_its_hooks_at_it() {
     let machine = Machine::new().installed("codex");
 
     let report = machine.report(&["install", "--agent", "codex"]);
+
+    let wrapper = machine.codex_wrapper();
+    assert!(
+        report.contains(&format!("created {}", wrapper.display())),
+        "{report}"
+    );
+    let script = fs::read_to_string(&wrapper).expect("no wrapper was written");
+    // Marked, because that is the whole of how an upgrade and an uninstall later
+    // tell this program's own file from one that merely shares its name.
+    assert!(
+        agentbus_install::sentinel::is_generated(&script),
+        "the wrapper was left unmarked: {script}"
+    );
+    assert!(
+        script.contains(&format!("'{}'", env!("CARGO_BIN_EXE_agentbus"))),
+        "the wrapper does not name the binary that wrote it: {script}"
+    );
+    assert!(script.contains("emit --agent codex"), "{script}");
+    assert!(!script.contains('@'), "a placeholder was left in: {script}");
+    // A script the agent is told to run is a script the machine has to let it
+    // run.
+    assert_eq!(
+        fs::metadata(&wrapper).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
 
     let path = machine.codex_hooks();
     assert!(
@@ -916,50 +955,41 @@ fn installing_for_codex_drops_a_file_in_where_there_was_none() {
         .as_object()
         .expect("no hooks were registered")
         .clone();
+    // One event, and it is the one that says which session this is. What every
+    // other event means is worked out from the payload this one's hook forwards.
     assert_eq!(
         events.keys().map(String::as_str).collect::<Vec<&str>>(),
-        [
-            "SessionStart",
-            "UserPromptSubmit",
-            "PreToolUse",
-            "PermissionRequest",
-            "PostToolUse",
-            "SubagentStart",
-            "SubagentStop",
-            "PreCompact",
-            "PostCompact",
-            "Stop",
-            "SessionEnd",
-        ]
+        ["SessionStart"]
     );
-    for (event, entries) in &events {
-        let entries = entries.as_array().expect(event);
-        assert_eq!(entries.len(), 1, "{event}");
-        // Marked, because that is the whole of how an upgrade and an uninstall
-        // later find this program's own work in somebody else's file.
-        assert!(
-            agentbus_install::sentinel::is_marked(&entries[0]),
-            "{event} was left unmarked"
-        );
-        for hook in entries[0]["hooks"].as_array().expect(event) {
-            let command = hook["command"].as_str().expect(event);
-            assert!(command.starts_with('/'), "{event}: {command}");
-            assert!(
-                command.ends_with(" emit --agent codex"),
-                "{event}: {command}"
-            );
-            assert_eq!(hook["async"], serde_json::Value::Bool(true), "{event}");
-            assert_eq!(hook["timeout"], serde_json::Value::from(5), "{event}");
-        }
-    }
-    for matched in ["PreToolUse", "PermissionRequest", "PostToolUse"] {
+    let entries = events["SessionStart"].as_array().expect("no entry");
+    assert_eq!(entries.len(), 1);
+    assert!(
+        agentbus_install::sentinel::is_marked(&entries[0]),
+        "the entry was left unmarked"
+    );
+    // The event carries no tool name, so there is nothing for a matcher to say.
+    assert_eq!(entries[0].get("matcher"), None, "{entries:?}");
+    for hook in entries[0]["hooks"].as_array().expect("no hook was written") {
+        assert_eq!(hook["type"], serde_json::Value::from("command"));
         assert_eq!(
-            events[matched][0]["matcher"],
-            serde_json::Value::from("*"),
-            "{matched}"
+            hook["command"],
+            serde_json::Value::from(format!("bash '{}'", wrapper.display()))
         );
+        assert_eq!(hook["async"], serde_json::Value::Bool(true));
+        assert_eq!(hook["timeout"], serde_json::Value::from(5));
     }
-    // A file this program wrote from nothing is not a merge, so nothing was
+
+    // And the setting without which the agent never reads that file at all.
+    let config = machine.codex_config();
+    assert!(
+        report.contains(&format!("created {}", config.display())),
+        "{report}"
+    );
+    assert_eq!(
+        fs::read_to_string(&config).unwrap(),
+        "[features]\nhooks = true\n"
+    );
+    // Files this program wrote from nothing are not merges, so nothing was
     // there to copy.
     assert!(machine.backups_of(&path).is_empty());
 }
@@ -968,21 +998,51 @@ fn installing_for_codex_drops_a_file_in_where_there_was_none() {
 fn installing_for_codex_twice_changes_nothing_the_second_time() {
     let machine = Machine::new().installed("codex");
     machine.report(&["install", "--agent", "codex"]);
-    let path = machine.codex_hooks();
-    let after_one = fs::read_to_string(&path).unwrap();
+    let files = [
+        machine.codex_wrapper(),
+        machine.codex_hooks(),
+        machine.codex_config(),
+    ];
+    let after_one: Vec<String> = files
+        .iter()
+        .map(|path| fs::read_to_string(path).unwrap())
+        .collect();
 
     let report = machine.report(&["install", "--agent", "codex"]);
 
     assert!(report.contains("  already installed\n"), "{report}");
-    assert!(
-        report.contains(&format!("unchanged {}", path.display())),
-        "{report}"
-    );
-    assert_eq!(fs::read_to_string(&path).unwrap(), after_one);
-    assert!(
-        machine.backups_of(&path).is_empty(),
-        "a run that changed nothing still copied the file"
-    );
+    for path in &files {
+        assert!(
+            report.contains(&format!("unchanged {}", path.display())),
+            "{report}"
+        );
+        assert!(
+            machine.backups_of(path).is_empty(),
+            "a run that changed nothing still copied {}",
+            path.display()
+        );
+    }
+    let after_two: Vec<String> = files
+        .iter()
+        .map(|path| fs::read_to_string(path).unwrap())
+        .collect();
+    assert_eq!(after_two, after_one);
+}
+
+#[test]
+fn a_dry_run_for_codex_says_what_the_real_run_does_and_writes_none_of_it() {
+    let machine = Machine::new().installed("codex");
+
+    let planned = machine.report(&["install", "--dry-run", "--agent", "codex"]);
+
+    assert!(!machine.codex_wrapper().exists());
+    assert!(!machine.codex_hooks().exists());
+    assert!(!machine.codex_config().exists());
+    assert!(is_untouched(&machine.state));
+
+    let done = machine.report(&["install", "--agent", "codex"]);
+
+    assert_eq!(planned.replace("would create", "created"), done);
 }
 
 #[test]
@@ -1001,10 +1061,10 @@ fn what_the_user_had_in_their_codex_hooks_survives_being_installed_around() {
 
     let merged = machine.document(&path);
     assert_eq!(merged["somethingElse"], theirs["somethingElse"]);
-    assert_eq!(merged["hooks"]["Stop"][0], theirs["hooks"]["Stop"][0]);
+    assert_eq!(merged["hooks"]["Stop"], theirs["hooks"]["Stop"]);
     assert_eq!(
-        merged["hooks"]["Stop"].as_array().unwrap().len(),
-        2,
+        merged["hooks"]["SessionStart"].as_array().unwrap().len(),
+        1,
         "ours was not added beside theirs"
     );
     assert_eq!(
@@ -1019,6 +1079,66 @@ fn what_the_user_had_in_their_codex_hooks_survives_being_installed_around() {
         machine.document(&path),
         theirs,
         "the user's own file did not come back as it went in"
+    );
+}
+
+#[test]
+fn what_an_earlier_build_registered_for_codex_is_replaced_by_the_one_entry() {
+    let machine = Machine::new().configured("codex");
+    let path = machine.codex_hooks();
+    // What installing used to write: an entry for every event the mapping reads,
+    // each running the binary directly rather than a wrapper, all of them marked
+    // as this program's.
+    let mut events = serde_json::Map::new();
+    for event in [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PermissionRequest",
+        "PostToolUse",
+        "SubagentStart",
+        "SubagentStop",
+        "PreCompact",
+        "PostCompact",
+        "Stop",
+        "SessionEnd",
+    ] {
+        events.insert(
+            event.to_owned(),
+            serde_json::json!([{
+                "_agentbus": {"v": 1},
+                "hooks": [{
+                    "type": "command",
+                    "command": "/opt/bin/agentbus emit --agent codex",
+                    "async": true,
+                    "timeout": 5,
+                }],
+            }]),
+        );
+    }
+    let old = serde_json::json!({ "hooks": serde_json::Value::Object(events) });
+    fs::write(&path, format!("{old:#}\n")).unwrap();
+
+    machine.report(&["install", "--agent", "codex"]);
+
+    let events = machine.document(&path)["hooks"]
+        .as_object()
+        .expect("no hooks were registered")
+        .clone();
+    for (event, entries) in &events {
+        let entries = entries.as_array().expect(event);
+        match event.as_str() {
+            "SessionStart" => assert_eq!(entries.len(), 1, "{event}"),
+            _ => assert!(entries.is_empty(), "{event} still holds {entries:?}"),
+        }
+    }
+    let command = events["SessionStart"][0]["hooks"][0]["command"]
+        .as_str()
+        .expect("the entry runs nothing");
+    assert_eq!(
+        command,
+        format!("bash '{}'", machine.codex_wrapper().display()),
+        "the entry still runs the binary directly"
     );
 }
 
@@ -1045,25 +1165,123 @@ fn a_codex_hooks_file_that_cannot_be_rewritten_is_left_exactly_as_it_was() {
 }
 
 #[test]
-fn uninstalling_for_codex_takes_away_the_file_it_dropped_in() {
+fn a_codex_config_that_cannot_be_read_a_line_at_a_time_stops_the_run() {
+    let machine = Machine::new().configured("codex");
+    let config = machine.codex_config();
+    // Two sections of the same name: there is no saying which of them a setting
+    // written here would belong to.
+    let theirs = "[features]\nhooks = false\n\n[features]\nother = true\n";
+    fs::write(&config, theirs).unwrap();
+
+    let output = machine.run(&["install", "--agent", "codex"]);
+
+    assert!(!output.status.success(), "{output:?}");
+    let complaint = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        complaint.contains(&config.display().to_string()),
+        "{complaint}"
+    );
+    assert!(complaint.contains("left as it was"), "{complaint}");
+    assert_eq!(fs::read_to_string(&config).unwrap(), theirs);
+    // The whole run is worked out before any of it is carried out, so a file
+    // refused at the end of the plan means nothing at the start of it was
+    // written either.
+    assert!(!machine.codex_wrapper().exists());
+    assert!(!machine.codex_hooks().exists());
+}
+
+#[test]
+fn what_the_user_had_in_their_codex_config_survives_being_installed_around() {
+    let machine = Machine::new().configured("codex");
+    let config = machine.codex_config();
+    let theirs = "# mine\nmodel = \"something\"\n\n[features]\n# and this\nother = false\n";
+    fs::write(&config, theirs).unwrap();
+
+    machine.report(&["install", "--agent", "codex"]);
+
+    assert_eq!(
+        fs::read_to_string(&config).unwrap(),
+        "# mine\nmodel = \"something\"\n\n[features]\nhooks = true\n# and this\nother = false\n",
+        "one line went in and something else changed with it"
+    );
+
+    machine.report(&["uninstall", "--agent", "codex"]);
+
+    assert_eq!(
+        fs::read_to_string(&config).unwrap(),
+        theirs,
+        "the file did not come back as it went in"
+    );
+}
+
+#[test]
+fn a_setting_the_user_had_already_switched_on_is_left_switched_on() {
+    let machine = Machine::new().configured("codex");
+    let config = machine.codex_config();
+    let theirs = "[features]\nhooks = true\n";
+    fs::write(&config, theirs).unwrap();
+
+    let report = machine.report(&["install", "--agent", "codex"]);
+
+    assert!(
+        report.contains(&format!("unchanged {}", config.display())),
+        "{report}"
+    );
+
+    machine.report(&["uninstall", "--agent", "codex"]);
+
+    assert_eq!(
+        fs::read_to_string(&config).unwrap(),
+        theirs,
+        "a setting this program never switched on was switched off"
+    );
+}
+
+#[test]
+fn uninstalling_for_codex_takes_away_everything_it_put_there() {
     let machine = Machine::new().installed("codex");
     machine.report(&["install", "--agent", "codex"]);
-    let path = machine.codex_hooks();
 
     let report = machine.report(&["uninstall", "--agent", "codex"]);
 
+    for path in [
+        machine.codex_wrapper(),
+        machine.codex_hooks(),
+        machine.codex_config(),
+    ] {
+        assert!(
+            report.contains(&format!("removed {}", path.display())),
+            "{report}"
+        );
+        assert!(!path.exists(), "{} was left behind", path.display());
+    }
+    // Nothing of this program's is left, down to the copies it takes before it
+    // writes and the directories it made.
     assert!(
-        report.contains(&format!("removed {}", path.display())),
-        "{report}"
+        !machine.home.join(".codex").exists(),
+        "a directory this program made was left behind"
     );
-    assert!(!path.exists(), "{} was left behind", path.display());
+}
+
+#[test]
+fn a_configuration_directory_codex_already_had_survives_an_uninstall() {
+    let machine = Machine::new().configured("codex");
+    machine.report(&["install", "--agent", "codex"]);
+
+    machine.report(&["uninstall", "--agent", "codex"]);
+
+    let dir = machine.home.join(".codex");
     assert!(
-        machine.backups_of(&path).is_empty(),
-        "copies of a file this program made were left behind"
-    );
-    assert!(
-        machine.home.join(".codex").is_dir(),
+        dir.is_dir(),
         "the agent's own configuration directory was removed"
+    );
+    let left: Vec<PathBuf> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert!(
+        left.is_empty(),
+        "an uninstall left something behind: {left:?}"
     );
 }
 

@@ -103,6 +103,12 @@ pub const CLAUDE_WRAPPER: Asset = Asset::pair(
     include_str!("../assets/claude/agentbus.ps1"),
 );
 
+/// The wrapper Codex runs on each of its events.
+pub const CODEX_WRAPPER: Asset = Asset::pair(
+    include_str!("../assets/codex/agentbus.sh"),
+    include_str!("../assets/codex/agentbus.ps1"),
+);
+
 /// The plugin OpenCode is given, as a single file dropped into its plugin
 /// directory.
 pub const OPENCODE_PLUGIN: &str = include_str!("../assets/opencode/agentbus.js");

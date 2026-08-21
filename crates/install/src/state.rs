@@ -15,8 +15,17 @@
 //! changed it since. What the record is for is the questions the files cannot
 //! answer: what an older build wrote, and where, once the build that wrote it
 //! has been replaced.
+//!
+//! The third thing here is of the same kind. One agent will not read the hooks
+//! it is given until a setting in a file of its own is switched on, and a line
+//! switching something on looks the same whoever wrote it — there is nowhere in
+//! `key = true` to hang the mark that every entry this program writes into a
+//! document carries. So whether this program was the one to switch it on is
+//! written down at the moment it is, and read back when an uninstall has to
+//! decide whether switching it off would be undoing its own work or somebody
+//! else's.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -79,6 +88,12 @@ pub struct State {
     /// which generation they were.
     #[serde(default)]
     agents: BTreeMap<String, Install>,
+    /// The settings this program turned on, by the file each is in.
+    ///
+    /// Named the way the file names them, so that a reader of the record can
+    /// find the line it is about.
+    #[serde(default)]
+    settings: BTreeMap<PathBuf, BTreeSet<String>>,
 }
 
 impl Default for State {
@@ -87,6 +102,7 @@ impl Default for State {
             version: VERSION,
             files: BTreeMap::new(),
             agents: BTreeMap::new(),
+            settings: BTreeMap::new(),
         }
     }
 }
@@ -199,6 +215,39 @@ impl State {
     /// anything to forget.
     pub fn uninstalled(&mut self, agent: Agent) -> bool {
         self.agents.remove(agent.name()).is_some()
+    }
+
+    /// Whether `setting` in the file at `path` is on because this program
+    /// turned it on.
+    ///
+    /// The one question about a setting this program ever asks, and the only
+    /// one the file it is in cannot answer: a line switching something on looks
+    /// the same whoever wrote it, so an uninstall deciding whether to switch it
+    /// off again has nothing but this to go on.
+    pub fn claimed(&self, path: &Path, setting: &str) -> bool {
+        self.settings
+            .get(path)
+            .is_some_and(|settings| settings.contains(setting))
+    }
+
+    /// Remembers that `setting` in the file at `path` is this program's doing.
+    pub fn claim(&mut self, path: &Path, setting: &str) {
+        self.settings
+            .entry(path.to_owned())
+            .or_default()
+            .insert(setting.to_owned());
+    }
+
+    /// Forgets `setting` in the file at `path`, because it has been turned off
+    /// again or was never this program's to turn off.
+    pub fn release(&mut self, path: &Path, setting: &str) {
+        let Some(settings) = self.settings.get_mut(path) else {
+            return;
+        };
+        settings.remove(setting);
+        if settings.is_empty() {
+            self.settings.remove(path);
+        }
     }
 }
 
@@ -339,6 +388,37 @@ mod tests {
         assert!(read.uninstalled(Agent::Codex));
         assert!(!read.uninstalled(Agent::Codex));
         assert_eq!(read.installation(Agent::Codex), None);
+    }
+
+    #[test]
+    fn a_setting_this_program_switched_on_is_remembered_and_given_up_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("installed.json");
+        let config = PathBuf::from("/home/u/.codex/config.toml");
+        let mut state = State::default();
+
+        assert!(!state.claimed(&config, "features.hooks"));
+        state.claim(&config, "features.hooks");
+        state.claim(&config, "[features]");
+        state.save(&path).unwrap();
+
+        let mut read = State::load(&path).unwrap();
+        assert!(read.claimed(&config, "features.hooks"));
+        assert!(read.claimed(&config, "[features]"));
+        assert!(!read.claimed(&config, "features.something-else"));
+        assert!(
+            !read.claimed(
+                Path::new("/home/u/.kimi-code/config.toml"),
+                "features.hooks"
+            ),
+            "a setting is claimed in one file, not everywhere it could appear"
+        );
+
+        read.release(&config, "features.hooks");
+        read.release(&config, "[features]");
+        read.release(&config, "[features]");
+
+        assert_eq!(read.settings, BTreeMap::new(), "an empty claim was kept");
     }
 
     #[test]
