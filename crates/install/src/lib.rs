@@ -42,6 +42,7 @@ pub mod file;
 pub mod github_copilot;
 pub mod grok;
 pub mod json;
+pub mod kimi;
 mod lines;
 pub mod mastracode;
 pub mod merge;
@@ -128,6 +129,18 @@ pub enum Error {
     /// then answerable for.
     #[error("{agent} keeps its configuration in {path}, which is not there; install {agent} first")]
     Absent { agent: Agent, path: PathBuf },
+    /// The agent on the machine is older than the release its hooks arrived
+    /// in, so installing would write files nothing ever reads. Both versions
+    /// are named: the one thing a user in this position has to decide is
+    /// whether upgrading is worth it to them.
+    #[error(
+        "{agent} on this machine is {found}, and its hooks need {needed} or newer; upgrade {agent}, then install again"
+    )]
+    TooOld {
+        agent: Agent,
+        found: String,
+        needed: String,
+    },
     /// A file this program would write is one somebody else wrote.
     #[error(
         "{path} was not written by this program, so it is not this program's to replace; move it aside to install here"
@@ -230,6 +243,7 @@ pub fn installers() -> Vec<&'static dyn Installer> {
         &nested_json::DROID,
         &github_copilot::GithubCopilot,
         &grok::Grok,
+        &kimi::Kimi,
         &mastracode::Mastracode,
         &opencode::OpenCode,
         &nested_json::QODERCLI,

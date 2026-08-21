@@ -1690,3 +1690,67 @@ what it will of silence.
 
 So the rule stands and the exception is written down: the wrapper prints exactly
 that object, on every path out of it, and prints nothing else ever.
+
+## 2026-08-21 — Kimi, and the agent that can be too old
+
+### Kimi's tables live in a fenced block inside the user's `config.toml`
+
+**`[[hooks]]` tables go between two marker comments in `~/.kimi-code/config.toml`,
+and everything outside them is copied through byte for byte.** Kimi has no
+drop-in directory and no separate hooks file: the tables belong in the same
+file the user keeps their model, their approvals and their comments in. So the
+rule that governs every hand-kept file here governs this one, and the claim on
+what this program wrote is made by position — a TOML table has nowhere to hang
+the key that marks this program's entries in a JSON document.
+
+That makes the marker lines load-bearing in a way they are not elsewhere, and
+the line-by-line editor treats them accordingly: two opening markers, an opening
+without a closing, or a marker inside a multi-line string all refuse the run
+rather than produce a guess. An uninstall gives back the bytes the install was
+handed, blank line included.
+
+### The whole of the registered surface goes in, matchers and all
+
+**Twelve rows, three of them narrowed by one of Kimi's own regular expressions,
+and every row running the same wrapper.** Two of the three are the two halves of
+`PreToolUse` — the tool that puts a question to the person at the keyboard, and
+every other tool — which together are that event entire. With one command in
+every row the pair is behaviourally identical to a single unnarrowed row, and it
+is still written as two: the distinction is one the agent draws, and collapsing
+it would be this program deciding at install time that a distinction the agent
+makes is not worth carrying into somebody's configuration file.
+
+The expressions are Kimi configuration, written for Kimi to evaluate. None of
+them is ever read by this program, and nothing on the path an event takes from
+the wrapper to the bus matches anything — the mappings that path is driven by are
+tables of names, by decision, and an expression arriving out of a configuration
+file is exactly what that decision keeps out of it.
+
+### An agent too old for its hooks is refused, and one that cannot be asked is not
+
+**`kimi --version` is run while the plan is being worked out, and its three
+answers are three different outcomes.** Kimi is the one agent here whose hooks
+arrived in a known release, and installing into an older one writes the right
+bytes to the right paths and produces nothing — the same failure the Codex
+setting exists to prevent, arriving from the other direction. So a version below
+the floor makes the plan a refusal that names both versions, before any file is
+touched.
+
+The unanswerable case is deliberately not a refusal. No command on the search
+path, a command that fails, output with no version in it: all of them mean *this
+program does not know*, and a user whose agent could not be interrogated is
+better served by working hooks and a sentence about them than by neither. The
+probe is therefore a question rather than a step — it is allowed to fail, and
+failing is not an error — matching how every other command this program runs to
+find something out behaves.
+
+### A plan step that changes nothing and says something
+
+**`Change::Note` carries a remark through the plan to the report.** The warning
+above has to reach the user on the dry run as much as on the real one, in order
+among the files it is about, and both of those follow from travelling the same
+way every other part of a plan travels. The alternative — a channel of its own,
+outside the plan — would print out of order at best and not at all on a dry run
+at worst, which is the run the remark matters most on. It changes nothing on the
+machine, like the step that records who a setting belongs to, and an agent whose
+whole plan is one remark is still correctly reported as having nothing to do.

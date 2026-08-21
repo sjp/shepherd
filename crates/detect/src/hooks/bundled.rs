@@ -30,6 +30,7 @@ pub(crate) const BUNDLED_HOOKS: &[(&str, &str)] = &[
         include_str!("../../manifests/hooks/github-copilot.toml"),
     ),
     ("grok", include_str!("../../manifests/hooks/grok.toml")),
+    ("kimi", include_str!("../../manifests/hooks/kimi.toml")),
     (
         "mastracode",
         include_str!("../../manifests/hooks/mastracode.toml"),
@@ -65,7 +66,7 @@ mod tests {
 
     /// How many agents the bundled mappings cover. Asserted rather than derived
     /// so that a mapping dropped from the list has to be an explicit decision.
-    const BUNDLED_COUNT: usize = 12;
+    const BUNDLED_COUNT: usize = 13;
 
     #[test]
     fn every_bundled_manifest_loads_cleanly_under_the_key_it_is_filed_by() {
@@ -158,6 +159,11 @@ mod tests {
         (
             "grok",
             r#"{"hookEventName": "SessionStart", "sessionId": "s1", "cwd": "/w"}"#,
+            Some("/w"),
+        ),
+        (
+            "kimi",
+            r#"{"hook_event_name": "SessionStart", "session_id": "s1", "cwd": "/w",                "session_title": "a session", "client_type": "kimi_code_cli"}"#,
             Some("/w"),
         ),
         (

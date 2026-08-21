@@ -15,12 +15,16 @@
 //! somebody else's tool is a step like any other, planned alongside the writes
 //! and reported alongside them.
 //!
-//! One step changes nothing on the machine at all. Where an installation
-//! depends on a setting in somebody else's file being switched on, whether this
-//! program was the one to switch it on is a fact that exists only while the
-//! installation is being worked out — the line it wrote is indistinguishable
-//! from the line a user wrote — and the step that carries it is what puts it
-//! into the record before it is lost.
+//! Two of the steps change nothing on the machine at all. Where an
+//! installation depends on a setting in somebody else's file being switched on,
+//! whether this program was the one to switch it on is a fact that exists only
+//! while the installation is being worked out — the line it wrote is
+//! indistinguishable from the line a user wrote — and the step that carries it
+//! is what puts it into the record before it is lost. And where working the
+//! plan out turned up something the user has to be told, the telling is a step
+//! too: a plan is reported step by step, so a remark that travelled any other
+//! way would either be printed out of order with the work it is about or not
+//! printed at all on the dry run, which is the run it matters most on.
 
 use std::path::{Path, PathBuf};
 
@@ -82,6 +86,18 @@ pub enum Change {
         /// Whether it is this program's to switch off again.
         ours: bool,
     },
+    /// Something the plan turned up that the user has to be told, and that no
+    /// other step will say for itself.
+    ///
+    /// Not a change to anything, and not a failure either: it is what an
+    /// installer says when it went ahead without being able to check something
+    /// it would rather have checked. A plan that could neither refuse nor
+    /// reassure has to hand that on, because the alternative is an
+    /// installation that looks exactly like one nothing was in doubt about.
+    Note {
+        /// What to tell them, as a sentence they will read among the files.
+        message: String,
+    },
 }
 
 impl Change {
@@ -96,8 +112,9 @@ impl Change {
             | Self::Clear { path } => Some(path),
             // The setting is one line inside a file another step is already
             // about, and a report that named the file twice would be saying
-            // that two things had happened to it.
-            Self::Run { .. } | Self::Ran { .. } | Self::Setting { .. } => None,
+            // that two things had happened to it. A remark is about the plan
+            // rather than about any one file in it.
+            Self::Run { .. } | Self::Ran { .. } | Self::Setting { .. } | Self::Note { .. } => None,
         }
     }
 
@@ -113,7 +130,7 @@ impl Change {
     pub fn is_change(&self) -> bool {
         !matches!(
             self,
-            Self::Keep { .. } | Self::Ran { .. } | Self::Setting { .. }
+            Self::Keep { .. } | Self::Ran { .. } | Self::Setting { .. } | Self::Note { .. }
         )
     }
 
@@ -179,7 +196,7 @@ impl Change {
                 true => state.claim(path, setting),
                 false => state.release(path, setting),
             },
-            Self::Keep { .. } | Self::Ran { .. } => {}
+            Self::Keep { .. } | Self::Ran { .. } | Self::Note { .. } => {}
         }
         Ok(())
     }

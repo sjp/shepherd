@@ -143,6 +143,11 @@ fn listed(names: Vec<String>) -> String {
 /// changes nothing, and the file it is about is named by the step that writes
 /// it — a second line about the same file would be telling a user that two
 /// things happened to it.
+///
+/// A remark the plan turned up is printed as it was written, in both modes and
+/// among the files it is about. It is not conditional on anything the run does,
+/// so putting it in the conditional the way a step is put there would be saying
+/// that the doubt itself was hypothetical.
 fn describe(change: &Change, mode: Mode) -> Option<String> {
     let line = match (mode, change) {
         (Mode::Apply, Change::Make { path } | Change::Create { path, .. }) => {
@@ -163,6 +168,7 @@ fn describe(change: &Change, mode: Mode) -> Option<String> {
         (Mode::Apply, Change::Run { command }) => format!("ran {command}"),
         (Mode::DryRun, Change::Run { command }) => format!("would run {command}"),
         (_, Change::Ran { command }) => format!("already run {command}"),
+        (_, Change::Note { message }) => message.clone(),
         (_, Change::Setting { .. }) => return None,
     };
     Some(line)
@@ -298,6 +304,46 @@ mod tests {
             would.contains("  would run claude plugin install agentbus@agentbus\n"),
             "{would}"
         );
+    }
+
+    #[test]
+    fn a_remark_the_plan_turned_up_is_printed_as_it_was_written() {
+        let message = "could not confirm kimi's version; its hooks need 0.14.0 or newer";
+        let changes = vec![
+            Change::Note {
+                message: message.to_owned(),
+            },
+            Change::Create {
+                path: hooks(),
+                contents: String::new(),
+                executable: false,
+            },
+        ];
+
+        for mode in [Mode::Apply, Mode::DryRun] {
+            let rendered = render(&[], &outcome(changes.clone()), Direction::Install, mode);
+
+            assert!(rendered.contains(&format!("  {message}\n")), "{rendered}");
+            assert!(
+                !rendered.contains("already installed"),
+                "a remark is not a reason to say nothing happened: {rendered}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_remark_on_its_own_is_not_something_happening() {
+        let changes = vec![Change::Note {
+            message: "could not confirm anything".to_owned(),
+        }];
+
+        let rendered = render(&[], &outcome(changes), Direction::Install, Mode::Apply);
+
+        assert!(
+            rendered.contains("  could not confirm anything\n"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("  already installed\n"), "{rendered}");
     }
 
     #[test]
