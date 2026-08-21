@@ -33,9 +33,21 @@ pub enum Change {
     /// however empty this program leaves it.
     Make { path: PathBuf },
     /// There is no file, and this would write one.
-    Create { path: PathBuf, contents: String },
+    Create {
+        path: PathBuf,
+        contents: String,
+        /// Whether the file is one the machine has to be able to run, which is
+        /// the case for a script an agent is told to execute and for nothing
+        /// else this program writes.
+        executable: bool,
+    },
     /// There is a file, and this would write it back with different contents.
-    Rewrite { path: PathBuf, contents: String },
+    Rewrite {
+        path: PathBuf,
+        contents: String,
+        /// Whether the file is one the machine has to be able to run.
+        executable: bool,
+    },
     /// There is a file this program created and no longer needs.
     Delete { path: PathBuf },
     /// The file is already as it should be.
@@ -90,16 +102,24 @@ impl Change {
                 })?;
                 state.record(path, agent, Ownership::Created);
             }
-            Self::Create { path, contents } => {
-                write(path, contents)?;
+            Self::Create {
+                path,
+                contents,
+                executable,
+            } => {
+                write(path, contents, *executable)?;
                 state.record(path, agent, Ownership::Created);
             }
-            Self::Rewrite { path, contents } => {
+            Self::Rewrite {
+                path,
+                contents,
+                executable,
+            } => {
                 file::back_up(path).map_err(|source| Error::Write {
                     path: path.to_owned(),
                     source,
                 })?;
-                write(path, contents)?;
+                write(path, contents, *executable)?;
                 state.record(path, agent, Ownership::Merged);
             }
             Self::Delete { path } => {
@@ -129,8 +149,12 @@ impl Change {
 }
 
 /// Writes a file, naming it if that fails.
-fn write(path: &Path, contents: &str) -> Result<(), Error> {
-    file::write(path, contents).map_err(|source| Error::Write {
+fn write(path: &Path, contents: &str, executable: bool) -> Result<(), Error> {
+    let written = match executable {
+        true => file::write_runnable(path, contents),
+        false => file::write(path, contents),
+    };
+    written.map_err(|source| Error::Write {
         path: path.to_owned(),
         source,
     })
@@ -151,7 +175,8 @@ mod tests {
         assert!(
             Change::Create {
                 path: path.clone(),
-                contents: String::new()
+                contents: String::new(),
+                executable: false,
             }
             .is_change()
         );
@@ -198,6 +223,61 @@ mod tests {
 
         assert!(!made.exists(), "the directory was left behind");
         assert_eq!(state.ownership(&made), None);
+    }
+
+    #[test]
+    fn a_file_an_agent_has_to_run_lands_as_something_this_machine_would_run() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("hooks/agentbus-hook.sh");
+        let mut state = State::default();
+
+        Change::Create {
+            path: script.clone(),
+            contents: String::from("exit 0\n"),
+            executable: true,
+        }
+        .apply(Agent::Claude, &mut state)
+        .unwrap();
+
+        assert_eq!(mode(&script), 0o755);
+
+        Change::Rewrite {
+            path: script.clone(),
+            contents: String::from("exit 0 # again\n"),
+            executable: true,
+        }
+        .apply(Agent::Claude, &mut state)
+        .unwrap();
+
+        assert_eq!(
+            mode(&script),
+            0o755,
+            "a rewrite of a script has to leave it runnable too"
+        );
+    }
+
+    #[test]
+    fn a_file_nobody_runs_is_left_as_something_nobody_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let document = root.path().join("hooks.json");
+        let mut state = State::default();
+
+        Change::Create {
+            path: document.clone(),
+            contents: String::from("{}\n"),
+            executable: false,
+        }
+        .apply(Agent::Codex, &mut state)
+        .unwrap();
+
+        assert_eq!(mode(&document) & 0o111, 0);
+    }
+
+    /// What a file's permissions are, as the number they are written as.
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
     #[test]

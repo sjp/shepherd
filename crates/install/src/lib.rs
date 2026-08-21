@@ -39,6 +39,8 @@ pub mod opencode;
 pub mod paths;
 pub mod sentinel;
 pub mod state;
+pub mod status;
+pub mod version;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -49,6 +51,8 @@ pub use command::Invocation;
 pub use merge::Placement;
 pub use paths::{Environment, Platform};
 pub use state::State;
+pub use status::{HookStatus, Recommendation, recommendations};
+pub use version::expected_version;
 
 /// Why an installation could not be carried out.
 #[derive(Debug, thiserror::Error)]
@@ -162,6 +166,15 @@ pub trait Installer {
 
     /// What uninstalling would do.
     fn plan_uninstall(&self, env: &Environment, state: &State) -> Result<Vec<Change>, Error>;
+
+    /// What is installed for this agent on `env` now.
+    ///
+    /// Read from the machine rather than worked out from a plan, because the
+    /// question is what is there and not what would be written. Each agent
+    /// answers for itself: which of its files says which generation it is, and
+    /// what else has to be in place for that file to ever be run, are both
+    /// things only it knows.
+    fn status(&self, env: &Environment) -> Result<HookStatus, Error>;
 }
 
 /// Every agent this build can install for.
@@ -188,9 +201,13 @@ pub fn install(env: &Environment, agents: &[Agent], mode: Mode) -> Result<Vec<Ou
         return Ok(Vec::new());
     }
     let binary = binary()?;
-    carry_out(env, mode, chosen, |installer, _| {
-        installer.plan_install(env, &binary)
-    })
+    carry_out(
+        env,
+        mode,
+        chosen,
+        |installer, _| installer.plan_install(env, &binary),
+        Bookkeeping::Installed,
+    )
 }
 
 /// Removes the hooks for `agents`.
@@ -199,9 +216,13 @@ pub fn uninstall(env: &Environment, agents: &[Agent], mode: Mode) -> Result<Vec<
     if chosen.is_empty() {
         return Ok(Vec::new());
     }
-    let outcomes = carry_out(env, mode, chosen, |installer, state| {
-        installer.plan_uninstall(env, state)
-    })?;
+    let outcomes = carry_out(
+        env,
+        mode,
+        chosen,
+        |installer, state| installer.plan_uninstall(env, state),
+        Bookkeeping::Removed,
+    )?;
     // The directory the installers generate into is this program's own, and one
     // left standing empty is a trace of something that is supposed to be gone.
     // Not reported as a change, because it is not one: an empty directory held
@@ -225,6 +246,7 @@ fn carry_out(
     mode: Mode,
     installers: Vec<&'static dyn Installer>,
     plan: impl Fn(&dyn Installer, &State) -> Result<Vec<Change>, Error>,
+    bookkeeping: Bookkeeping,
 ) -> Result<Vec<Outcome>, Error> {
     let record = env.state_file();
     let mut state = State::load(&record)?;
@@ -232,6 +254,7 @@ fn carry_out(
     let mut changed = false;
     let mut stopped = None;
     for installer in installers {
+        let agent = installer.agent();
         let changes = match plan(installer, &state) {
             Ok(changes) => changes,
             Err(error) => {
@@ -241,17 +264,21 @@ fn carry_out(
         };
         if mode == Mode::Apply {
             for change in &changes {
-                if let Err(error) = change.apply(installer.agent(), &mut state) {
+                if let Err(error) = change.apply(agent, &mut state) {
                     stopped = Some(error);
                     break;
                 }
                 changed |= change.is_change();
             }
+            // Only once every step of this agent's has been taken. What is
+            // recorded here is that the agent is installed, and half of an
+            // installation is not that; each file that did land is recorded
+            // above, one at a time, which is what an uninstall needs.
+            if stopped.is_none() {
+                changed |= note(&mut state, agent, &changes, bookkeeping);
+            }
         }
-        outcomes.push(Outcome {
-            agent: installer.agent(),
-            changes,
-        });
+        outcomes.push(Outcome { agent, changes });
         if stopped.is_some() {
             break;
         }
@@ -267,6 +294,44 @@ fn carry_out(
         Some(error) => Err(error),
         None => Ok(outcomes),
     }
+}
+
+/// What a run leaves in the record about an agent as a whole, over and above
+/// what it leaves about each of that agent's files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bookkeeping {
+    /// The agent now has hooks, made of these files at this generation.
+    Installed,
+    /// The agent no longer has any.
+    Removed,
+}
+
+/// Records what became of `agent`, and says whether that changed the record.
+fn note(state: &mut State, agent: Agent, changes: &[Change], bookkeeping: Bookkeeping) -> bool {
+    match bookkeeping {
+        Bookkeeping::Installed => {
+            state.installed(agent, installed(changes), version::expected_version(agent))
+        }
+        Bookkeeping::Removed => state.uninstalled(agent),
+    }
+}
+
+/// The files an installation is made of, out of the steps that made it.
+///
+/// A file that was already right counts as much as one just written: it is part
+/// of what is installed, and the run that found it that way is the run that
+/// says so.
+fn installed(changes: &[Change]) -> Vec<PathBuf> {
+    changes
+        .iter()
+        .filter(|change| {
+            matches!(
+                change,
+                Change::Create { .. } | Change::Rewrite { .. } | Change::Keep { .. }
+            )
+        })
+        .filter_map(|change| change.path().map(Path::to_owned))
+        .collect()
 }
 
 /// The installers for `agents`, in the order they are registered.

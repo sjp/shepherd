@@ -212,6 +212,7 @@ mod tests {
             Change::Create {
                 path: hooks(),
                 contents: String::new(),
+                executable: false,
             },
             Change::Keep {
                 path: PathBuf::from("/home/u/.codex/other.json"),
@@ -235,6 +236,7 @@ mod tests {
         let changes = vec![Change::Rewrite {
             path: hooks(),
             contents: String::new(),
+            executable: false,
         }];
 
         let rendered = render(&[], &outcome(changes), Direction::Install, Mode::DryRun);

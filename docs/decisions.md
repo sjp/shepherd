@@ -1302,3 +1302,65 @@ an hour is far finer than the thing being watched, which changes on the scale of
 days. Both, and the catalog location, are one value a caller can replace, so
 that anything pointing a daemon at a catalog of its own gets to say how often it
 is read as well as where it is.
+
+## 2026-08-21 — saying which generation of the hooks a machine carries
+
+### A count per agent, in a comment at the top of every file installed
+
+**One `u32` per agent, written into the file as `AGENTBUS_HOOK_VERSION=<n>` and
+compared with `>=`.** An installation that is either present or absent cannot
+answer the question a user actually has, which is whether what they installed
+months ago is what this build would install today. Every file `agentbus install`
+writes whole now says which generation it is, in a comment among its opening
+lines, and status is a read of that one line.
+
+It is deliberately not a version of anything. Nobody releases it, nothing
+depends on a particular value, and no ordering beyond "at least" is ever asked
+of it — so the two extra numbers a semantic version carries would be two extra
+things to get wrong for no question they answer. One count per agent, not one
+for the program: the agents change independently, and rewriting the wrapper one
+of them runs is no reason to tell everybody else's user that their hooks are
+behind. A file marked *newer* than this build writes counts as current, because
+a machine somebody has already upgraded is not one an older build should talk
+into installing over it.
+
+The count is read from the installed file, never from this program's record of
+what it wrote. The file is what the agent runs, a user can read it without this
+program's help, and a record that disagreed with it would be a confident answer
+about the wrong machine — one restored from a backup, one copied from somewhere
+else, one somebody has edited. The record grows a note of each agent's installed
+paths and generation all the same, in a second revision of its schema that reads
+the first one whole: that is bookkeeping for the questions the files cannot
+answer, such as where a build that has since been replaced put things.
+
+A mark is only honoured in the comment at the top of a file — the first line
+that is neither blank nor a comment ends the search. Further down it would be
+something a file could acquire by accident, from a string or a heredoc or a line
+of somebody else's, and this decides whether a user is told their hooks are
+current. A file with no mark at all is reported as out of date rather than as
+unknown: that is what everything installed before this scheme looks like, what a
+document with nowhere to put a comment looks like, and the fix for both is the
+same one.
+
+### Windows files ship before the Windows client does
+
+**The installer writes PowerShell wrappers on a Windows machine, while the emit
+client and the daemon remain unported.** Installing is the half of this program
+that can be made to work on both kinds of machine cheaply — it is paths, files
+and a little quoting — and holding it back until the rest follows would mean
+writing all seventeen agents' installers twice, once now and once again later.
+
+What lands on such a machine in the meantime does nothing, and does it safely: a
+wrapper whose first act is to look for the binary it hands events to finds
+nothing there and exits reporting success. That is not a special case for the
+occasion — it is exactly what every wrapper does on a machine where the binary
+has been removed, and what the emit path itself does when no daemon is
+listening. An installation ahead of its client is therefore inert rather than
+broken, and becomes live the day the client arrives, without anybody having to
+install again.
+
+The one thing this costs is that the encoded spelling of a PowerShell command —
+base64 of UTF-16, for the hook runners that put what they are given through a
+shell of their own — is built here rather than taken from a library. It is one
+table and one loop used in one place, and a dependency for it would be more to
+keep an eye on than to keep.

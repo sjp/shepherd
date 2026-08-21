@@ -87,10 +87,12 @@ pub fn plan_install(path: &Path, placements: &[Placement]) -> Result<Change, Err
         Some(_) => Change::Rewrite {
             path: path.to_owned(),
             contents,
+            executable: false,
         },
         None => Change::Create {
             path: path.to_owned(),
             contents,
+            executable: false,
         },
     })
 }
@@ -126,6 +128,7 @@ pub fn plan_uninstall(path: &Path, state: &State) -> Result<Change, Error> {
     Ok(Change::Rewrite {
         path: path.to_owned(),
         contents: json::render(&document, json::indentation(&text)),
+        executable: false,
     })
 }
 

@@ -34,6 +34,7 @@ use crate::change::Change;
 use crate::command::Invocation;
 use crate::paths::Environment;
 use crate::state::State;
+use crate::status::HookStatus;
 use crate::{Error, Installer, assets, file, json};
 
 /// What the plugin, and the marketplace offering it, are both called.
@@ -115,6 +116,22 @@ impl Installer for Claude {
         });
         Ok(changes)
     }
+
+    /// Reads the generated hooks, and looks for the rest of the marketplace
+    /// around them.
+    ///
+    /// The hooks are the file that says which generation this is, because they
+    /// are the one whose content is the installation; the two manifests exist to
+    /// get Claude to read them. A hooks file with no manifests beside it is one
+    /// Claude will never be offered, which is a working file in a broken
+    /// installation — exactly the case worth telling somebody about.
+    fn status(&self, env: &Environment) -> Result<HookStatus, Error> {
+        let root = root(env);
+        let [marketplace, plugin, hooks] = paths(&root);
+
+        let status = HookStatus::of_asset(self.agent(), &hooks)?;
+        Ok(status.confirmed(marketplace.is_file() && plugin.is_file()))
+    }
 }
 
 /// Where the marketplace is generated.
@@ -177,10 +194,12 @@ fn plan_file(path: &Path, contents: &str) -> Result<Change, Error> {
         Some(_) => Change::Rewrite {
             path: path.to_owned(),
             contents: contents.to_owned(),
+            executable: false,
         },
         None => Change::Create {
             path: path.to_owned(),
             contents: contents.to_owned(),
+            executable: false,
         },
     })
 }

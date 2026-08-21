@@ -653,6 +653,39 @@ fn a_run_that_stopped_partway_still_remembers_what_it_wrote() {
 }
 
 #[test]
+fn what_an_agent_had_installed_is_remembered_and_forgotten_again() {
+    let machine = Machine::new().installed("codex");
+
+    machine.report(&["install", "--agent", "codex"]);
+    let record = machine.document(&machine.state.join("agentbus/installed.json"));
+
+    let installed = record["agents"]["codex"]
+        .as_object()
+        .unwrap_or_else(|| panic!("nothing was remembered about the install: {record}"));
+    assert_eq!(
+        installed["assets"],
+        serde_json::json!([machine.codex_hooks().to_str().unwrap()]),
+        "{record}"
+    );
+    assert_eq!(
+        installed["version"],
+        serde_json::Value::from(agentbus_install::expected_version(
+            agentbus_install::Agent::Codex
+        )),
+        "{record}"
+    );
+
+    machine.report(&["uninstall", "--agent", "codex"]);
+    let record = machine.document(&machine.state.join("agentbus/installed.json"));
+
+    assert_eq!(
+        record["agents"].as_object().map(serde_json::Map::len),
+        Some(0),
+        "an agent with nothing installed is still remembered as having something: {record}"
+    );
+}
+
+#[test]
 fn installing_for_codex_drops_a_file_in_where_there_was_none() {
     let machine = Machine::new().installed("codex");
 

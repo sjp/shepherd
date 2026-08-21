@@ -32,6 +32,7 @@ use crate::agent::Agent;
 use crate::change::Change;
 use crate::paths::Environment;
 use crate::state::{Ownership, State};
+use crate::status::HookStatus;
 use crate::{Error, Installer, assets, file, json, sentinel};
 
 /// The directory inside OpenCode's configuration that plugins are loaded from.
@@ -92,6 +93,22 @@ impl Installer for OpenCode {
         }
         Ok(changes)
     }
+
+    /// Reads the dropped script, if the script there is this program's.
+    ///
+    /// There is nothing else to check. OpenCode loads whatever is in that
+    /// directory, so a script that is there is a script that runs, and the file
+    /// is the whole of the installation. A file of that name without the mark is
+    /// somebody else's, and nothing of this program's is installed.
+    fn status(&self, env: &Environment) -> Result<HookStatus, Error> {
+        let Some(text) = read(&plugin(&plugin_dir(env)))? else {
+            return Ok(HookStatus::NotInstalled);
+        };
+        Ok(match sentinel::is_generated(&text) {
+            true => HookStatus::of_text(self.agent(), &text),
+            false => HookStatus::NotInstalled,
+        })
+    }
 }
 
 /// The directory OpenCode loads this user's plugins from.
@@ -134,6 +151,7 @@ fn plan_file(path: &Path, contents: &str) -> Result<Change, Error> {
         None => Change::Create {
             path: path.to_owned(),
             contents: contents.to_owned(),
+            executable: false,
         },
         Some(text) if !sentinel::is_generated(&text) => {
             return Err(Error::NotOurs {
@@ -146,6 +164,7 @@ fn plan_file(path: &Path, contents: &str) -> Result<Change, Error> {
         Some(_) => Change::Rewrite {
             path: path.to_owned(),
             contents: contents.to_owned(),
+            executable: false,
         },
     })
 }
@@ -177,7 +196,7 @@ mod tests {
         match changes.as_slice() {
             [
                 Change::Make { path: dir },
-                Change::Create { path, contents },
+                Change::Create { path, contents, .. },
             ] => {
                 assert_eq!(dir, &plugin_dir(env));
                 assert_eq!(path, &plugin(&plugin_dir(env)));

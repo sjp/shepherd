@@ -66,6 +66,23 @@ pub fn back_up(path: &Path) -> io::Result<Option<PathBuf>> {
 /// from was made as: nothing written here has any reason to be legible to
 /// another account.
 pub fn write(path: &Path, contents: &str) -> io::Result<()> {
+    put(path, contents, false)
+}
+
+/// Puts `contents` at `path` as a file the machine will run.
+///
+/// The same write, and then the permissions that make a script a command, which
+/// is what an agent asked to run one needs of it. They are set rather than kept:
+/// a wrapper that lost its executable bit somewhere — restored from an archive,
+/// copied off a filesystem that has no such thing — is an installation that
+/// looks complete and does nothing, and installing again is what a user does
+/// about that.
+pub fn write_runnable(path: &Path, contents: &str) -> io::Result<()> {
+    put(path, contents, true)
+}
+
+/// Puts `contents` at `path`, optionally as something runnable.
+fn put(path: &Path, contents: &str, runnable: bool) -> io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(dir)?;
     let mut file = NamedTempFile::new_in(dir)?;
@@ -74,7 +91,32 @@ pub fn write(path: &Path, contents: &str) -> io::Result<()> {
     if let Ok(existing) = fs::metadata(path) {
         fs::set_permissions(file.path(), existing.permissions())?;
     }
+    if runnable {
+        make_runnable(file.path())?;
+    }
     file.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+/// Gives `path` the permissions of a command.
+///
+/// Readable and runnable by anybody, writable by its owner: the permissions a
+/// program's own files are installed with, and nothing about a wrapper is
+/// private.
+#[cfg(unix)]
+fn make_runnable(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+}
+
+/// Gives `path` the permissions of a command, where a machine has no such
+/// thing.
+///
+/// What makes a file runnable there is the extension it was written under,
+/// which the name it is being written to already carries.
+#[cfg(not(unix))]
+fn make_runnable(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 

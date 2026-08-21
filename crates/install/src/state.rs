@@ -7,9 +7,14 @@
 //! asked this program to add to — is theirs, and deleting it would be an
 //! installer removing something it never installed.
 //!
-//! Nothing else is remembered here. This is not a manifest of what is installed:
-//! the files themselves are that, they carry the mark that says who wrote them,
-//! and a record that disagreed with them would be worse than no record at all.
+//! Beside that, and for the same kind of reason, is what each agent's
+//! installation is made of: which files were written for it and which generation
+//! of the hooks they were when they were written. That is bookkeeping and not an
+//! answer — asked which generation an agent is carrying *now*, this program
+//! reads the file, because the file is what the agent runs and a user may have
+//! changed it since. What the record is for is the questions the files cannot
+//! answer: what an older build wrote, and where, once the build that wrote it
+//! has been replaced.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -23,7 +28,13 @@ use crate::agent::Agent;
 use crate::file;
 
 /// The shape of the record this build writes.
-const VERSION: u32 = 1;
+///
+/// A record written by an earlier build is read as it stands and written back in
+/// this shape, so that nothing an earlier installation left behind is lost by a
+/// later one turning up. A record from a *later* build is refused instead of
+/// half-understood: guessing at a shape this build has never seen would risk
+/// forgetting files an uninstall is the only thing that will ever remove.
+const VERSION: u32 = 2;
 
 /// How a file came to hold this program's entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,6 +44,15 @@ pub enum Ownership {
     Created,
     /// There was a file already, and this program added to it.
     Merged,
+}
+
+/// What was installed for one agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Install {
+    /// Every file written for it, in the order they were written.
+    pub assets: Vec<PathBuf>,
+    /// Which generation of that agent's hooks those files were.
+    pub version: u32,
 }
 
 /// One file this program has written to.
@@ -52,6 +72,13 @@ pub struct State {
     version: u32,
     /// The files, by absolute path.
     files: BTreeMap<PathBuf, Record>,
+    /// What was installed for each agent, by the agent's name.
+    ///
+    /// Absent from a record an earlier build wrote, and empty is exactly what
+    /// that means: files that were installed before this program kept track of
+    /// which generation they were.
+    #[serde(default)]
+    agents: BTreeMap<String, Install>,
 }
 
 impl Default for State {
@@ -59,6 +86,7 @@ impl Default for State {
         Self {
             version: VERSION,
             files: BTreeMap::new(),
+            agents: BTreeMap::new(),
         }
     }
 }
@@ -71,17 +99,33 @@ impl State {
     /// next uninstall leave this program's own files behind, and the user can
     /// see this one for themselves and delete it.
     pub fn load(path: &Path) -> Result<Self, Error> {
-        match fs::read_to_string(path) {
-            Ok(text) => serde_json::from_str(&text).map_err(|error| Error::State {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) => {
+                return Err(Error::Read {
+                    path: path.to_owned(),
+                    source: error,
+                });
+            }
+        };
+        let mut state: Self = serde_json::from_str(&text).map_err(|error| Error::State {
+            path: path.to_owned(),
+            reason: error.to_string(),
+        })?;
+        if state.version > VERSION {
+            return Err(Error::State {
                 path: path.to_owned(),
-                reason: error.to_string(),
-            }),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(Error::Read {
-                path: path.to_owned(),
-                source: error,
-            }),
+                reason: format!(
+                    "it was written by a later version of this program, which keeps records in a shape {VERSION} does not know"
+                ),
+            });
         }
+        // Everything an earlier shape held is held by this one too, so what was
+        // read is complete and is simply this shape now. Nothing is written
+        // until something else changes.
+        state.version = VERSION;
+        Ok(state)
     }
 
     /// Writes the record to `path`.
@@ -117,6 +161,28 @@ impl State {
     /// Forgets `path`, which is no longer written to.
     pub fn forget(&mut self, path: &Path) {
         self.files.remove(path);
+    }
+
+    /// What was installed for `agent`, if anything was.
+    pub fn installation(&self, agent: Agent) -> Option<&Install> {
+        self.agents.get(agent.name())
+    }
+
+    /// Remembers that `agent` now has `assets` installed, at generation
+    /// `version`, and says whether that changed the record.
+    ///
+    /// The last answer stands, unlike the per-file record above: this says what
+    /// is installed now, and an installation that has just replaced an earlier
+    /// one has replaced what was true about it as well.
+    pub fn installed(&mut self, agent: Agent, assets: Vec<PathBuf>, version: u32) -> bool {
+        let install = Install { assets, version };
+        self.agents.insert(agent.name().to_owned(), install.clone()) != Some(install)
+    }
+
+    /// Forgets what was installed for `agent`, and says whether there was
+    /// anything to forget.
+    pub fn uninstalled(&mut self, agent: Agent) -> bool {
+        self.agents.remove(agent.name()).is_some()
     }
 }
 
@@ -171,6 +237,92 @@ mod tests {
         state.forget(path);
 
         assert_eq!(state.ownership(path), None);
+    }
+
+    #[test]
+    fn what_an_earlier_build_wrote_is_read_whole_and_written_back_in_this_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("installed.json");
+        // Written out as an earlier build wrote it, byte for byte, rather than
+        // generated: a record on somebody's machine is bytes, and the thing
+        // being tested is that these ones are still understood.
+        let earlier = r#"{
+  "version": 1,
+  "files": {
+    "/home/u/.local/share/agentbus/claude-marketplace/agentbus/hooks/hooks.json": {
+      "agent": "claude",
+      "ownership": "created"
+    },
+    "/home/u/.codex/hooks.json": {
+      "agent": "codex",
+      "ownership": "merged"
+    }
+  }
+}
+"#;
+        fs::write(&path, earlier).unwrap();
+
+        let state = State::load(&path).unwrap();
+
+        assert_eq!(
+            state.ownership(Path::new(
+                "/home/u/.local/share/agentbus/claude-marketplace/agentbus/hooks/hooks.json"
+            )),
+            Some(Ownership::Created)
+        );
+        assert_eq!(
+            state.ownership(Path::new("/home/u/.codex/hooks.json")),
+            Some(Ownership::Merged)
+        );
+        assert_eq!(state.installation(Agent::Claude), None);
+
+        state.save(&path).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+
+        assert_eq!(written["version"], serde_json::Value::from(VERSION));
+        assert_eq!(State::load(&path).unwrap(), state, "and nothing was lost");
+    }
+
+    #[test]
+    fn a_record_from_a_later_build_is_refused_rather_than_half_understood() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("installed.json");
+        fs::write(
+            &path,
+            format!("{{ \"version\": {}, \"files\": {{}} }}", VERSION + 1),
+        )
+        .unwrap();
+
+        assert!(matches!(State::load(&path), Err(Error::State { .. })));
+    }
+
+    #[test]
+    fn what_was_installed_for_an_agent_is_remembered_and_replaced_and_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("installed.json");
+        let mut state = State::default();
+        let wrapper = PathBuf::from("/home/u/.local/share/agentbus/codex/agentbus-hook.sh");
+
+        assert!(state.installed(Agent::Codex, vec![wrapper.clone()], 1));
+        assert!(
+            !state.installed(Agent::Codex, vec![wrapper.clone()], 1),
+            "installing the same thing again changes nothing"
+        );
+        assert!(state.installed(Agent::Codex, vec![wrapper.clone()], 2));
+
+        state.save(&path).unwrap();
+        let read = State::load(&path).unwrap();
+
+        let install = read.installation(Agent::Codex).expect("nothing recorded");
+        assert_eq!(install.assets, vec![wrapper]);
+        assert_eq!(install.version, 2);
+        assert_eq!(read.installation(Agent::Claude), None);
+
+        let mut read = read;
+        assert!(read.uninstalled(Agent::Codex));
+        assert!(!read.uninstalled(Agent::Codex));
+        assert_eq!(read.installation(Agent::Codex), None);
     }
 
     #[test]

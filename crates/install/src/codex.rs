@@ -27,7 +27,8 @@ use crate::agent::Agent;
 use crate::change::Change;
 use crate::paths::Environment;
 use crate::state::State;
-use crate::{Error, Installer, Placement, merge};
+use crate::status::HookStatus;
+use crate::{Error, Installer, Placement, file, json, merge, sentinel};
 
 /// The file Codex reads hooks from, inside its configuration directory.
 const HOOKS_FILE: &str = "hooks.json";
@@ -102,6 +103,35 @@ impl Installer for Codex {
     fn plan_uninstall(&self, env: &Environment, state: &State) -> Result<Vec<Change>, Error> {
         Ok(vec![merge::plan_uninstall(&hooks(env), state)?])
     }
+
+    /// Looks in the drop-in file for entries this program wrote.
+    ///
+    /// The file is a document rather than a script, so there is nowhere in it
+    /// for a comment saying which generation it is, and it reads as an
+    /// installation from before this program marked its work. That is the right
+    /// answer for now and stops being it the moment these entries point at a
+    /// file that can carry a mark.
+    ///
+    /// A file this program cannot parse holds nothing this program can find, so
+    /// it reads as nothing installed. The install that would put that right is
+    /// where a user is told what is wrong with it, and it says so with the file
+    /// left exactly as it was.
+    fn status(&self, env: &Environment) -> Result<HookStatus, Error> {
+        let path = hooks(env);
+        let Some(text) = file::read(&path).map_err(|source| Error::Read {
+            path: path.clone(),
+            source,
+        })?
+        else {
+            return Ok(HookStatus::NotInstalled);
+        };
+        let ours =
+            json::parse(&text).is_ok_and(|mut document| sentinel::remove_marked(&mut document) > 0);
+        Ok(match ours {
+            true => HookStatus::of_text(self.agent(), &text),
+            false => HookStatus::NotInstalled,
+        })
+    }
 }
 
 /// The file the entries go in.
@@ -159,7 +189,7 @@ mod tests {
         let changes = Codex
             .plan_install(&env, Path::new(binary))
             .expect("planning failed");
-        let [Change::Create { path, contents }] = changes.as_slice() else {
+        let [Change::Create { path, contents, .. }] = changes.as_slice() else {
             panic!("a file that is not there should be created: {changes:?}");
         };
         assert_eq!(path, &hooks(&env));
