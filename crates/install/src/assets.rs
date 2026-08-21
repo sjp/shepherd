@@ -133,6 +133,12 @@ pub const GITHUB_COPILOT_WRAPPER: Asset = Asset::pair(
     include_str!("../assets/github-copilot/agentbus.ps1"),
 );
 
+/// The wrapper MastraCode runs on each of its events.
+pub const MASTRACODE_WRAPPER: Asset = Asset::pair(
+    include_str!("../assets/mastracode/agentbus.sh"),
+    include_str!("../assets/mastracode/agentbus.ps1"),
+);
+
 /// The wrapper Qoder runs on each of its events.
 pub const QODERCLI_WRAPPER: Asset = Asset::pair(
     include_str!("../assets/qodercli/agentbus.sh"),

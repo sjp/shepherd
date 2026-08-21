@@ -1,0 +1,21 @@
+id = "mastracode"
+version = "2026.08.21.1"
+min_engine_version = 1
+updated_at = "2026-08-21T00:00:00Z"
+
+# The wrapper installed for this agent is registered for the whole of its
+# lifecycle, and this maps one event of that lifecycle: the one that says which
+# session is running. The rest arrive and are passed over, which is what an event
+# no mapping describes gets everywhere. Growing this file is how they start being
+# understood; nothing about the installation has to change for that.
+#
+# The field names below are the ones this agent's own hook reference gives for
+# the envelope every one of its events carries.
+[payload]
+event = "hook_event_name"
+session = ["session_id"]
+cwd = ["cwd"]
+
+[[events]]
+name = "SessionStart"
+kind = "session_start"

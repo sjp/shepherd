@@ -927,7 +927,7 @@ mod tests {
     /// mappings counted separately: the two families describe overlapping sets
     /// of agents and a summary is per family, not per agent.
     const BUNDLED_SCREEN_COUNT: usize = 20;
-    const BUNDLED_HOOK_COUNT: usize = 9;
+    const BUNDLED_HOOK_COUNT: usize = 10;
     const BUNDLED_COUNT: usize = BUNDLED_SCREEN_COUNT + BUNDLED_HOOK_COUNT;
 
     /// An agent the bundled corpus describes the screen of and says nothing

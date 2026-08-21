@@ -26,6 +26,10 @@ pub(crate) const BUNDLED_HOOKS: &[(&str, &str)] = &[
         include_str!("../../manifests/hooks/github-copilot.toml"),
     ),
     (
+        "mastracode",
+        include_str!("../../manifests/hooks/mastracode.toml"),
+    ),
+    (
         "opencode",
         include_str!("../../manifests/hooks/opencode.toml"),
     ),
@@ -56,7 +60,7 @@ mod tests {
 
     /// How many agents the bundled mappings cover. Asserted rather than derived
     /// so that a mapping dropped from the list has to be an explicit decision.
-    const BUNDLED_COUNT: usize = 9;
+    const BUNDLED_COUNT: usize = 10;
 
     #[test]
     fn every_bundled_manifest_loads_cleanly_under_the_key_it_is_filed_by() {
@@ -139,6 +143,11 @@ mod tests {
         (
             "github-copilot",
             r#"{"hook_event_name": "SessionStart", "session_id": "s1", "cwd": "/w",                "source": "startup"}"#,
+            Some("/w"),
+        ),
+        (
+            "mastracode",
+            r#"{"hook_event_name": "SessionStart", "session_id": "s1", "cwd": "/w"}"#,
             Some("/w"),
         ),
         (

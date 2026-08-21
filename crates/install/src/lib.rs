@@ -41,6 +41,7 @@ pub mod file;
 pub mod github_copilot;
 pub mod json;
 mod lines;
+pub mod mastracode;
 pub mod merge;
 pub mod nested_json;
 pub mod opencode;
@@ -225,6 +226,7 @@ pub fn installers() -> Vec<&'static dyn Installer> {
         &nested_json::DEVIN,
         &nested_json::DROID,
         &github_copilot::GithubCopilot,
+        &mastracode::Mastracode,
         &opencode::OpenCode,
         &nested_json::QODERCLI,
         &nested_json::QWEN,
