@@ -38,13 +38,16 @@ pub mod command;
 pub mod cst;
 pub mod file;
 pub mod json;
+mod lines;
 pub mod merge;
 pub mod opencode;
 pub mod paths;
 pub mod sentinel;
 pub mod state;
 pub mod status;
+pub mod toml_text;
 pub mod version;
+pub mod yaml_text;
 
 use std::io;
 use std::path::{Path, PathBuf};

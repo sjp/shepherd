@@ -1409,3 +1409,55 @@ desired value is the value the document already holds writes no text at all and
 hands back the original bytes, so installing twice, or taking out exactly what
 was just put in, leaves a file with the modification time it had before anybody
 looked at it.
+
+## 2026-08-21 — the files that are not JSON
+
+### The TOML and YAML editors are written here, not taken from a crate
+
+**Hand-rolled line editors, in `crates/install/src/toml_text.rs` and
+`crates/install/src/yaml_text.rs`, rather than `toml_edit` or a YAML
+serializer.** This is the opposite call from the one made for JSON a few
+sections above, so it is worth saying why the same reasoning lands elsewhere.
+
+What the installer needs from these two formats is small and fixed: a block of
+tables between two marker comments, one boolean under one section, and one name
+in one list. What a full-document library gives back is the whole file, and for
+YAML that means a file whose comments are gone, whose quoting style has been
+normalized and whose ordering is whatever the serializer felt like — the same
+loss the concrete-syntax-tree parser was taken on to avoid, at a size where the
+parser's own bulk is not justified. `toml_edit` would preserve more than that,
+but it is still a whole-document model taken on for one boolean and one block.
+
+The narrowness is the safety feature, not a shortcut around one. Each editor
+knows a short list of shapes and refuses everything else by name: a section
+written twice, a key whose value carries on to the next line, a marker sitting
+inside a multi-line string, a YAML list written on one line, an anchor, a tag, a
+tab where the indentation belongs. A refusal costs a plan and leaves the file
+untouched, which is the outcome a person can fix; a rewrite that guessed would
+cost them their configuration. A library, by contrast, would happily accept all
+of those and hand back something reformatted.
+
+The pieces this does generate go through one function each — a TOML basic string
+with every escape the format defines, and a YAML scalar quoted whenever a reader
+would take it for a number, a date or a boolean — so that a value from the
+machine this is running on cannot break out of what it is being put between.
+
+### An edit that added a line records nothing except what it had to create
+
+**The two editors are string-to-string functions; the one thing they report
+alongside the text is whether they had to write the container as well as the
+entry.** Everything else about an install can be worked out again by reading the
+file: which line the block is on, whether the key is there, whether the name is
+in the list. One thing cannot — a `[features]` holding nothing but this
+program's flag, or a `plugins.enabled` holding nothing but its plugin, looks
+exactly the same whether this program wrote the container or found it empty and
+filled it. So the install reports it, the caller records it, and the uninstall is
+handed it back; without it, taking a hook out would either leave a section
+behind for ever or take away one somebody else wrote.
+
+Everything else about the round trip is arithmetic on lines. Each line carries
+the terminator it arrived with, so a file written on a Windows machine leaves
+with `\r\n` and a file that ended without a newline still does; and the blank
+line put in front of an appended block comes back out with it, so that an
+uninstall over a file this program has not otherwise touched gives back the
+bytes the install was handed.

@@ -14,5 +14,11 @@ serde_json = { workspace = true, features = ["preserve_order"] }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+# Only ever used to check that what the text editors produce really is TOML.
+# Nothing in this crate generates TOML through it: a serializer would give the
+# file back reformatted, which is the thing those editors exist to avoid.
+toml = { workspace = true }
+
 [lints]
 workspace = true
