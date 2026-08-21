@@ -18,8 +18,13 @@
 pub(crate) const BUNDLED_HOOKS: &[(&str, &str)] = &[
     ("claude", include_str!("../../manifests/hooks/claude.toml")),
     ("codex", include_str!("../../manifests/hooks/codex.toml")),
+    ("cursor", include_str!("../../manifests/hooks/cursor.toml")),
     ("devin", include_str!("../../manifests/hooks/devin.toml")),
     ("droid", include_str!("../../manifests/hooks/droid.toml")),
+    (
+        "github-copilot",
+        include_str!("../../manifests/hooks/github-copilot.toml"),
+    ),
     (
         "opencode",
         include_str!("../../manifests/hooks/opencode.toml"),
@@ -51,7 +56,7 @@ mod tests {
 
     /// How many agents the bundled mappings cover. Asserted rather than derived
     /// so that a mapping dropped from the list has to be an explicit decision.
-    const BUNDLED_COUNT: usize = 7;
+    const BUNDLED_COUNT: usize = 9;
 
     #[test]
     fn every_bundled_manifest_loads_cleanly_under_the_key_it_is_filed_by() {
@@ -99,34 +104,57 @@ mod tests {
     /// like that to account is to hand it the payload and look at what comes
     /// back. The session and the directory are spelled differently by every
     /// agent here, which is exactly the thing the mapping exists to absorb.
-    const SESSION_STARTS: &[(&str, &str)] = &[
+    ///
+    /// The third column is the directory the mapping is expected to report.
+    /// Almost every agent names one; the one that does not names a list of
+    /// working roots instead, which is not something a directory can be read out
+    /// of, and a mapping that claimed otherwise would report a key that is
+    /// silently always absent.
+    const SESSION_STARTS: &[(&str, &str, Option<&str>)] = &[
         (
             "claude",
             r#"{"hook_event_name": "SessionStart", "session_id": "s1", "cwd": "/w"}"#,
+            Some("/w"),
         ),
         (
             "codex",
             r#"{"hook_event_name": "SessionStart", "session_id": "s1", "cwd": "/w"}"#,
+            Some("/w"),
+        ),
+        (
+            "cursor",
+            r#"{"hook_event_name": "sessionStart", "session_id": "s1",                "conversation_id": "c1", "workspace_roots": ["/w"]}"#,
+            None,
         ),
         (
             "devin",
             r#"{"hook_event_name": "SessionStart", "session_id": "s1", "cwd": "/w"}"#,
+            Some("/w"),
         ),
         (
             "droid",
             r#"{"hook_event_name": "SessionStart", "session_id": "s1", "cwd": "/w"}"#,
+            Some("/w"),
+        ),
+        (
+            "github-copilot",
+            r#"{"hook_event_name": "SessionStart", "session_id": "s1", "cwd": "/w",                "source": "startup"}"#,
+            Some("/w"),
         ),
         (
             "opencode",
             r#"{"type": "session.created", "sessionID": "s1", "directory": "/w"}"#,
+            Some("/w"),
         ),
         (
             "qodercli",
             r#"{"hook_event_name": "SessionStart", "session_id": "s1", "cwd": "/w"}"#,
+            Some("/w"),
         ),
         (
             "qwen",
             r#"{"hook_event_name": "SessionStart", "session_id": "s1", "cwd": "/w",                "source": "resume"}"#,
+            Some("/w"),
         ),
     ];
 
@@ -143,11 +171,11 @@ mod tests {
 
     #[test]
     fn every_bundled_manifest_turns_its_agents_session_start_into_a_session_beginning() {
-        let covered: Vec<&str> = SESSION_STARTS.iter().map(|(id, _)| *id).collect();
+        let covered: Vec<&str> = SESSION_STARTS.iter().map(|(id, _, _)| *id).collect();
         let bundled: Vec<&str> = bundled_hook_manifests().iter().map(|(id, _)| *id).collect();
         assert_eq!(covered, bundled, "every mapping needs a payload to answer");
 
-        for (id, payload) in SESSION_STARTS {
+        for (id, payload, cwd) in SESSION_STARTS {
             let payload: Value = serde_json::from_str(payload).expect("a payload");
             let event = compiled(id)
                 .normalize(&payload)
@@ -156,9 +184,20 @@ mod tests {
             assert_eq!(event.agent.as_str(), *id);
             assert_eq!(event.kind, Kind::SessionStart, "{id}");
             assert_eq!(event.session, "s1", "{id}");
-            assert_eq!(event.cwd.as_deref(), Some("/w"), "{id}");
+            assert_eq!(event.cwd.as_deref(), *cwd, "{id}");
             assert_eq!(event.raw.as_ref(), Some(&payload), "{id}");
         }
+    }
+
+    #[test]
+    fn the_agent_that_names_a_conversation_rather_than_a_session_is_still_understood() {
+        let payload: Value =
+            serde_json::from_str(r#"{"hook_event_name": "sessionStart", "conversation_id": "c1"}"#)
+                .expect("a payload");
+
+        let event = compiled("cursor").normalize(&payload).expect("an event");
+
+        assert_eq!(event.session, "c1");
     }
 
     #[test]

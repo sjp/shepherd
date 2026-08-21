@@ -42,6 +42,34 @@ impl Placement {
     }
 }
 
+/// A key a document carries about itself, rather than about anybody's entries.
+///
+/// Some agents' hook files open by saying which dialect they are written in.
+/// That is not an entry and is never marked as one: a file written here from
+/// nothing carries it because the agent that reads the file expects it, and a
+/// file that already says something under that key keeps whatever it says —
+/// somebody who wrote a different value there meant it.
+///
+/// It is named on the way out as well as on the way in, because a file holding
+/// nothing but what it says about itself is a file holding nothing of the
+/// user's. One this program created is then its own to take away, rather than
+/// something to leave standing with a single line in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Declaration {
+    key: String,
+    value: Value,
+}
+
+impl Declaration {
+    /// A key to be given `value`, wherever it is not already there.
+    pub fn new(key: impl Into<String>, value: impl Into<Value>) -> Self {
+        Self {
+            key: key.into(),
+            value: value.into(),
+        }
+    }
+}
+
 /// How a place in a document is named in a message about it.
 fn address(path: &[String]) -> String {
     match path.is_empty() {
@@ -58,6 +86,20 @@ fn address(path: &[String]) -> String {
 /// so that an upgrade replaces what an older build wrote instead of adding to
 /// it.
 pub fn plan_install(path: &Path, placements: &[Placement]) -> Result<Change, Error> {
+    plan_install_declaring(path, placements, &[])
+}
+
+/// The same, into a document that has to say something about itself before its
+/// entries are read at all.
+///
+/// Each declaration is given to the document only where the document does not
+/// already have that key, and before the entries go in, so that a file written
+/// from nothing opens the way the agent's own documentation writes it.
+pub fn plan_install_declaring(
+    path: &Path,
+    placements: &[Placement],
+    declarations: &[Declaration],
+) -> Result<Change, Error> {
     let existing = read(path)?;
     let mut document = match &existing {
         Some(text) => json::parse(text).map_err(|problem| Error::NotRewritable {
@@ -72,6 +114,9 @@ pub fn plan_install(path: &Path, placements: &[Placement]) -> Result<Change, Err
         },
     };
     sentinel::remove_marked(&mut document);
+    for declaration in declarations {
+        declare(&mut document, declaration, path)?;
+    }
     for placement in placements {
         place(&mut document, placement, path)?;
     }
@@ -105,6 +150,20 @@ pub fn plan_install(path: &Path, placements: &[Placement]) -> Result<Change, Err
 /// created it; one it merely added to is written back, empty containers and all
 /// removed, and kept.
 pub fn plan_uninstall(path: &Path, state: &State) -> Result<Change, Error> {
+    plan_uninstall_declaring(path, state, &[])
+}
+
+/// The same, out of a document that says something about itself.
+///
+/// What the document says about itself is left exactly as it is. It only
+/// changes the answer to one question: whether what is left once this program's
+/// entries are gone is a file with anything in it, and a file whose every
+/// remaining key is one of these has nothing in it that anybody asked for.
+pub fn plan_uninstall_declaring(
+    path: &Path,
+    state: &State,
+    declarations: &[Declaration],
+) -> Result<Change, Error> {
     let Some(text) = read(path)? else {
         return Ok(Change::Keep {
             path: path.to_owned(),
@@ -120,7 +179,7 @@ pub fn plan_uninstall(path: &Path, state: &State) -> Result<Change, Error> {
         });
     }
     let ours = state.ownership(path) == Some(Ownership::Created);
-    if ours && sentinel::is_vacant(&document) {
+    if ours && vacant_but_for(&document, declarations) {
         return Ok(Change::Delete {
             path: path.to_owned(),
         });
@@ -167,6 +226,39 @@ fn place(document: &mut Value, placement: &Placement, path: &Path) -> Result<(),
     sentinel::mark(&mut entry);
     items.push(Value::Object(entry));
     Ok(())
+}
+
+/// Gives a document a key it says about itself, unless it says something there
+/// already.
+///
+/// A document that is not an object at all is refused rather than replaced, for
+/// the same reason a misplaced entry is: whatever is there is a file this
+/// program does not understand, and the part it does not understand is the part
+/// it has no business rewriting.
+fn declare(document: &mut Value, declaration: &Declaration, path: &Path) -> Result<(), Error> {
+    document
+        .as_object_mut()
+        .ok_or_else(|| Error::Conflict {
+            path: path.to_owned(),
+            at: address(&[]),
+            needed: "an object",
+        })?
+        .entry(declaration.key.clone())
+        .or_insert_with(|| declaration.value.clone());
+    Ok(())
+}
+
+/// Whether a document holds nothing but what it says about itself.
+///
+/// Only the keys at the top are treated that way, because that is where a
+/// document says such things. Everything else is asked the ordinary question.
+fn vacant_but_for(document: &Value, declarations: &[Declaration]) -> bool {
+    let Value::Object(entries) = document else {
+        return sentinel::is_vacant(document);
+    };
+    entries.iter().all(|(key, value)| {
+        declarations.iter().any(|declared| &declared.key == key) || sentinel::is_vacant(value)
+    })
 }
 
 /// Reads a file that may not be there, naming it if that fails.

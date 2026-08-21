@@ -109,6 +109,12 @@ pub const CODEX_WRAPPER: Asset = Asset::pair(
     include_str!("../assets/codex/agentbus.ps1"),
 );
 
+/// The wrapper Cursor's command line runs on each of its events.
+pub const CURSOR_WRAPPER: Asset = Asset::pair(
+    include_str!("../assets/cursor/agentbus.sh"),
+    include_str!("../assets/cursor/agentbus.ps1"),
+);
+
 /// The wrapper Devin runs on each of its events.
 pub const DEVIN_WRAPPER: Asset = Asset::pair(
     include_str!("../assets/devin/agentbus.sh"),
@@ -119,6 +125,12 @@ pub const DEVIN_WRAPPER: Asset = Asset::pair(
 pub const DROID_WRAPPER: Asset = Asset::pair(
     include_str!("../assets/droid/agentbus.sh"),
     include_str!("../assets/droid/agentbus.ps1"),
+);
+
+/// The wrapper GitHub Copilot's command line runs on each of its events.
+pub const GITHUB_COPILOT_WRAPPER: Asset = Asset::pair(
+    include_str!("../assets/github-copilot/agentbus.sh"),
+    include_str!("../assets/github-copilot/agentbus.ps1"),
 );
 
 /// The wrapper Qoder runs on each of its events.

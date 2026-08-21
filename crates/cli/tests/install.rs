@@ -336,8 +336,8 @@ fn a_machine_with_no_agent_on_it_is_told_so() {
     assert_eq!(
         report,
         "no coding agent found on this machine\n\
-         nothing to install: this build only handles claude, codex, devin, droid, \
-         opencode, qodercli and qwen\n"
+         nothing to install: this build only handles claude, codex, cursor, devin, \
+         droid, github-copilot, opencode, qodercli and qwen\n"
     );
 }
 
@@ -1642,7 +1642,10 @@ fn an_agent_this_build_has_no_installer_for_is_refused_when_it_is_named() {
     let said = String::from_utf8(output.stderr).expect("output is not UTF-8");
     assert!(said.contains("cannot install pi yet"), "{said}");
     assert!(
-        said.contains("claude, codex, devin, droid, opencode, qodercli and qwen"),
+        said.contains(
+            "claude, codex, cursor, devin, droid, github-copilot, opencode, qodercli \
+             and qwen"
+        ),
         "{said}"
     );
     assert!(is_untouched(&machine.state));
@@ -1682,8 +1685,8 @@ fn an_agent_this_build_has_no_installer_for_is_reported_and_passed_over() {
     assert!(report.contains("found pi"), "{report}");
     assert!(
         report.contains(
-            "nothing to install: this build only handles claude, codex, devin, droid, \
-         opencode, qodercli and qwen\n"
+            "nothing to install: this build only handles claude, codex, cursor, devin, \
+         droid, github-copilot, opencode, qodercli and qwen\n"
         ),
         "{report}"
     );
@@ -1692,9 +1695,15 @@ fn an_agent_this_build_has_no_installer_for_is_reported_and_passed_over() {
 
 #[test]
 fn an_agent_run_by_a_name_that_is_not_its_own_is_found_by_that_name() {
-    let machine = Machine::new().installed("cursor-agent");
+    let machine = Machine::new()
+        .installed("cursor-agent")
+        .configured("cursor");
 
     let report = machine.report(&["install"]);
 
-    assert!(report.contains("found cursor (command "), "{report}");
+    assert!(report.contains("found cursor ("), "{report}");
+    assert!(
+        report.contains("cursor-agent"),
+        "the name it was found under is what a user would recognize: {report}"
+    );
 }

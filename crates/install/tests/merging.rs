@@ -12,7 +12,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use agentbus_install::state::{Ownership, State};
-use agentbus_install::{Agent, Change, Error, Placement, file, merge, sentinel};
+use agentbus_install::{Agent, Change, Declaration, Error, Placement, file, merge, sentinel};
 use serde_json::{Map, Value, json};
 
 /// The agent the entries in these tests are pretended to be for. Which one it
@@ -371,4 +371,85 @@ fn an_entry_carries_what_it_was_given_and_the_mark() {
     let written = &document(&path)["hooks"]["Stop"][0];
     assert_eq!(written["command"], json!("/opt/bin/agentbus emit"));
     assert_eq!(written[sentinel::KEY], json!({"v": sentinel::VERSION}));
+}
+
+/// What a file that says something about itself says.
+fn declarations() -> [Declaration; 1] {
+    [Declaration::new("version", 1)]
+}
+
+/// Installs into `path` for real, with the file saying that about itself.
+fn install_declaring(path: &Path, state: &mut State) -> Change {
+    let change =
+        merge::plan_install_declaring(path, &ours(), &declarations()).expect("planning failed");
+    change.apply(AGENT, state).expect("applying failed");
+    change
+}
+
+#[test]
+fn a_file_written_from_nothing_says_what_it_was_told_to_say_about_itself() {
+    let (_dir, path) = target(None);
+
+    install_declaring(&path, &mut State::default());
+
+    let document = document(&path);
+    assert_eq!(document["version"], Value::from(1));
+    assert_eq!(
+        document.as_object().expect("an object").keys().next(),
+        Some(&"version".to_owned()),
+        "what a file says about itself belongs at the top of it",
+    );
+}
+
+#[test]
+fn a_file_that_already_says_something_about_itself_is_not_contradicted() {
+    let (_dir, path) = target(Some("{\n  \"version\": 99\n}\n"));
+
+    install_declaring(&path, &mut State::default());
+
+    assert_eq!(document(&path)["version"], Value::from(99));
+}
+
+#[test]
+fn a_file_this_program_made_goes_away_even_though_it_says_something_about_itself() {
+    let (_dir, path) = target(None);
+    let mut state = State::default();
+    install_declaring(&path, &mut state);
+
+    let change =
+        merge::plan_uninstall_declaring(&path, &state, &declarations()).expect("planning failed");
+    change.apply(AGENT, &mut state).expect("applying failed");
+
+    assert!(
+        !path.exists(),
+        "a file holding nothing but what it says about itself was kept",
+    );
+}
+
+#[test]
+fn a_file_the_user_made_keeps_what_it_says_about_itself() {
+    let (_dir, path) = target(Some("{\n  \"version\": 1\n}\n"));
+    let mut state = State::default();
+    install_declaring(&path, &mut state);
+
+    let change =
+        merge::plan_uninstall_declaring(&path, &state, &declarations()).expect("planning failed");
+    change.apply(AGENT, &mut state).expect("applying failed");
+
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "{\n  \"version\": 1\n}\n",
+        "a file that was never this program's was changed",
+    );
+}
+
+#[test]
+fn a_document_with_nowhere_to_say_anything_about_itself_is_refused() {
+    let (_dir, path) = target(Some("[]\n"));
+
+    let refusal = merge::plan_install_declaring(&path, &ours(), &declarations())
+        .expect_err("a document that cannot carry the key has to stop the plan");
+
+    assert!(matches!(refusal, Error::Conflict { .. }), "{refusal:?}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "[]\n");
 }

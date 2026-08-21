@@ -1,0 +1,29 @@
+id = "github-copilot"
+version = "2026.08.21.1"
+min_engine_version = 1
+updated_at = "2026-08-21T00:00:00Z"
+aliases = ["copilot", "copilot-cli", "github copilot cli"]
+
+# This agent accepts two spellings of every event name and hands the hook a
+# different payload for each: one carries the event under `hook_event_name` with
+# the session beside it as `session_id`, the other names no event at all and
+# spells the session `sessionId`. The hook is registered under the first
+# spelling, so that is the shape read here.
+#
+# Every field below is taken from this agent's published hook reference rather
+# than from a payload captured off a running session, which is a weaker thing to
+# rest on: a field that turns out to be spelled differently reports nothing at
+# all rather than reporting wrongly, but it still reports nothing.
+[payload]
+event = "hook_event_name"
+session = ["session_id"]
+cwd = ["cwd"]
+
+# This agent says why a session began — started, resumed, new — in a field of its
+# own, and that travels beside the event: a session a receiver has already seen,
+# arriving again because it was resumed, is a different thing from one it has
+# never heard of.
+[[events]]
+name = "SessionStart"
+kind = "session_start"
+detail = [{ field = "source", from = "source" }]

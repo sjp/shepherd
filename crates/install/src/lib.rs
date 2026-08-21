@@ -36,7 +36,9 @@ pub mod claude;
 pub mod codex;
 pub mod command;
 pub mod cst;
+pub mod cursor;
 pub mod file;
+pub mod github_copilot;
 pub mod json;
 mod lines;
 pub mod merge;
@@ -56,7 +58,7 @@ use std::path::{Path, PathBuf};
 pub use agent::{Agent, DetectedAgent, UnknownAgent, detect};
 pub use change::Change;
 pub use command::Invocation;
-pub use merge::Placement;
+pub use merge::{Declaration, Placement};
 pub use paths::{Environment, Platform};
 pub use state::State;
 pub use status::{HookStatus, Recommendation, recommendations};
@@ -219,8 +221,10 @@ pub fn installers() -> Vec<&'static dyn Installer> {
     vec![
         &claude::Claude,
         &codex::Codex,
+        &cursor::Cursor,
         &nested_json::DEVIN,
         &nested_json::DROID,
+        &github_copilot::GithubCopilot,
         &opencode::OpenCode,
         &nested_json::QODERCLI,
         &nested_json::QWEN,
