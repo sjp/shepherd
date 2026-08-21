@@ -169,7 +169,17 @@ pub trait Installer {
 
     /// What installing would do, with `binary` as the absolute path of the
     /// `agentbus` binary the hooks are to run.
-    fn plan_install(&self, env: &Environment, binary: &Path) -> Result<Vec<Change>, Error>;
+    ///
+    /// The record is here for the same reason it is on the way out: an
+    /// installation an earlier build made may be made of files this one would
+    /// never look for, and clearing one away before writing the new one is part
+    /// of installing rather than something a user has to be told to do.
+    fn plan_install(
+        &self,
+        env: &Environment,
+        state: &State,
+        binary: &Path,
+    ) -> Result<Vec<Change>, Error>;
 
     /// What uninstalling would do.
     fn plan_uninstall(&self, env: &Environment, state: &State) -> Result<Vec<Change>, Error>;
@@ -212,7 +222,7 @@ pub fn install(env: &Environment, agents: &[Agent], mode: Mode) -> Result<Vec<Ou
         env,
         mode,
         chosen,
-        |installer, _| installer.plan_install(env, &binary),
+        |installer, state| installer.plan_install(env, state, &binary),
         Bookkeeping::Installed,
     )
 }

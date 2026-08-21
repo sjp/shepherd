@@ -1461,3 +1461,74 @@ with `\r\n` and a file that ended without a newline still does; and the blank
 line put in front of an appended block comes back out with it, so that an
 uninstall over a file this program has not otherwise touched gives back the
 bytes the install was handed.
+
+## 2026-08-21 — Claude Code moves onto its settings file
+
+### The generated marketplace is retired, and replaced by a wrapper and one entry
+
+**This supersedes *Claude's plugin is offered through a generated marketplace of
+one*.** `agentbus install --agent claude` now writes a wrapper script into
+`~/.claude/hooks/` and adds one entry to `~/.claude/settings.json` that runs it.
+Nothing is generated below the data directory, and nothing is asked of `claude
+plugin` on an ordinary install.
+
+The mechanism was not wrong; it stopped being worth what it cost once there were
+seventeen agents to install for rather than three.
+
+- **One mechanism, one status story.** Every other agent is a versioned file
+  plus a surgical edit of a file the agent already reads. Claude was the only
+  one whose installation lived somewhere else and was registered by running
+  somebody else's program, so it was the only one that needed its own reasoning
+  in every part of the installer — planning, reporting, staleness, uninstalling.
+- **A version-marked asset can be read back.** An installation now says which
+  generation it is, in a comment in the file the agent runs, and a status
+  command reads that off the machine. JSON has nowhere to put such a comment, so
+  the marketplace's `hooks.json` could never carry one; an installation made
+  that way is present or absent and nothing else.
+- **No install-time dependency on another program's command line.** The old
+  sequence depended on the `claude plugin` subcommands keeping their names, on
+  Claude being on the `PATH` at install time, and on a subprocess per install
+  even when nothing needed doing. A machine whose Claude has since been removed
+  could not be installed for at all.
+
+What it costs is the thing the old entry was chosen to avoid: this program now
+writes into a file the user maintains by hand. That is paid for by editing it
+through the concrete-syntax-tree editor rather than rewriting it — every byte
+outside the four lines added comes back exactly as it went in — and by the same
+rule every other agent's config file gets, that a file which cannot be written
+back safely stops the plan and is left alone.
+
+Machines carrying the old installation are cleaned up by both `install` and
+`uninstall`: the generated directory goes, the records of it go, and Claude is
+asked to forget the plugin and the marketplace. That runs only when something of
+it is actually found — on disk, or in this program's own record, which is the
+only thing that still names a file somebody deleted by hand. An answer from
+Claude is not required: where it cannot be run, the files go anyway and the
+registration is left for the user, which is the half of the job this program can
+finish on its own.
+
+### Install-time hooks carry session identity, not the whole event surface
+
+**One event is hooked — `SessionStart` — rather than every event the agent
+offers.** The earlier arrangement registered eleven, on the reasoning that
+capturing everything at install time meant never having to install again to see
+a new kind of event.
+
+What an install actually needs from the agent is the identity of the session in
+front of it: which session this is, and where its transcript lives. That arrives
+on the first event of the session and does not change afterwards. Everything
+else — what the agent is doing, whether it is waiting, whether it has stopped —
+is decided from the payload the wrapper forwards, by mappings the binary
+carries, and those can be changed by shipping a new binary rather than by
+editing seventeen users' configuration files.
+
+Against that, a hook is not free. It is an entry in a file the user reads, and a
+process started inside their session every time the event fires. Registering
+eleven of them to use one is a cost paid on every tool call for events nothing
+is waiting on.
+
+The hook-mapping manifests are deliberately **not** trimmed to match. Mapping is
+data: it says what an event means if one arrives, and it costs nothing to know
+about events this build does not ask for. Payloads for unhooked events simply
+stop arriving, and an installation that hooks more of them later needs no change
+to the mappings at all.

@@ -109,11 +109,10 @@ impl Fake {
         self.far().join(".local/share/agentbus/installed")
     }
 
-    /// Where Claude Code's hooks end up over there, once anything has asked
-    /// for them.
+    /// Where Claude Code's hook ends up over there, once anything has asked
+    /// for it.
     fn hooks(&self) -> PathBuf {
-        self.far()
-            .join(".local/share/agentbus/claude-marketplace/agentbus/hooks/hooks.json")
+        self.far().join(".claude/hooks/agentbus.sh")
     }
 }
 
@@ -264,13 +263,13 @@ fn the_agents_are_wired_up_to_the_installed_copy_when_that_is_asked_for() {
 
     assert!(installed.status.success(), "{}", said(&installed));
     let hooks = fs::read_to_string(fake.hooks()).expect("no hooks were written");
-    // Every hook names the copy that was installed, by an absolute path: the
+    // The hook names the copy that was installed, by an absolute path: the
     // directory it is in is on most machines' PATH and guaranteed on none.
     assert!(
-        hooks.contains("/.local/bin/agentbus emit --agent claude"),
+        hooks.contains(&format!("'{}'", fake.binary().display())),
         "{hooks}"
     );
-    assert!(!hooks.contains("\"agentbus emit"), "{hooks}");
+    assert!(hooks.contains("emit --agent claude"), "{hooks}");
 
     let removed = agentbus(&fake, &["uninstall", "ssh", "--with-hooks", "--", HOST]);
 
@@ -300,14 +299,11 @@ fn a_machine_that_says_where_it_wants_a_copy_gets_it_there_and_is_wired_up_to_it
         !fake.binary().exists(),
         "a copy went to the ordinary place as well"
     );
-    // The hooks name the copy that was actually made, absolutely, which is the
+    // The hook names the copy that was actually made, absolutely, which is the
     // whole reason the far end gets to decide where it went.
     let hooks = fs::read_to_string(fake.hooks()).expect("no hooks were written");
-    assert!(
-        hooks.contains(&format!("{} emit --agent claude", there.display())),
-        "{hooks}"
-    );
-    assert!(!hooks.contains("\"agentbus emit"), "{hooks}");
+    assert!(hooks.contains(&format!("'{}'", there.display())), "{hooks}");
+    assert!(hooks.contains("emit --agent claude"), "{hooks}");
 
     let removed = agentbus(&fake, &["uninstall", "ssh", "--with-hooks", "--", HOST]);
 

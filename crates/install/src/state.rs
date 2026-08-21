@@ -163,6 +163,22 @@ impl State {
         self.files.remove(path);
     }
 
+    /// Every file the record knows about that lies below `root`.
+    ///
+    /// What this answers is the question an installation left by an earlier
+    /// build poses: a file it wrote is one only the record still names, because
+    /// the code that knew where to look for it has since been replaced. Asked
+    /// about the directory that build generated into, this hands back what is
+    /// left to take away — including the entries whose files somebody has
+    /// already deleted by hand, which are the ones nothing else would find.
+    pub fn recorded_below(&self, root: &Path) -> Vec<PathBuf> {
+        self.files
+            .keys()
+            .filter(|path| path.starts_with(root))
+            .cloned()
+            .collect()
+    }
+
     /// What was installed for `agent`, if anything was.
     pub fn installation(&self, agent: Agent) -> Option<&Install> {
         self.agents.get(agent.name())

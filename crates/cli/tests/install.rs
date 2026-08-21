@@ -6,11 +6,13 @@
 //! set up, the files written, the agent's own command line being run, and the
 //! report.
 //!
-//! The agent's command line is a stand-in that records what it was asked and
-//! answers the way the real one does — including the part that matters most,
-//! that installing a plugin takes a *copy* of it. A stand-in that only recorded
-//! its arguments would agree with an installer that never noticed the copy had
-//! gone stale, which is the failure this is most concerned with catching.
+//! One agent's command line is a stand-in, because one of them still has to be
+//! run: an installation made the way an earlier build made them is registered
+//! inside Claude rather than on disk, and clearing that away means asking Claude
+//! about it and then telling it. The stand-in records what it was asked and
+//! answers from a world of its own, so a test can describe a machine that
+//! carries such an installation and a machine that never did, and see that only
+//! one of them is asked anything at all.
 
 use std::fs;
 use std::io;
@@ -25,10 +27,10 @@ const WORLD_VAR: &str = "AGENTBUS_TEST_CLAUDE_WORLD";
 
 /// A stand-in for Claude's command line.
 ///
-/// It answers `plugin marketplace list` and `plugin list` from what it has been
-/// told, and `plugin install` copies the plugin out of the marketplace exactly
-/// as the real one does — which is what makes a second install of changed
-/// content a real question rather than a formality.
+/// It answers `plugin list` and `plugin marketplace list` from what it has been
+/// told, and forgets what it is asked to forget. Nothing else is needed of it:
+/// installing no longer goes through Claude at all, and what is left is the
+/// retirement of what did.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 set -eu
 # The machine's search path holds only the agents being described, so that
@@ -39,10 +41,6 @@ marketplace="$AGENTBUS_TEST_CLAUDE_WORLD/marketplace"
 installed="$AGENTBUS_TEST_CLAUDE_WORLD/installed"
 
 case "$1 $2 ${3-}" in
-"plugin marketplace add")
-	printf '%s' "$4" > "$marketplace"
-	exit 0
-	;;
 "plugin marketplace remove")
 	rm -f "$marketplace"
 	exit 0
@@ -58,20 +56,13 @@ case "$1 $2 ${3-}" in
 esac
 
 case "$1 $2" in
-"plugin install")
-	[ -f "$marketplace" ] || { printf 'not in any marketplace\n' >&2; exit 1; }
-	rm -rf "$installed"
-	mkdir -p "$installed"
-	cp -R "$(cat "$marketplace")/agentbus/." "$installed/"
-	exit 0
-	;;
 "plugin uninstall")
-	rm -rf "$installed"
+	rm -f "$installed"
 	exit 0
 	;;
 "plugin list")
-	if [ -d "$installed" ]; then
-		printf '[{"id":"agentbus@agentbus","version":"0.1.0","installPath":"%s"}]' "$installed"
+	if [ -f "$installed" ]; then
+		printf '[{"id":"agentbus@agentbus","version":"0.1.0","installPath":"%s"}]' "$(cat "$installed")"
 	else
 		printf '[]'
 	fi
@@ -186,14 +177,42 @@ impl Machine {
         succeeds(&output).to_owned()
     }
 
-    /// Where the marketplace is generated.
+    /// Puts on the machine what an installation made the way an earlier build
+    /// made them left behind: the generated marketplace, and a Claude that says
+    /// it has the plugin from it installed.
+    fn with_the_old_install(self) -> Self {
+        let root = self.marketplace();
+        for name in [
+            ".claude-plugin/marketplace.json",
+            "agentbus/.claude-plugin/plugin.json",
+            "agentbus/hooks/hooks.json",
+        ] {
+            let path = root.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "{}\n").unwrap();
+        }
+        fs::write(self.world.join("marketplace"), root.to_str().unwrap()).unwrap();
+        fs::write(
+            self.world.join("installed"),
+            root.join("agentbus").to_str().unwrap(),
+        )
+        .unwrap();
+        self
+    }
+
+    /// Where an earlier build generated its marketplace.
     fn marketplace(&self) -> PathBuf {
         self.home.join(".local/share/agentbus/claude-marketplace")
     }
 
-    /// The hooks inside the generated marketplace.
-    fn hooks(&self) -> PathBuf {
-        self.marketplace().join("agentbus/hooks/hooks.json")
+    /// The wrapper Claude is told to run.
+    fn claude_wrapper(&self) -> PathBuf {
+        self.home.join(".claude/hooks/agentbus.sh")
+    }
+
+    /// The settings file the entry that runs it goes into.
+    fn claude_settings(&self) -> PathBuf {
+        self.home.join(".claude/settings.json")
     }
 
     /// Where Codex's hooks are dropped in.
@@ -362,23 +381,21 @@ fn a_dry_run_says_what_it_would_do_and_does_none_of_it() {
 
     let report = machine.report(&["install", "--dry-run"]);
 
+    for path in [machine.claude_wrapper(), machine.claude_settings()] {
+        assert!(
+            report.contains(&format!("would create {}", path.display())),
+            "{report}"
+        );
+    }
     assert!(
-        report.contains(&format!("would create {}", machine.hooks().display())),
-        "{report}"
-    );
-    assert!(
-        report.contains("would run claude plugin install agentbus@agentbus -s user"),
-        "{report}"
-    );
-    assert!(
-        is_untouched(&machine.marketplace()),
+        is_untouched(&machine.home.join(".claude")),
         "a dry run wrote files"
     );
     assert!(is_untouched(&machine.state), "a dry run wrote a record");
     assert_eq!(
-        machine.asked_to_change(),
+        machine.asked(),
         Vec::<String>::new(),
-        "a dry run had the agent change something"
+        "a dry run went to the agent's own command line"
     );
 }
 
@@ -437,158 +454,187 @@ fn a_run_with_nowhere_to_look_says_which_variable_is_missing() {
 }
 
 #[test]
-fn installing_generates_the_marketplace_and_has_the_agent_install_from_it() {
+fn installing_drops_a_wrapper_in_and_points_the_settings_at_it() {
     let machine = Machine::new().with_claude();
 
     let report = machine.report(&["install", "--agent", "claude"]);
 
-    let marketplace = machine.marketplace();
-    for name in [
-        ".claude-plugin/marketplace.json",
-        "agentbus/.claude-plugin/plugin.json",
-        "agentbus/hooks/hooks.json",
-    ] {
-        let path = marketplace.join(name);
-        assert!(path.is_file(), "{} was not written", path.display());
-        assert!(
-            report.contains(&format!("created {}", path.display())),
-            "{report}"
-        );
-    }
-    assert_eq!(
-        machine.asked_to_change(),
-        vec![
-            format!("plugin marketplace add {}", marketplace.display()),
-            "plugin install agentbus@agentbus -s user".to_owned(),
-        ]
+    let wrapper = machine.claude_wrapper();
+    assert!(
+        report.contains(&format!("created {}", wrapper.display())),
+        "{report}"
     );
+    let script = fs::read_to_string(&wrapper).expect("no wrapper was written");
+    // Marked, because that is the whole of how an upgrade and an uninstall later
+    // tell this program's own file from one that merely shares its name.
+    assert!(
+        agentbus_install::sentinel::is_generated(&script),
+        "the wrapper was left unmarked: {script}"
+    );
+    assert!(
+        script.contains(&format!("'{}'", env!("CARGO_BIN_EXE_agentbus"))),
+        "the wrapper does not name the binary that wrote it: {script}"
+    );
+    assert!(script.contains("emit --agent claude"), "{script}");
+    assert!(!script.contains('@'), "a placeholder was left in: {script}");
+    // A script the agent is told to run is a script the machine has to let it
+    // run.
+    assert_eq!(
+        fs::metadata(&wrapper).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+
+    let settings = machine.claude_settings();
+    assert!(
+        report.contains(&format!("created {}", settings.display())),
+        "{report}"
+    );
+    let entries = machine.document(&settings)["hooks"]["SessionStart"]
+        .as_array()
+        .cloned()
+        .expect("no entry was written");
+    assert_eq!(entries.len(), 1);
+    assert!(
+        agentbus_install::sentinel::is_marked(&entries[0]),
+        "the entry was left unmarked"
+    );
+    assert_eq!(entries[0]["matcher"], serde_json::Value::from("*"));
+
+    // Nothing on this machine was ever installed the old way, so the agent's
+    // own command line was never troubled.
+    assert_eq!(machine.asked(), Vec::<String>::new());
 }
 
 #[test]
-fn every_hook_runs_the_binary_by_an_absolute_path_and_never_waits_for_it() {
+fn the_entry_runs_the_wrapper_by_an_absolute_path_and_never_waits_for_it() {
     let machine = Machine::new().with_claude();
 
     machine.report(&["install", "--agent", "claude"]);
 
-    let hooks: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(machine.hooks()).unwrap()).unwrap();
-    let events = hooks["hooks"]
+    let settings = machine.document(&machine.claude_settings());
+    let events = settings["hooks"]
         .as_object()
         .expect("no hooks were registered");
+    // One event, and it is the one that says which session this is. What every
+    // other event means is worked out from the payload this one's hook forwards.
     assert_eq!(
         events.keys().map(String::as_str).collect::<Vec<&str>>(),
-        [
-            "SessionStart",
-            "UserPromptSubmit",
-            "PreToolUse",
-            "PostToolUse",
-            "Notification",
-            "Stop",
-            "StopFailure",
-            "SubagentStart",
-            "SubagentStop",
-            "PreCompact",
-            "SessionEnd",
-        ]
+        ["SessionStart"]
     );
-    for (event, matchers) in events {
-        for entry in matchers.as_array().expect(event) {
-            for hook in entry["hooks"].as_array().expect(event) {
-                let command = hook["command"].as_str().expect(event);
-                assert!(command.starts_with('/'), "{event}: {command}");
-                assert!(
-                    command.ends_with(" emit --agent claude"),
-                    "{event}: {command}"
-                );
-                assert_eq!(hook["async"], serde_json::Value::Bool(true), "{event}");
-            }
-        }
+    for hook in events["SessionStart"][0]["hooks"]
+        .as_array()
+        .expect("no hook was written")
+    {
+        assert_eq!(hook["type"], serde_json::Value::from("command"));
+        assert_eq!(
+            hook["command"],
+            serde_json::Value::from(format!("bash '{}'", machine.claude_wrapper().display()))
+        );
+        assert_eq!(hook["async"], serde_json::Value::Bool(true));
+        assert_eq!(hook["timeout"], serde_json::Value::from(5));
     }
-    assert_eq!(
-        events["PreToolUse"][0]["matcher"],
-        serde_json::Value::from("*")
-    );
 }
 
 #[test]
 fn installing_twice_changes_nothing_the_second_time() {
     let machine = Machine::new().with_claude();
     machine.report(&["install", "--agent", "claude"]);
-    let first = machine.asked_to_change();
+    let (wrapper, settings) = (machine.claude_wrapper(), machine.claude_settings());
+    let after_one = (
+        fs::read_to_string(&wrapper).unwrap(),
+        fs::read_to_string(&settings).unwrap(),
+    );
 
     let report = machine.report(&["install", "--agent", "claude"]);
 
     assert!(report.contains("  already installed\n"), "{report}");
-    assert!(
-        report.contains("already run claude plugin install agentbus@agentbus -s user"),
-        "{report}"
-    );
+    for path in [&wrapper, &settings] {
+        assert!(
+            report.contains(&format!("unchanged {}", path.display())),
+            "{report}"
+        );
+    }
     assert_eq!(
-        machine.asked_to_change(),
-        first,
-        "the second run had the agent do something again"
+        (
+            fs::read_to_string(&wrapper).unwrap(),
+            fs::read_to_string(&settings).unwrap()
+        ),
+        after_one
+    );
+    assert!(
+        machine.backups_of(&settings).is_empty(),
+        "a run that changed nothing still copied the file"
     );
 }
 
 #[test]
-fn a_binary_that_moved_has_the_agent_take_the_plugin_again() {
+fn a_binary_that_moved_is_written_into_the_wrapper_again() {
     let machine = Machine::new().with_claude();
     machine.report(&["install", "--agent", "claude"]);
-    let before = machine.asked_to_change().len();
     let moved = machine.moved_binary();
 
-    // The version has not changed, so the agent would keep serving the copy it
-    // already took — which names a binary that is no longer where it was.
     let output = machine.run_binary(&moved, &["install", "--agent", "claude"]);
     let report = succeeds(&output);
 
+    let wrapper = machine.claude_wrapper();
     assert!(
-        report.contains(&format!("updated {}", machine.hooks().display())),
+        report.contains(&format!("updated {}", wrapper.display())),
         "{report}"
     );
-    assert_eq!(
-        machine.asked_to_change()[before..],
-        [
-            "plugin uninstall agentbus@agentbus -s user".to_owned(),
-            "plugin install agentbus@agentbus -s user".to_owned(),
-        ],
-        "a stale copy was not taken again"
-    );
-    let hooks = fs::read_to_string(machine.hooks()).unwrap();
+    let script = fs::read_to_string(&wrapper).unwrap();
     assert!(
-        hooks.contains(&moved.display().to_string()),
-        "the hooks do not name the binary that wrote them: {hooks}"
+        script.contains(&moved.display().to_string()),
+        "the wrapper does not name the binary that wrote it: {script}"
+    );
+    // The entry names the wrapper, and the wrapper has not moved, so the file
+    // the user maintains was not written again on account of it.
+    assert!(
+        report.contains(&format!(
+            "unchanged {}",
+            machine.claude_settings().display()
+        )),
+        "{report}"
     );
 }
 
 #[test]
-fn uninstalling_takes_the_plugin_back_out_and_leaves_nothing_behind() {
+fn uninstalling_takes_the_entry_and_the_wrapper_and_leaves_nothing_behind() {
     let machine = Machine::new().with_claude();
     machine.report(&["install", "--agent", "claude"]);
-    let installed = machine.asked_to_change().len();
 
     let report = machine.report(&["uninstall", "--agent", "claude"]);
 
-    assert_eq!(
-        machine.asked_to_change()[installed..],
-        [
-            "plugin uninstall agentbus@agentbus -s user".to_owned(),
-            "plugin marketplace remove agentbus".to_owned(),
-        ]
-    );
+    let wrapper = machine.claude_wrapper();
     assert!(
-        report.contains(&format!("removed {}", machine.marketplace().display())),
+        report.contains(&format!("removed {}", wrapper.display())),
         "{report}"
     );
+    assert!(!wrapper.exists(), "{} was left behind", wrapper.display());
     assert!(
-        !machine.marketplace().exists(),
-        "{} was left behind",
-        machine.marketplace().display()
+        !machine.claude_settings().exists(),
+        "a settings file this program made was left behind"
     );
+    // Nothing of this program's is left, down to the directories it made — and
+    // the agent's own command line was never asked about any of it.
     assert!(
-        !machine.home.join(".local/share/agentbus").exists(),
-        "the directory the marketplace was in was left behind"
+        !machine.home.join(".claude").exists(),
+        "a directory this program made was left behind"
     );
+    assert_eq!(machine.asked(), Vec::<String>::new());
+}
+
+#[test]
+fn a_configuration_directory_the_user_already_had_survives_an_uninstall() {
+    let machine = Machine::new().configured("claude").with_claude();
+    machine.report(&["install", "--agent", "claude"]);
+
+    machine.report(&["uninstall", "--agent", "claude"]);
+
+    assert!(
+        machine.home.join(".claude").is_dir(),
+        "a directory this program did not make was removed"
+    );
+    assert!(!machine.home.join(".claude/hooks").exists());
 }
 
 #[test]
@@ -603,51 +649,221 @@ fn uninstalling_what_was_never_installed_changes_nothing() {
 }
 
 #[test]
-fn the_agents_own_settings_file_is_never_touched() {
+fn what_the_user_had_in_their_settings_survives_being_installed_around() {
     let machine = Machine::new().configured("claude").with_claude();
-    let settings = machine.home.join(".claude/settings.json");
-    let before = "{\n  \"model\": \"whatever the user chose\"\n}\n";
-    fs::write(&settings, before).unwrap();
+    let settings = machine.claude_settings();
+    // Written the way somebody keeps a file by hand: tabs, one hook of their
+    // own, and the line endings of the machine they wrote it on.
+    let theirs = "{\r\n\t\"model\": \"whatever the user chose\",\r\n\t\"hooks\": {\r\n\t\t\"Stop\": [\r\n\t\t\t{ \"hooks\": [{ \"type\": \"command\", \"command\": \"notify-send done\" }] }\r\n\t\t]\r\n\t}\r\n}\r\n";
+    fs::write(&settings, theirs).unwrap();
 
     machine.report(&["install", "--agent", "claude"]);
+
+    let after = fs::read_to_string(&settings).unwrap();
+    assert!(
+        after.starts_with("{\r\n\t\"model\": \"whatever the user chose\",\r\n"),
+        "{after}"
+    );
+    assert!(after.contains("notify-send done"), "{after}");
+    let merged = machine.document(&settings);
+    assert_eq!(merged["hooks"]["Stop"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        merged["hooks"]["SessionStart"].as_array().unwrap().len(),
+        1,
+        "ours was not added beside theirs"
+    );
+    assert_eq!(
+        machine.backups_of(&settings).len(),
+        1,
+        "the file was changed without a copy being taken first"
+    );
+
     machine.report(&["uninstall", "--agent", "claude"]);
 
-    assert_eq!(fs::read_to_string(&settings).unwrap(), before);
+    assert_eq!(
+        fs::read_to_string(&settings).unwrap(),
+        theirs,
+        "the user's own file did not come back as it went in"
+    );
 }
 
 #[test]
-fn an_agent_that_cannot_be_run_leaves_the_files_and_says_what_to_run() {
-    let machine = Machine::new().configured("claude");
+fn a_settings_file_that_cannot_be_rewritten_is_left_exactly_as_it_was() {
+    let machine = Machine::new().configured("claude").with_claude();
+    let settings = machine.claude_settings();
+    // Reads perfectly well, and writing it back out would silently drop the
+    // first of the two.
+    let theirs = "{\n  \"hooks\": {},\n  \"hooks\": {\"SessionStart\": []}\n}\n";
+    fs::write(&settings, theirs).unwrap();
 
     let output = machine.run(&["install", "--agent", "claude"]);
 
     assert!(!output.status.success(), "{output:?}");
     let complaint = String::from_utf8_lossy(&output.stderr);
     assert!(
-        complaint.contains("claude plugin marketplace add"),
+        complaint.contains(&settings.display().to_string()),
         "{complaint}"
     );
-    assert!(complaint.contains("by hand"), "{complaint}");
+    assert!(complaint.contains("left as it was"), "{complaint}");
+    assert_eq!(fs::read_to_string(&settings).unwrap(), theirs);
+    assert!(machine.backups_of(&settings).is_empty());
     assert!(
-        machine.hooks().is_file(),
-        "the files a user was told to register were not written"
+        !machine.claude_wrapper().exists(),
+        "a plan that was refused still wrote a file"
+    );
+}
+
+#[test]
+fn an_installation_made_the_old_way_is_taken_away_when_the_new_one_goes_in() {
+    let machine = Machine::new()
+        .configured("claude")
+        .with_claude()
+        .with_the_old_install();
+
+    let report = machine.report(&["install", "--agent", "claude"]);
+
+    assert_eq!(
+        machine.asked_to_change(),
+        vec![
+            "plugin uninstall agentbus@agentbus -s user".to_owned(),
+            "plugin marketplace remove agentbus".to_owned(),
+        ]
     );
     assert!(
-        !machine.home.join(".claude/settings.json").exists(),
-        "a failed run wrote into the agent's own settings"
+        report.contains(&format!("removed {}", machine.marketplace().display())),
+        "{report}"
+    );
+    assert!(
+        !machine.marketplace().exists(),
+        "{} was left behind",
+        machine.marketplace().display()
+    );
+    assert!(
+        machine.claude_wrapper().is_file(),
+        "the installation that replaces it did not land"
+    );
+}
+
+#[test]
+fn an_installation_made_the_old_way_is_taken_away_by_an_uninstall_too() {
+    let machine = Machine::new()
+        .configured("claude")
+        .with_claude()
+        .with_the_old_install();
+
+    machine.report(&["uninstall", "--agent", "claude"]);
+
+    assert_eq!(
+        machine.asked_to_change(),
+        vec![
+            "plugin uninstall agentbus@agentbus -s user".to_owned(),
+            "plugin marketplace remove agentbus".to_owned(),
+        ]
+    );
+    assert!(!machine.marketplace().exists());
+    assert!(!machine.claude_wrapper().exists());
+}
+
+#[test]
+fn an_installation_made_the_old_way_goes_even_where_the_agent_cannot_be_run() {
+    // Its configuration directory is there and its command is not, which is what
+    // a machine whose agent has been removed since looks like.
+    let machine = Machine::new().configured("claude").with_the_old_install();
+
+    let report = machine.report(&["uninstall", "--agent", "claude"]);
+
+    // Nothing could be asked, so nothing is claimed to have been done about the
+    // registration — and the files go regardless, which is the half of it this
+    // program can do by itself.
+    assert!(
+        report.contains("already run claude plugin uninstall agentbus@agentbus -s user"),
+        "{report}"
+    );
+    assert!(
+        !machine.marketplace().exists(),
+        "{} was left behind",
+        machine.marketplace().display()
+    );
+}
+
+#[test]
+fn a_record_left_by_an_earlier_build_is_cleared_when_the_new_installation_goes_in() {
+    let machine = Machine::new().configured("claude").with_claude();
+    // A record in the shape an earlier build wrote it, naming a file of a
+    // marketplace whose directory somebody has since deleted by hand — the one
+    // trace nothing on disk could still find.
+    let record = machine.state.join("agentbus/installed.json");
+    fs::create_dir_all(record.parent().unwrap()).unwrap();
+    let stale = machine.marketplace().join("agentbus/hooks/hooks.json");
+    fs::write(
+        &record,
+        format!(
+            "{{\n  \"version\": 1,\n  \"files\": {{\n    \"{}\": {{\n      \"agent\": \"claude\",\n      \"ownership\": \"created\"\n    }}\n  }}\n}}\n",
+            stale.display()
+        ),
+    )
+    .unwrap();
+
+    let report = machine.report(&["install", "--agent", "claude"]);
+
+    assert!(
+        report.contains(&format!("removed {}", stale.display())),
+        "{report}"
+    );
+    let after = machine.document(&record);
+    assert!(
+        after["files"]
+            .as_object()
+            .expect("no files in the record")
+            .keys()
+            .all(|path| !path.contains("claude-marketplace")),
+        "{after}"
+    );
+}
+
+#[test]
+fn uninstalling_a_machine_that_carries_both_installations_leaves_no_record_of_either() {
+    let machine = Machine::new()
+        .configured("claude")
+        .with_claude()
+        .with_the_old_install();
+    machine.report(&["install", "--agent", "claude"]);
+
+    machine.report(&["uninstall", "--agent", "claude"]);
+
+    assert!(!machine.marketplace().exists());
+    assert!(!machine.claude_wrapper().exists());
+    assert!(!machine.claude_settings().exists());
+    let record = machine.document(&machine.state.join("agentbus/installed.json"));
+    assert_eq!(
+        record["files"].as_object().map(serde_json::Map::len),
+        Some(0),
+        "a file this program wrote is still in the record: {record}"
+    );
+    assert_eq!(
+        record["agents"].as_object().map(serde_json::Map::len),
+        Some(0),
+        "an agent with nothing installed is still remembered as having something: {record}"
     );
 }
 
 #[test]
 fn a_run_that_stopped_partway_still_remembers_what_it_wrote() {
-    let machine = Machine::new().configured("claude");
-    machine.run(&["install", "--agent", "claude"]);
+    let machine = Machine::new().with_claude().configured("opencode");
+    // A plugin of the user's own under the name this program uses, which stops
+    // the plan for the agent that comes after claude.
+    let plugin = machine.opencode_plugin();
+    fs::create_dir_all(plugin.parent().unwrap()).unwrap();
+    fs::write(&plugin, "// mine\n").unwrap();
 
+    let output = machine.run(&["install", "--agent", "claude", "--agent", "opencode"]);
+
+    assert!(!output.status.success(), "{output:?}");
     let record = fs::read_to_string(machine.state.join("agentbus/installed.json"))
         .expect("nothing was remembered about a run that wrote files");
 
     assert!(
-        record.contains("hooks.json"),
+        record.contains("agentbus.sh"),
         "a file that was written is not in the record: {record}"
     );
 }

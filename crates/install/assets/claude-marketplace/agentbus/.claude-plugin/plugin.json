@@ -1,5 +1,0 @@
-{
-  "name": "agentbus",
-  "version": "@VERSION@",
-  "description": "Reports this session's hook events to the agentbus event bus, so that anything subscribed to it can tell what this session is doing."
-}

@@ -1,69 +1,101 @@
 //! Installing for Claude Code.
 //!
-//! Claude reads hooks from a plugin: a directory holding a manifest and a
-//! `hooks/hooks.json` in the same shape as the `hooks` block of its settings
-//! file. That is the mechanism to use, because the alternatives are both files
-//! somebody else maintains — the user's own settings, or a project's settings,
-//! which is worse still for being shared with their colleagues through version
-//! control.
+//! Two things go on the machine. A wrapper script is dropped into a `hooks`
+//! directory beside Claude's own configuration, and one entry is added to
+//! `settings.json` telling Claude to run it when a session starts. The wrapper
+//! is where the generation mark lives, so a machine can be asked what it is
+//! carrying; the entry is what makes the wrapper ever run.
 //!
-//! A plugin is not installed by being written somewhere, though. Claude installs
-//! plugins from *marketplaces*, and a marketplace is itself just a directory
-//! with a manifest listing the plugins in it. So what this generates is a
-//! marketplace of exactly one plugin, and what it then does is ask Claude — with
-//! Claude's own command line, the only supported way — to add that marketplace
-//! and install that plugin from it. Registering it is Claude's business, written
-//! wherever Claude keeps such things, and this program neither knows nor touches
-//! where that is.
+//! The entry goes into a file somebody keeps by hand, so it is edited through
+//! [`crate::cst`] rather than parsed and written back: their comments are not
+//! allowed there by Claude's own reader, but their key order, their indentation
+//! and their line endings are theirs, and an installer that reformatted the
+//! file would be handing them a diff of the whole thing where they asked for
+//! four lines.
 //!
-//! The generated files name this program's own binary by an absolute path, and
-//! that is what makes an installation go stale: a binary that moved leaves hooks
-//! pointing at nothing. Claude copies a plugin's files when it installs them and
-//! only refreshes that copy when the version changes, so a reinstall at the same
-//! version would silently keep the old copy. This therefore compares what Claude
-//! actually installed against what it would generate now, and when they differ
-//! it removes the plugin and installs it again — which is the only sequence that
-//! makes Claude take a new copy.
+//! The one event hooked is the start of a session, because what this program
+//! needs from Claude at install time is the identity of the session that is
+//! running: which session it is, and where its transcript is. What every other
+//! event *means* is decided from the payload the wrapper forwards, and adding
+//! more of them to somebody's settings file is a cost paid on every session for
+//! events nothing is waiting for.
+//!
+//! # What was here before
+//!
+//! Earlier builds installed for Claude by generating a marketplace of one
+//! plugin below this program's data directory and asking Claude's own command
+//! line to add the marketplace and install the plugin from it. That mechanism
+//! is retired, and a machine still carrying it is cleaned up on the way past —
+//! by both directions, because a user who installs again and a user who gives
+//! up and uninstalls are equally entitled to be rid of it. Nothing is asked of
+//! Claude's command line unless something of that installation is actually
+//! there, so the ordinary install on an ordinary machine runs no subprocess at
+//! all.
 
 use std::path::{Path, PathBuf};
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::agent::Agent;
 use crate::change::Change;
-use crate::command::Invocation;
-use crate::paths::Environment;
-use crate::state::State;
+use crate::command::{self, Invocation};
+use crate::cst::CstDocument;
+use crate::paths::{Environment, Platform};
+use crate::state::{Ownership, State};
 use crate::status::HookStatus;
-use crate::{Error, Installer, assets, file, json};
+use crate::{Error, Installer, assets, file, json, sentinel};
 
-/// What the plugin, and the marketplace offering it, are both called.
+/// The directory inside Claude's configuration that the wrapper is dropped
+/// into.
 ///
-/// One name for both because there is one of each and they are the same thing
-/// twice: a user reading either name in Claude's own output should see this
-/// program's name and nothing to work out.
-const NAME: &str = "agentbus";
+/// Claude does not require hooks to live anywhere in particular — the entry
+/// names the script by an absolute path — but a directory of that name is where
+/// a user would look for one, and putting it there keeps a generated file out of
+/// the top of a directory they read.
+const HOOKS_DIR: &str = "hooks";
 
-/// The directory the marketplace is generated into, below the data directory.
-const DIR_NAME: &str = "claude-marketplace";
-
-/// The scope every registration is made at.
+/// The file Claude keeps this user's own settings in, and the one the entry
+/// goes into.
 ///
-/// The user's, rather than a project's: a project's configuration is shared with
-/// everyone who checks the repository out, and installing one person's local
-/// tooling into it would be installing it for their colleagues too.
-const SCOPE: &str = "user";
+/// The user's, rather than a project's: a project's settings are checked into
+/// version control and shared with everyone who clones the repository, and
+/// installing one person's local tooling into it would be installing it for
+/// their colleagues too.
+const SETTINGS: &str = "settings.json";
 
-/// What the templates say where this program's own binary belongs.
+/// Where in the settings the entry goes.
+const HOOKS_KEY: &str = "hooks";
+
+/// The event the wrapper is run on.
+const EVENT: &str = "SessionStart";
+
+/// What the entry matches, which is everything.
+///
+/// The event carries no tool name to match on, so the pattern is the one that
+/// says so rather than an omission a reader would have to interpret.
+const MATCHER: &str = "*";
+
+/// How long Claude is asked to allow the wrapper, in seconds.
+///
+/// Far longer than the wrapper can take, and there so that a machine which has
+/// somehow made it slow cannot make somebody's session slow with it.
+const TIMEOUT: u64 = 5;
+
+/// What the wrapper says where this program's own binary belongs.
 const BINARY_MARK: &str = "@BINARY@";
 
-/// What the templates say where the plugin's version belongs.
-const VERSION_MARK: &str = "@VERSION@";
+/// What the plugin, and the marketplace that offered it, were both called.
+const RETIRED_NAME: &str = "agentbus";
 
-/// The version the generated plugin carries, which is this program's own.
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The directory the retired marketplace was generated into, below the data
+/// directory.
+const RETIRED_DIR: &str = "claude-marketplace";
 
-/// Claude Code's hooks, as a plugin offered by a marketplace of one.
+/// The scope the retired registration was made at.
+const RETIRED_SCOPE: &str = "user";
+
+/// Claude Code's hooks: a wrapper script, and one entry in the settings file
+/// that runs it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Claude;
 
@@ -72,78 +104,324 @@ impl Installer for Claude {
         Agent::Claude
     }
 
-    /// Writes the marketplace, then has Claude register it and install from it.
+    /// Clears away anything an earlier build left, writes the wrapper, then
+    /// points the settings at it.
     ///
-    /// In that order, because the second half reads the first: a marketplace
-    /// Claude is asked about before it exists is a marketplace Claude refuses.
-    fn plan_install(&self, env: &Environment, binary: &Path) -> Result<Vec<Change>, Error> {
-        let root = root(env);
-        let generated = generated(&root, binary)?;
-
-        let mut changes = Vec::new();
-        for (path, contents) in &generated {
-            changes.push(plan_file(path, contents)?);
+    /// In that order. The entry names a file, and a settings file that named one
+    /// which is not there yet would be a session's worth of hooks that do
+    /// nothing — a window that is short, avoidable, and hard to explain
+    /// afterwards.
+    fn plan_install(
+        &self,
+        env: &Environment,
+        state: &State,
+        binary: &Path,
+    ) -> Result<Vec<Change>, Error> {
+        let mut changes = plan_retirement(env, state);
+        // Writing a file makes the directories above it anyway; these are here
+        // so that the making is recorded, which is the one thing the uninstall
+        // cannot work out for itself later. Both, because an agent found by its
+        // command alone may have no configuration directory yet, and one this
+        // program made is one it has to be able to take away again.
+        for dir in [Agent::Claude.config_dir(env), hooks_dir(env)] {
+            if !dir.is_dir() {
+                changes.push(Change::Make { path: dir });
+            }
         }
-        changes.extend(plan_registration(env, &root, &generated));
+        changes.push(plan_wrapper(env, binary)?);
+        changes.push(plan_entry(env)?);
         Ok(changes)
     }
 
-    /// Has Claude forget the plugin and the marketplace, then removes what was
-    /// generated for them.
+    /// Takes the entry out, then the wrapper, and clears away anything an
+    /// earlier build left as well.
     ///
-    /// In that order, for the same reason reversed: Claude is being asked about
-    /// a marketplace that is still on disk, and asking it afterwards would be
-    /// asking about a directory that is no longer there.
-    ///
-    /// The files go whether or not the record says this program created them.
-    /// Everywhere else that question decides between deleting litter and
-    /// deleting somebody's own file, but this whole directory is generated: it
-    /// is below this program's own data directory, nothing else writes to it,
-    /// and a lost record is not a reason to leave it behind.
-    fn plan_uninstall(&self, env: &Environment, _state: &State) -> Result<Vec<Change>, Error> {
-        let root = root(env);
+    /// In that order for the same reason reversed: the entry is what runs the
+    /// file, so it goes first and nothing is ever pointed at something that is
+    /// no longer there.
+    fn plan_uninstall(&self, env: &Environment, state: &State) -> Result<Vec<Change>, Error> {
+        let mut changes = plan_retirement(env, state);
+        changes.push(plan_entry_removal(env, state)?);
 
-        let mut changes = plan_deregistration(env, &root);
-        for path in paths(&root) {
-            changes.push(match path.exists() {
-                true => Change::Delete { path },
-                false => Change::Keep { path },
-            });
-        }
-        changes.push(match root.exists() {
-            true => Change::Clear { path: root },
-            false => Change::Keep { path: root },
+        let path = wrapper(env);
+        // A file without the mark is passed over here rather than refused,
+        // unlike on the way in: an uninstall that stopped because something of
+        // the user's is in the way would be refusing to do the one thing it can
+        // certainly do safely, which is nothing.
+        changes.push(match read(&path)? {
+            Some(text) if sentinel::is_generated(&text) => Change::Delete { path },
+            _ => Change::Keep { path },
         });
+        // Deepest first, and only the directories the record says this program
+        // made: one the user already had is theirs however empty this leaves it.
+        for dir in [hooks_dir(env), Agent::Claude.config_dir(env)] {
+            if state.ownership(&dir) == Some(Ownership::Created) {
+                changes.push(Change::Clear { path: dir });
+            }
+        }
         Ok(changes)
     }
 
-    /// Reads the generated hooks, and looks for the rest of the marketplace
-    /// around them.
+    /// Reads the wrapper, and then looks for the entry that runs it.
     ///
-    /// The hooks are the file that says which generation this is, because they
-    /// are the one whose content is the installation; the two manifests exist to
-    /// get Claude to read them. A hooks file with no manifests beside it is one
-    /// Claude will never be offered, which is a working file in a broken
-    /// installation — exactly the case worth telling somebody about.
+    /// The wrapper is the file that says which generation this is, because it is
+    /// the one whose content is the installation. A wrapper nothing calls is a
+    /// working file in an installation that never runs, which is exactly the
+    /// case worth telling somebody about — and so is an entry left over from an
+    /// installation whose wrapper has since moved, because it names the path it
+    /// was written with and not wherever one is now.
     fn status(&self, env: &Environment) -> Result<HookStatus, Error> {
-        let root = root(env);
-        let [marketplace, plugin, hooks] = paths(&root);
-
-        let status = HookStatus::of_asset(self.agent(), &hooks)?;
-        Ok(status.confirmed(marketplace.is_file() && plugin.is_file()))
+        let path = wrapper(env);
+        let Some(text) = read(&path)? else {
+            return Ok(HookStatus::NotInstalled);
+        };
+        if !sentinel::is_generated(&text) {
+            return Ok(HookStatus::NotInstalled);
+        }
+        let status = HookStatus::of_text(self.agent(), &text);
+        Ok(status.confirmed(is_pointed_at(env)?))
     }
 }
 
-/// Where the marketplace is generated.
-fn root(env: &Environment) -> PathBuf {
-    env.data_dir().join(DIR_NAME)
+/// The directory the wrapper is dropped into.
+fn hooks_dir(env: &Environment) -> PathBuf {
+    Agent::Claude.config_dir(env).join(HOOKS_DIR)
 }
 
-/// Every file the marketplace is made of, in the order Claude's own layout
-/// suggests, so that a report of what was written reads like a walk of the
-/// directory rather than like the order the code happened to be written in.
-fn paths(root: &Path) -> [PathBuf; 3] {
-    let plugin = plugin_dir(root);
+/// The wrapper this program drops in there.
+fn wrapper(env: &Environment) -> PathBuf {
+    hooks_dir(env).join(match env.platform() {
+        Platform::Unix => "agentbus.sh",
+        Platform::Windows => "agentbus.ps1",
+    })
+}
+
+/// The settings file the entry goes into.
+fn settings(env: &Environment) -> PathBuf {
+    Agent::Claude.config_dir(env).join(SETTINGS)
+}
+
+/// What the wrapper should hold, with the binary written into it.
+fn generated(platform: Platform, binary: &Path) -> Result<String, Error> {
+    let named = match platform {
+        Platform::Unix => command::in_shell(binary)?,
+        Platform::Windows => command::in_powershell(binary)?,
+    };
+    Ok(assets::CLAUDE_WRAPPER
+        .text(platform)
+        .replace(BINARY_MARK, &named))
+}
+
+/// What writing the wrapper would do, given whatever is at its path now.
+///
+/// A file of that name this program did not write stops the plan. It is the one
+/// case where doing nothing is worse than saying so: silently leaving it would
+/// report a successful installation of hooks that are not installed, and
+/// silently replacing it would delete something a user wrote.
+fn plan_wrapper(env: &Environment, binary: &Path) -> Result<Change, Error> {
+    let path = wrapper(env);
+    let contents = generated(env.platform(), binary)?;
+    Ok(match read(&path)? {
+        None => Change::Create {
+            path,
+            contents,
+            executable: true,
+        },
+        Some(text) if !sentinel::is_generated(&text) => return Err(Error::NotOurs { path }),
+        Some(text) if text == contents => Change::Keep { path },
+        Some(_) => Change::Rewrite {
+            path,
+            contents,
+            executable: true,
+        },
+    })
+}
+
+/// The entry that tells Claude to run the wrapper, marked as this program's.
+///
+/// The mark goes in first so that a user opening their settings file reads who
+/// wrote this before they read what it does.
+fn entry(env: &Environment) -> Result<Value, Error> {
+    let mut hook = Map::new();
+    hook.insert("type".to_owned(), Value::from("command"));
+    hook.insert(
+        "command".to_owned(),
+        Value::from(command::hook_command(
+            Agent::Claude,
+            env.platform(),
+            &wrapper(env),
+            None,
+        )?),
+    );
+    // Claude runs an asynchronous hook without waiting for it, which is what
+    // this one wants: nothing here has anything to say back, and a session that
+    // paused for it would be paying for an event it is not waiting on.
+    hook.insert("async".to_owned(), Value::Bool(true));
+    hook.insert("timeout".to_owned(), Value::from(TIMEOUT));
+
+    let mut entry = Map::new();
+    sentinel::mark(&mut entry);
+    entry.insert("matcher".to_owned(), Value::from(MATCHER));
+    entry.insert("hooks".to_owned(), Value::Array(vec![Value::Object(hook)]));
+    Ok(Value::Object(entry))
+}
+
+/// What putting the entry into the settings file would do.
+///
+/// A file that is not there is written from nothing, which is the case worth
+/// having: no merge, no user content, nothing that can go wrong. A file that is
+/// there is edited in place, and this program's own previous entries come out as
+/// the new one goes in — so an upgrade replaces what an older build wrote rather
+/// than accumulating beside it.
+fn plan_entry(env: &Environment) -> Result<Change, Error> {
+    let path = settings(env);
+    let ours = entry(env)?;
+
+    let Some(text) = read(&path)? else {
+        let mut hooks = Map::new();
+        hooks.insert(EVENT.to_owned(), Value::Array(vec![ours]));
+        let mut document = Map::new();
+        document.insert(HOOKS_KEY.to_owned(), Value::Object(hooks));
+        return Ok(Change::Create {
+            path,
+            contents: json::render(&Value::Object(document), json::DEFAULT_INDENT),
+            executable: false,
+        });
+    };
+
+    let mut document = CstDocument::parse_strict(&path, &text)?;
+    // Asked first, because taking the entry out and putting the same one back
+    // would move the containers it lives in to the end of the objects that hold
+    // them — a change to somebody's file made by a run with nothing to do.
+    if !holds(&document, &ours) {
+        document.retain(&[HOOKS_KEY, EVENT], |value| !sentinel::is_marked(value))?;
+        document.append(&[HOOKS_KEY, EVENT], ours)?;
+    }
+    let contents = document.render();
+    Ok(match contents == text {
+        true => Change::Keep { path },
+        false => Change::Rewrite {
+            path,
+            contents,
+            executable: false,
+        },
+    })
+}
+
+/// What taking this program's entries back out of the settings file would do.
+///
+/// A file holding no mark at all is left alone without being parsed. That is not
+/// a shortcut around the strictness: a file with nothing of this program's in it
+/// is a file an uninstall has nothing to do to, and refusing to finish an
+/// uninstall over a settings file this program never wrote into would be
+/// refusing to remove everything else on the machine as well.
+fn plan_entry_removal(env: &Environment, state: &State) -> Result<Change, Error> {
+    let path = settings(env);
+    let Some(text) = read(&path)? else {
+        return Ok(Change::Keep { path });
+    };
+    if !text.contains(sentinel::KEY) {
+        return Ok(Change::Keep { path });
+    }
+
+    let mut document = CstDocument::parse_strict(&path, &text)?;
+    document.retain(&[HOOKS_KEY, EVENT], |value| !sentinel::is_marked(value))?;
+    let contents = document.render();
+    if contents == text {
+        return Ok(Change::Keep { path });
+    }
+    // A file this program created and has just emptied is litter. One it merely
+    // added to is the user's, however little of it is left.
+    let ours = state.ownership(&path) == Some(Ownership::Created);
+    if ours && document.get(&[]).is_some_and(sentinel::is_vacant) {
+        return Ok(Change::Delete { path });
+    }
+    Ok(Change::Rewrite {
+        path,
+        contents,
+        executable: false,
+    })
+}
+
+/// Whether the settings already hold exactly this program's entry and no other
+/// of its own.
+fn holds(document: &CstDocument, ours: &Value) -> bool {
+    let Some(Value::Array(entries)) = document.get(&[HOOKS_KEY, EVENT]) else {
+        return false;
+    };
+    let mut marked = entries.iter().filter(|entry| sentinel::is_marked(entry));
+    marked.next() == Some(ours) && marked.next().is_none()
+}
+
+/// Whether the settings on this machine run the wrapper this program would
+/// install now.
+///
+/// A settings file that cannot be read as this program reads it counts as not
+/// pointing anywhere. It may well be Claude's to understand, but it is not one
+/// an install could add to either, so an installation resting on it is one that
+/// needs a person.
+fn is_pointed_at(env: &Environment) -> Result<bool, Error> {
+    let path = settings(env);
+    let Some(text) = read(&path)? else {
+        return Ok(false);
+    };
+    let Ok(document) = CstDocument::parse_strict(&path, &text) else {
+        return Ok(false);
+    };
+    Ok(holds(&document, &entry(env)?))
+}
+
+/// What clearing away an installation made the way an earlier build made them
+/// would do, and nothing at all when there is no sign of one.
+///
+/// The signs are the directory that build generated into and this program's own
+/// record of the files it put there. The record is looked at as well as the
+/// directory because it is the only thing that still names a file somebody has
+/// deleted by hand — and a record naming files that no longer exist is what
+/// makes the *next* uninstall unable to say it left nothing behind.
+///
+/// Claude's own command line is asked about the plugin only once something has
+/// been found, so an install on a machine that never had one runs no other
+/// program. What it says is not required: a Claude that cannot be run, or that
+/// answers with something this does not understand, means the registration is
+/// left where it is and the generated files go anyway — which is the outcome a
+/// user can finish by hand, and the one they get for free if they ever run
+/// `claude plugin uninstall` themselves.
+fn plan_retirement(env: &Environment, state: &State) -> Vec<Change> {
+    let root = env.data_dir().join(RETIRED_DIR);
+    let mut generated = state.recorded_below(&root);
+    for path in generated_paths(&root) {
+        if path.exists() && !generated.contains(&path) {
+            generated.push(path);
+        }
+    }
+    generated.sort();
+    if generated.is_empty() && !root.exists() {
+        return Vec::new();
+    }
+
+    let tool = tool(env);
+    let forget = plugin(&tool, ["uninstall", &id(), "-s", RETIRED_SCOPE]);
+    let remove = plugin(&tool, ["marketplace", "remove", RETIRED_NAME]);
+    let mut changes = vec![
+        match is_registered(&tool) {
+            true => Change::Run { command: forget },
+            false => Change::Ran { command: forget },
+        },
+        match knows_marketplace(&tool, &root) {
+            true => Change::Run { command: remove },
+            false => Change::Ran { command: remove },
+        },
+    ];
+    changes.extend(generated.into_iter().map(|path| Change::Delete { path }));
+    changes.push(Change::Clear { path: root });
+    changes
+}
+
+/// Every file the retired marketplace was made of, in the layout that build
+/// wrote them in.
+fn generated_paths(root: &Path) -> [PathBuf; 3] {
+    let plugin = root.join(RETIRED_NAME);
     [
         root.join(".claude-plugin").join("marketplace.json"),
         plugin.join(".claude-plugin").join("plugin.json"),
@@ -151,162 +429,34 @@ fn paths(root: &Path) -> [PathBuf; 3] {
     ]
 }
 
-/// Where the plugin itself sits inside the marketplace.
-fn plugin_dir(root: &Path) -> PathBuf {
-    root.join(NAME)
+/// Whether Claude still has the retired plugin installed.
+fn is_registered(tool: &Path) -> bool {
+    let Some(answer) = plugin(tool, ["list", "--json"]).ask() else {
+        return false;
+    };
+    let Ok(Value::Array(plugins)) = serde_json::from_str::<Value>(&answer) else {
+        return false;
+    };
+    plugins
+        .iter()
+        .any(|plugin| plugin.get("id").and_then(Value::as_str) == Some(&id()))
 }
 
-/// Every file the marketplace is made of, and what should be in it.
-fn generated(root: &Path, binary: &Path) -> Result<Vec<(PathBuf, String)>, Error> {
-    let binary = in_json(binary)?;
-    let contents = [
-        assets::CLAUDE_MARKETPLACE.to_owned(),
-        assets::CLAUDE_PLUGIN.replace(VERSION_MARK, VERSION),
-        assets::CLAUDE_HOOKS.replace(BINARY_MARK, &binary),
-    ];
-    Ok(paths(root).into_iter().zip(contents).collect())
-}
-
-/// A path as it is written inside a JSON string.
+/// Whether Claude still offers the marketplace generated at `root`.
 ///
-/// A path is bytes and a JSON string is text, so a path that is not text cannot
-/// be put in one. That is refused rather than approximated: the lossy spelling
-/// of it would parse, install, and produce hooks that run a command which is not
-/// there — a failure that shows up as an agent quietly emitting nothing, which
-/// is the hardest kind of failure to attribute to its cause.
-fn in_json(path: &Path) -> Result<String, Error> {
-    let text = path.to_str().ok_or_else(|| Error::Unwritable {
-        path: path.to_owned(),
-    })?;
-    Ok(json::escaped(text))
-}
-
-/// What writing one generated file would do.
-fn plan_file(path: &Path, contents: &str) -> Result<Change, Error> {
-    let existing = file::read(path).map_err(|source| Error::Read {
-        path: path.to_owned(),
-        source,
-    })?;
-    Ok(match existing {
-        Some(text) if text == contents => Change::Keep {
-            path: path.to_owned(),
-        },
-        Some(_) => Change::Rewrite {
-            path: path.to_owned(),
-            contents: contents.to_owned(),
-            executable: false,
-        },
-        None => Change::Create {
-            path: path.to_owned(),
-            contents: contents.to_owned(),
-            executable: false,
-        },
-    })
-}
-
-/// What asking Claude to install the plugin would do.
-///
-/// Each of the two steps is skipped only when Claude itself says it has already
-/// happened. Neither answer is required: a Claude that cannot be run, or that
-/// answers with something this does not understand, means both steps are
-/// planned, and both are safe to take when they were not needed.
-fn plan_registration(
-    env: &Environment,
-    root: &Path,
-    generated: &[(PathBuf, String)],
-) -> Vec<Change> {
-    let claude = command(env);
-    let mut changes = Vec::new();
-
-    let add = plugin(&claude, ["marketplace", "add", &root.to_string_lossy()]);
-    changes.push(match knows_marketplace(&claude, root) {
-        true => Change::Ran { command: add },
-        false => Change::Run { command: add },
-    });
-
-    let install = plugin(&claude, ["install", &id(), "-s", SCOPE]);
-    match installed(&claude) {
-        // Installed from a copy Claude took of what was generated last time.
-        // Claude refreshes that copy on a version change and on nothing else,
-        // so the only way to hand it a new one at the same version is to have
-        // it forget the plugin first.
-        Some(copy) if !matches(&copy, root, generated) => {
-            changes.push(Change::Run {
-                command: plugin(&claude, ["uninstall", &id(), "-s", SCOPE]),
-            });
-            changes.push(Change::Run { command: install });
-        }
-        Some(_) => changes.push(Change::Ran { command: install }),
-        None => changes.push(Change::Run { command: install }),
-    }
-    changes
-}
-
-/// What asking Claude to forget the plugin would do.
-fn plan_deregistration(env: &Environment, root: &Path) -> Vec<Change> {
-    let claude = command(env);
-
-    let remove = plugin(&claude, ["uninstall", &id(), "-s", SCOPE]);
-    let forget = plugin(&claude, ["marketplace", "remove", NAME]);
-    vec![
-        match installed(&claude).is_some() {
-            true => Change::Run { command: remove },
-            false => Change::Ran { command: remove },
-        },
-        match knows_marketplace(&claude, root) {
-            true => Change::Run { command: forget },
-            false => Change::Ran { command: forget },
-        },
-    ]
-}
-
-/// Whether Claude already offers the marketplace generated at `root`.
-///
-/// The path is part of the question. A marketplace of this name pointing
-/// somewhere else is one this program did not put there, or one left by an
-/// installation whose data directory has since moved, and in both cases adding
-/// it again is what makes the answer right.
-fn knows_marketplace(claude: &Path, root: &Path) -> bool {
-    let Some(answer) = plugin(claude, ["marketplace", "list", "--json"]).ask() else {
+/// The path is part of the question. A marketplace of that name pointing
+/// somewhere else is one this program did not put there, and removing it would
+/// be taking away something of somebody else's that happens to share a name.
+fn knows_marketplace(tool: &Path, root: &Path) -> bool {
+    let Some(answer) = plugin(tool, ["marketplace", "list", "--json"]).ask() else {
         return false;
     };
     let Ok(Value::Array(marketplaces)) = serde_json::from_str::<Value>(&answer) else {
         return false;
     };
     marketplaces.iter().any(|marketplace| {
-        marketplace.get("name").and_then(Value::as_str) == Some(NAME)
+        marketplace.get("name").and_then(Value::as_str) == Some(RETIRED_NAME)
             && marketplace.get("path").and_then(Value::as_str) == root.to_str()
-    })
-}
-
-/// Where Claude keeps its copy of the plugin, if it has one installed.
-fn installed(claude: &Path) -> Option<PathBuf> {
-    let answer = plugin(claude, ["list", "--json"]).ask()?;
-    let Ok(Value::Array(plugins)) = serde_json::from_str::<Value>(&answer) else {
-        return None;
-    };
-    plugins
-        .iter()
-        .find(|plugin| plugin.get("id").and_then(Value::as_str) == Some(&id()))
-        .and_then(|plugin| plugin.get("installPath"))
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-}
-
-/// Whether Claude's copy of the plugin, at `copy`, holds what would be
-/// generated now.
-///
-/// Only the plugin's own files are compared, because only they are copied: the
-/// marketplace manifest stays where it was generated and is read from there. A
-/// file that cannot be read counts as different, which errs towards installing
-/// again — the outcome that is merely wasteful rather than wrong.
-fn matches(copy: &Path, root: &Path, generated: &[(PathBuf, String)]) -> bool {
-    let plugin = plugin_dir(root);
-    generated.iter().all(|(path, contents)| {
-        let Ok(relative) = path.strip_prefix(&plugin) else {
-            return true;
-        };
-        file::read(&copy.join(relative)).ok().flatten().as_deref() == Some(contents.as_str())
     })
 }
 
@@ -314,120 +464,150 @@ fn matches(copy: &Path, root: &Path, generated: &[(PathBuf, String)]) -> bool {
 /// found at all.
 ///
 /// A Claude that is not on the search path is still named, by the command a user
-/// would type. Nothing can be asked of it and every step is planned, and
-/// carrying one out fails with that command line in the message — which is what
-/// somebody whose Claude is installed where this program cannot see it needs in
-/// order to finish the job themselves.
-fn command(env: &Environment) -> PathBuf {
+/// would type, so that a step which has to be taken by hand is printed as
+/// something they can copy.
+fn tool(env: &Environment) -> PathBuf {
     Agent::Claude
         .command(env)
         .unwrap_or_else(|| PathBuf::from(Agent::Claude.name()))
 }
 
 /// One `claude plugin` command.
-fn plugin<'a>(claude: &Path, args: impl IntoIterator<Item = &'a str>) -> Invocation {
+fn plugin<'a>(tool: &Path, args: impl IntoIterator<Item = &'a str>) -> Invocation {
     let mut all = vec!["plugin".to_owned()];
     all.extend(args.into_iter().map(str::to_owned));
-    Invocation::new(claude, all)
+    Invocation::new(tool, all)
 }
 
-/// How Claude names the plugin once it has been installed from the marketplace.
+/// How Claude named the retired plugin once it had been installed from the
+/// marketplace.
 fn id() -> String {
-    format!("{NAME}@{NAME}")
+    format!("{RETIRED_NAME}@{RETIRED_NAME}")
+}
+
+/// Reads a file that may not be there, naming it if reading fails.
+fn read(path: &Path) -> Result<Option<String>, Error> {
+    file::read(path).map_err(|source| Error::Read {
+        path: path.to_owned(),
+        source,
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
-    /// The generated files for a machine rooted at `home`.
-    fn files(home: &str, binary: &str) -> Vec<(PathBuf, String)> {
-        let env = Environment::rooted(home);
-        generated(&root(&env), Path::new(binary)).unwrap()
+    /// A machine with a home directory that really exists and holds nothing.
+    fn machine() -> (tempfile::TempDir, Environment) {
+        let home = tempfile::tempdir().expect("cannot make a temporary directory");
+        let env = Environment::rooted(home.path());
+        (home, env)
     }
 
-    #[test]
-    fn the_marketplace_is_generated_below_this_programs_own_data_directory() {
-        let paths: Vec<PathBuf> = files("/home/u", "/opt/bin/agentbus")
-            .into_iter()
-            .map(|(path, _)| path)
-            .collect();
-
-        assert_eq!(
-            paths,
-            vec![
-                PathBuf::from(
-                    "/home/u/.local/share/agentbus/claude-marketplace/.claude-plugin/marketplace.json"
-                ),
-                PathBuf::from(
-                    "/home/u/.local/share/agentbus/claude-marketplace/agentbus/.claude-plugin/plugin.json"
-                ),
-                PathBuf::from(
-                    "/home/u/.local/share/agentbus/claude-marketplace/agentbus/hooks/hooks.json"
-                ),
-            ]
-        );
+    /// What installing on `env` would do, with nothing installed before.
+    fn plan(env: &Environment) -> Vec<Change> {
+        Claude
+            .plan_install(env, &State::default(), Path::new("/opt/bin/agentbus"))
+            .expect("planning failed")
     }
 
-    #[test]
-    fn every_generated_file_is_json_and_carries_no_placeholder_out_of_the_template() {
-        for (path, contents) in files("/home/u", "/opt/bin/agentbus") {
-            let parsed: Value = serde_json::from_str(&contents)
-                .unwrap_or_else(|error| panic!("{} is not JSON: {error}", path.display()));
-            assert!(parsed.is_object(), "{}", path.display());
-            assert!(!contents.contains(BINARY_MARK), "{}", path.display());
-            assert!(!contents.contains(VERSION_MARK), "{}", path.display());
-        }
-    }
-
-    #[test]
-    fn the_plugin_carries_this_programs_own_version_and_names_nothing_else() {
-        let (_, plugin) = files("/home/u", "/opt/bin/agentbus").remove(1);
-        let manifest: Value = serde_json::from_str(&plugin).unwrap();
-
-        assert_eq!(manifest["name"], Value::from(NAME));
-        assert_eq!(manifest["version"], Value::from(VERSION));
-        assert!(
-            manifest["description"]
-                .as_str()
-                .is_some_and(|text| !text.is_empty()),
-            "{plugin}"
-        );
-    }
-
-    #[test]
-    fn the_marketplace_offers_exactly_the_generated_plugin() {
-        let (_, marketplace) = files("/home/u", "/opt/bin/agentbus").remove(0);
-        let manifest: Value = serde_json::from_str(&marketplace).unwrap();
-
-        assert_eq!(manifest["name"], Value::from(NAME));
-        let offered = manifest["plugins"].as_array().expect("no plugins listed");
-        assert_eq!(offered.len(), 1);
-        assert_eq!(offered[0]["name"], Value::from(NAME));
-        assert_eq!(offered[0]["source"], Value::from(format!("./{NAME}")));
-    }
-
-    #[test]
-    fn every_hook_runs_the_binary_by_the_path_it_was_given() {
-        let (_, hooks) = files("/home/u", "/opt/bin/agentbus").remove(2);
-        let document: Value = serde_json::from_str(&hooks).unwrap();
-
-        let events = document["hooks"].as_object().expect("no hooks");
-        assert!(!events.is_empty());
-        for (event, matchers) in events {
-            for entry in matchers.as_array().expect(event) {
-                for hook in entry["hooks"].as_array().expect(event) {
-                    assert_eq!(hook["type"], Value::from("command"));
-                    assert_eq!(
-                        hook["command"],
-                        Value::from("/opt/bin/agentbus emit --agent claude"),
-                        "{event}"
-                    );
-                    assert_eq!(hook["async"], Value::Bool(true), "{event}");
-                    assert_eq!(hook["timeout"], Value::from(5), "{event}");
-                }
+    /// The settings file as a plan would leave it, given what is in it now.
+    fn settings_after(env: &Environment, before: Option<&str>) -> String {
+        let path = settings(env);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        match before {
+            Some(text) => fs::write(&path, text).unwrap(),
+            None => {
+                let _ = fs::remove_file(&path);
             }
         }
+        match plan(env).pop().expect("no step for the settings") {
+            Change::Create { contents, .. } | Change::Rewrite { contents, .. } => contents,
+            Change::Keep { .. } => before.expect("kept a file that is not there").to_owned(),
+            other => panic!("the settings were {other:?}"),
+        }
+    }
+
+    /// The entry this program would write, as a value.
+    fn ours(env: &Environment) -> Value {
+        entry(env).expect("the entry cannot be built")
+    }
+
+    #[test]
+    fn the_wrapper_obeys_the_rules_every_wrapper_obeys() {
+        assets::tests::is_well_formed(Agent::Claude, &assets::CLAUDE_WRAPPER);
+    }
+
+    #[test]
+    fn installing_writes_a_runnable_wrapper_and_an_entry_that_runs_it() {
+        let (_home, env) = machine();
+
+        let changes = plan(&env);
+
+        let Some(Change::Create {
+            path,
+            contents,
+            executable,
+        }) = changes
+            .iter()
+            .find(|change| change.path() == Some(&wrapper(&env)))
+        else {
+            panic!("the wrapper was not written: {changes:?}");
+        };
+        assert_eq!(path, &env.home().join(".claude/hooks/agentbus.sh"));
+        assert!(
+            executable,
+            "a script nothing may run is a script nothing runs"
+        );
+        assert!(contents.contains("'/opt/bin/agentbus'"), "{contents}");
+        assert!(!contents.contains(BINARY_MARK), "{contents}");
+
+        let hook = &ours(&env)["hooks"][0];
+        assert_eq!(
+            hook["command"],
+            Value::from(format!("bash '{}'", path.display()))
+        );
+        assert_eq!(hook["async"], Value::Bool(true));
+        assert_eq!(hook["timeout"], Value::from(TIMEOUT));
+    }
+
+    #[test]
+    fn a_machine_that_runs_its_scripts_by_extension_gets_the_other_wrapper() {
+        let (_home, env) = machine();
+        let env = env.with_platform(Platform::Windows);
+
+        let changes = plan(&env);
+        let written = changes
+            .iter()
+            .find_map(|change| match change {
+                Change::Create { path, contents, .. } => Some((path, contents)),
+                _ => None,
+            })
+            .expect("nothing was written");
+
+        assert!(written.0.ends_with("agentbus.ps1"), "{:?}", written.0);
+        assert!(written.1.contains("'/opt/bin/agentbus'"), "{}", written.1);
+        assert!(
+            ours(&env)["hooks"][0]["command"]
+                .as_str()
+                .is_some_and(|command| command.contains("powershell")),
+            "{:?}",
+            ours(&env)
+        );
+    }
+
+    #[test]
+    fn a_binary_whose_path_needs_quoting_survives_being_put_in_the_wrapper() {
+        let contents = generated(Platform::Unix, Path::new("/opt/a 'b'/agentbus")).unwrap();
+        assert!(
+            contents.contains(r"'/opt/a '\''b'\''/agentbus'"),
+            "{contents}"
+        );
+
+        let contents = generated(Platform::Windows, Path::new("/opt/a 'b'/agentbus")).unwrap();
+        assert!(contents.contains("'/opt/a ''b''/agentbus'"), "{contents}");
     }
 
     #[test]
@@ -438,65 +618,285 @@ mod tests {
         let path = PathBuf::from(OsStr::from_bytes(b"/opt/\xff/agentbus"));
 
         assert!(matches!(
-            generated(Path::new("/home/u"), &path),
+            generated(Platform::Unix, &path),
             Err(Error::Unwritable { .. })
         ));
     }
 
     #[test]
-    fn a_path_with_something_to_escape_survives_being_put_in_json() {
-        let (_, hooks) = files("/home/u", "/opt/a \"b\"/agentbus").remove(2);
-        let document: Value = serde_json::from_str(&hooks).unwrap();
+    fn a_settings_file_that_is_not_there_is_written_from_nothing() {
+        let (_home, env) = machine();
 
-        assert_eq!(
-            document["hooks"]["Stop"][0]["hooks"][0]["command"],
-            Value::from("/opt/a \"b\"/agentbus emit --agent claude")
+        let written = settings_after(&env, None);
+
+        let document: Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(document["hooks"][EVENT][0], ours(&env));
+        assert!(written.ends_with("}\n"), "{written}");
+    }
+
+    #[test]
+    fn what_the_user_wrote_around_the_entry_comes_back_out_byte_for_byte() {
+        let (_home, env) = machine();
+        let before = "{\n\t\"model\": \"the one they chose\",\r\n\
+                      \t\"hooks\": {\r\n\
+                      \t\t\"SessionStart\": [\r\n\
+                      \t\t\t{ \"hooks\": [{ \"type\": \"command\", \"command\": \"theirs\" }] }\r\n\
+                      \t\t]\r\n\
+                      \t}\r\n\
+                      }\r\n";
+
+        let after = settings_after(&env, Some(before));
+
+        assert!(
+            after.starts_with("{\n\t\"model\": \"the one they chose\",\r\n"),
+            "{after}"
+        );
+        assert!(after.contains("\"command\": \"theirs\""), "{after}");
+        let document: Value = serde_json::from_str(&after).unwrap();
+        let entries = document["hooks"][EVENT].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "{after}");
+        assert_eq!(entries[1], ours(&env));
+    }
+
+    #[test]
+    fn a_settings_file_written_on_one_line_stays_on_one_line() {
+        let (_home, env) = machine();
+        let before = "{\"model\":\"theirs\"}\n";
+
+        let after = settings_after(&env, Some(before));
+
+        assert!(after.starts_with("{\"model\":\"theirs\","), "{after}");
+        let document: Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(document["model"], Value::from("theirs"));
+        assert_eq!(document["hooks"][EVENT][0], ours(&env));
+    }
+
+    #[test]
+    fn installing_twice_leaves_the_settings_exactly_as_they_were() {
+        let (_home, env) = machine();
+        let path = settings(&env);
+        let written = settings_after(&env, None);
+        fs::write(&path, &written).unwrap();
+
+        let again = plan(&env).pop().expect("no step for the settings");
+
+        assert_eq!(again, Change::Keep { path });
+    }
+
+    #[test]
+    fn a_settings_file_that_cannot_be_rewritten_stops_the_plan() {
+        let (_home, env) = machine();
+        let path = settings(&env);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Reads perfectly well, and writing it back out would silently drop the
+        // first of the two.
+        fs::write(&path, "{\n  \"hooks\": {},\n  \"hooks\": {}\n}\n").unwrap();
+
+        assert!(matches!(
+            Claude.plan_install(&env, &State::default(), Path::new("/opt/bin/agentbus")),
+            Err(Error::NotRewritable { .. })
+        ));
+
+        fs::write(&path, "{ not json at all }").unwrap();
+        assert!(matches!(
+            Claude.plan_install(&env, &State::default(), Path::new("/opt/bin/agentbus")),
+            Err(Error::NotRewritable { .. })
+        ));
+    }
+
+    #[test]
+    fn a_wrapper_of_the_users_own_with_the_same_name_stops_the_plan() {
+        let (_home, env) = machine();
+        let path = wrapper(&env);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "# a hook I wrote myself, which happens to share a name\n",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            Claude.plan_install(&env, &State::default(), Path::new("/opt/bin/agentbus")),
+            Err(Error::NotOurs { .. })
+        ));
+    }
+
+    #[test]
+    fn uninstalling_takes_the_entry_out_and_leaves_the_rest_of_the_file() {
+        let (_home, env) = machine();
+        let path = settings(&env);
+        let before = "{\n  \"model\": \"theirs\",\n  \"hooks\": {\n    \"SessionStart\": [\n      { \"hooks\": [{ \"type\": \"command\", \"command\": \"theirs\" }] }\n    ]\n  }\n}\n";
+        let after = settings_after(&env, Some(before));
+        fs::write(&path, &after).unwrap();
+
+        let changes = Claude.plan_uninstall(&env, &State::default()).unwrap();
+        let Some(Change::Rewrite { contents, .. }) =
+            changes.iter().find(|change| change.path() == Some(&*path))
+        else {
+            panic!("the settings were not written back: {changes:?}");
+        };
+
+        assert_eq!(contents, before, "the file did not come back as it went in");
+    }
+
+    #[test]
+    fn uninstalling_a_settings_file_this_program_made_takes_the_file_with_it() {
+        let (_home, env) = machine();
+        let path = settings(&env);
+        fs::write(&path, settings_after(&env, None)).unwrap();
+        let mut state = State::default();
+        state.record(&path, Agent::Claude, Ownership::Created);
+
+        let changes = Claude.plan_uninstall(&env, &state).unwrap();
+
+        assert!(
+            changes.contains(&Change::Delete { path: path.clone() }),
+            "{changes:?}"
         );
     }
 
     #[test]
-    fn a_copy_claude_took_matches_only_while_it_holds_the_plugins_own_files() {
-        let home = tempfile::tempdir().unwrap();
-        let env = Environment::rooted(home.path());
-        let root = root(&env);
-        let generated = generated(&root, Path::new("/opt/bin/agentbus")).unwrap();
-        let copy = home.path().join("copy");
+    fn uninstalling_leaves_a_settings_file_with_nothing_of_ours_in_it_alone() {
+        let (_home, env) = machine();
+        let path = settings(&env);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Not something this program could have written into, and not something
+        // it has to be able to, because there is nothing of its own in it.
+        let theirs = "// their own file, with a comment in it\n{ \"model\": \"theirs\" }\n";
+        fs::write(&path, theirs).unwrap();
+
+        let changes = Claude.plan_uninstall(&env, &State::default()).unwrap();
 
         assert!(
-            !matches(&copy, &root, &generated),
-            "a copy that was never taken cannot match"
+            changes.iter().all(|change| !change.is_change()),
+            "{changes:?}"
         );
+        assert_eq!(fs::read_to_string(&path).unwrap(), theirs);
+    }
 
-        for (path, contents) in &generated {
-            let Ok(relative) = path.strip_prefix(plugin_dir(&root)) else {
-                continue;
-            };
-            file::write(&copy.join(relative), contents).unwrap();
+    #[test]
+    fn nothing_is_asked_of_the_agent_on_a_machine_that_never_had_the_old_install() {
+        let (_home, env) = machine();
+
+        for changes in [
+            plan(&env),
+            Claude.plan_uninstall(&env, &State::default()).unwrap(),
+        ] {
+            assert!(
+                changes.iter().all(|change| change.command().is_none()),
+                "{changes:?}"
+            );
         }
-        assert!(matches(&copy, &root, &generated));
+    }
 
-        file::write(&copy.join("hooks/hooks.json"), "{}").unwrap();
+    #[test]
+    fn an_installation_made_the_old_way_is_taken_away_by_both_directions() {
+        let (_home, env) = machine();
+        let root = env.data_dir().join(RETIRED_DIR);
+        let hooks = generated_paths(&root)[2].clone();
+        file::write(&hooks, "{}").unwrap();
+
+        for changes in [
+            plan(&env),
+            Claude.plan_uninstall(&env, &State::default()).unwrap(),
+        ] {
+            let commands: Vec<String> = changes
+                .iter()
+                .filter_map(Change::command)
+                .map(Invocation::to_string)
+                .collect();
+            assert_eq!(
+                commands,
+                vec![
+                    "claude plugin uninstall agentbus@agentbus -s user".to_owned(),
+                    "claude plugin marketplace remove agentbus".to_owned(),
+                ],
+                "{changes:?}"
+            );
+            assert!(
+                changes.contains(&Change::Delete {
+                    path: hooks.clone()
+                }),
+                "{changes:?}"
+            );
+            assert!(
+                changes.contains(&Change::Clear { path: root.clone() }),
+                "{changes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_only_the_record_still_names_is_taken_away_as_well() {
+        let (_home, env) = machine();
+        let root = env.data_dir().join(RETIRED_DIR);
+        let forgotten = root.join("agentbus/hooks/hooks.json");
+        let mut state = State::default();
+        state.record(&forgotten, Agent::Claude, Ownership::Created);
+
+        let changes = Claude
+            .plan_install(&env, &state, Path::new("/opt/bin/agentbus"))
+            .unwrap();
+
         assert!(
-            !matches(&copy, &root, &generated),
-            "a copy holding something else cannot match"
+            changes.contains(&Change::Delete { path: forgotten }),
+            "{changes:?}"
         );
     }
 
     #[test]
-    fn a_command_is_named_by_where_it_was_found_or_by_what_a_user_would_type() {
-        let dir = tempfile::tempdir().unwrap();
+    fn nothing_is_installed_until_the_wrapper_is_there_to_be_pointed_at() {
+        let (_home, env) = machine();
+
+        let changes = plan(&env);
+        let order: Vec<&Path> = changes.iter().filter_map(Change::path).collect();
+
+        let wrapper = order
+            .iter()
+            .position(|path| *path == wrapper(&env))
+            .expect("no wrapper");
+        let settings = order
+            .iter()
+            .position(|path| *path == settings(&env))
+            .expect("no settings");
+        assert!(wrapper < settings, "{order:?}");
+    }
+
+    #[test]
+    fn what_is_installed_is_read_back_off_the_machine() {
+        let (_home, env) = machine();
+        assert_eq!(Claude.status(&env).unwrap(), HookStatus::NotInstalled);
+
+        let wrapper = wrapper(&env);
+        file::write(
+            &wrapper,
+            &generated(Platform::Unix, Path::new("/opt/bin/agentbus")).unwrap(),
+        )
+        .unwrap();
+        let expected = crate::version::expected_version(Agent::Claude);
         assert_eq!(
-            command(&Environment::rooted(dir.path())),
-            PathBuf::from("claude")
+            Claude.status(&env).unwrap(),
+            HookStatus::NeedsRepair(expected),
+            "a wrapper nothing runs is not an installation"
         );
 
-        let invocation = plugin(
-            Path::new("/usr/bin/claude"),
-            ["install", &id(), "-s", SCOPE],
-        );
+        let path = settings(&env);
+        file::write(&path, &settings_after(&env, None)).unwrap();
+        assert_eq!(Claude.status(&env).unwrap(), HookStatus::Current(expected));
+
+        file::write(&path, "{\n  \"hooks\": {}\n}\n").unwrap();
         assert_eq!(
-            invocation.to_string(),
-            "claude plugin install agentbus@agentbus -s user"
+            Claude.status(&env).unwrap(),
+            HookStatus::NeedsRepair(expected),
+            "an entry that has been taken out is one that no longer runs"
         );
+    }
+
+    #[test]
+    fn a_wrapper_somebody_else_wrote_is_nothing_of_ours_installed() {
+        let (_home, env) = machine();
+        file::write(&wrapper(&env), "# mine\n").unwrap();
+
+        assert_eq!(Claude.status(&env).unwrap(), HookStatus::NotInstalled);
     }
 }

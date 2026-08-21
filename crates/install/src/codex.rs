@@ -91,7 +91,12 @@ impl Installer for Codex {
         Agent::Codex
     }
 
-    fn plan_install(&self, env: &Environment, binary: &Path) -> Result<Vec<Change>, Error> {
+    fn plan_install(
+        &self,
+        env: &Environment,
+        _state: &State,
+        binary: &Path,
+    ) -> Result<Vec<Change>, Error> {
         let command = command(binary)?;
         let placements: Vec<Placement> = EVENTS
             .iter()
@@ -187,7 +192,7 @@ mod tests {
         let home = tempfile::tempdir().expect("cannot make a temporary directory");
         let env = Environment::rooted(home.path());
         let changes = Codex
-            .plan_install(&env, Path::new(binary))
+            .plan_install(&env, &State::default(), Path::new(binary))
             .expect("planning failed");
         let [Change::Create { path, contents, .. }] = changes.as_slice() else {
             panic!("a file that is not there should be created: {changes:?}");
@@ -288,7 +293,7 @@ mod tests {
 
         assert!(matches!(command(&binary), Err(Error::Unwritable { .. })));
         assert!(matches!(
-            Codex.plan_install(&Environment::rooted("/home/u"), &binary),
+            Codex.plan_install(&Environment::rooted("/home/u"), &State::default(), &binary),
             Err(Error::Unwritable { .. })
         ));
     }

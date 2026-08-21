@@ -62,7 +62,12 @@ impl Installer for OpenCode {
     /// Writing a file creates the directories above it anyway, so the first step
     /// exists to *record* that this program was the one that made it — which is
     /// what the uninstall cannot work out for itself later.
-    fn plan_install(&self, env: &Environment, binary: &Path) -> Result<Vec<Change>, Error> {
+    fn plan_install(
+        &self,
+        env: &Environment,
+        _state: &State,
+        binary: &Path,
+    ) -> Result<Vec<Change>, Error> {
         let dir = plugin_dir(env);
         let contents = generated(binary)?;
 
@@ -191,7 +196,7 @@ mod tests {
     /// What installing would put in the script, on a machine with none.
     fn written(env: &Environment, binary: &str) -> String {
         let changes = OpenCode
-            .plan_install(env, Path::new(binary))
+            .plan_install(env, &State::default(), Path::new(binary))
             .expect("planning failed");
         match changes.as_slice() {
             [
@@ -265,7 +270,7 @@ mod tests {
             Err(Error::Unwritable { .. })
         ));
         assert!(matches!(
-            OpenCode.plan_install(&Environment::rooted("/home/u"), &binary),
+            OpenCode.plan_install(&Environment::rooted("/home/u"), &State::default(), &binary),
             Err(Error::Unwritable { .. })
         ));
     }
@@ -276,7 +281,7 @@ mod tests {
         std::fs::create_dir_all(home.path().join(".config/opencode/plugin")).unwrap();
 
         let changes = OpenCode
-            .plan_install(&env, Path::new("/opt/bin/agentbus"))
+            .plan_install(&env, &State::default(), Path::new("/opt/bin/agentbus"))
             .expect("planning failed");
 
         assert!(
@@ -324,7 +329,8 @@ mod tests {
         )
         .unwrap();
 
-        let refused = OpenCode.plan_install(&env, Path::new("/opt/bin/agentbus"));
+        let refused =
+            OpenCode.plan_install(&env, &State::default(), Path::new("/opt/bin/agentbus"));
 
         assert!(matches!(refused, Err(Error::NotOurs { .. })), "{refused:?}");
     }

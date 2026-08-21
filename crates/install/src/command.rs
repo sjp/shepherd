@@ -174,15 +174,31 @@ pub fn encoded_hook_command(
     if platform == Platform::Unix {
         return hook_command(agent, platform, script, argument);
     }
-    // Doubling is how a literal quote is written inside a quoted string there,
-    // and the call operator is how a path that has been quoted is run rather
-    // than printed.
-    let quoted = text(script)?.replace('\'', "''");
-    let script = with(format!("& '{quoted}'"), argument);
+    // The call operator is how a path that has been quoted is run rather than
+    // printed.
+    let script = with(format!("& {}", literal(text(script)?)), argument);
     Ok(format!(
         "{POWERSHELL} -EncodedCommand {}",
         base64(&utf16(&script))
     ))
+}
+
+/// A path as it is written inside a script this program generates for a
+/// machine whose commands are files with the executable bit set.
+///
+/// Quoted, with the surrounding quotes, so that what a wrapper assigns to a
+/// variable is one word whatever the directory a user keeps this program in is
+/// called. A path that is not text is refused for the same reason it is refused
+/// above: the lossy spelling of it would install, and name a binary that is not
+/// there.
+pub fn in_shell(path: &Path) -> Result<String, Error> {
+    Ok(single_quoted(text(path)?))
+}
+
+/// A path as it is written inside a script for a machine that runs its scripts
+/// by extension.
+pub fn in_powershell(path: &Path) -> Result<String, Error> {
+    Ok(literal(text(path)?))
 }
 
 /// A command with the argument that says what it is about, if it has one.
@@ -216,6 +232,12 @@ fn single_quoted(path: &str) -> String {
 /// A path as a machine that runs its scripts by extension reads it.
 fn double_quoted(path: &str) -> String {
     format!("\"{}\"", path.replace('"', "\\\""))
+}
+
+/// A path as that machine's shell reads it when nothing in it is to be
+/// expanded, which is what a quote doubled rather than escaped means there.
+fn literal(path: &str) -> String {
+    format!("'{}'", path.replace('\'', "''"))
 }
 
 /// A path as text, or a refusal if it is not.

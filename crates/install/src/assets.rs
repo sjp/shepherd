@@ -97,17 +97,11 @@ impl Asset {
     }
 }
 
-/// The manifest of the marketplace Claude Code installs the plugin from.
-pub const CLAUDE_MARKETPLACE: &str =
-    include_str!("../assets/claude-marketplace/.claude-plugin/marketplace.json");
-
-/// The manifest of the plugin that marketplace offers.
-pub const CLAUDE_PLUGIN: &str =
-    include_str!("../assets/claude-marketplace/agentbus/.claude-plugin/plugin.json");
-
-/// The hooks that plugin registers.
-pub const CLAUDE_HOOKS: &str =
-    include_str!("../assets/claude-marketplace/agentbus/hooks/hooks.json");
+/// The wrapper Claude Code runs on each of its events.
+pub const CLAUDE_WRAPPER: Asset = Asset::pair(
+    include_str!("../assets/claude/agentbus.sh"),
+    include_str!("../assets/claude/agentbus.ps1"),
+);
 
 /// The plugin OpenCode is given, as a single file dropped into its plugin
 /// directory.
