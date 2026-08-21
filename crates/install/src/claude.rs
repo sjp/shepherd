@@ -300,7 +300,8 @@ fn matches(copy: &Path, root: &Path, generated: &[(PathBuf, String)]) -> bool {
 /// somebody whose Claude is installed where this program cannot see it needs in
 /// order to finish the job themselves.
 fn command(env: &Environment) -> PathBuf {
-    env.look_up(Agent::Claude.name())
+    Agent::Claude
+        .command(env)
         .unwrap_or_else(|| PathBuf::from(Agent::Claude.name()))
 }
 

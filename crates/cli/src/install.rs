@@ -88,17 +88,41 @@ pub fn render(
     out
 }
 
+/// What to say to a run that named an agent this build cannot act on yet.
+///
+/// This program knows more agents than it can install for: knowing one is what
+/// lets it be recognized on a machine and have its events understood, and
+/// installing for it is a separate piece of work that lands later. An agent the
+/// user named by hand is one they are waiting on an answer about, so the answer
+/// is that this build does not have it yet — rather than a silent run that did
+/// nothing, which is what asking for an agent nothing has been written for
+/// would otherwise look like.
+pub fn unhandled(agents: &[Agent], direction: Direction) -> String {
+    format!(
+        "cannot {} {} yet; this build handles {}",
+        direction.verb(),
+        listed(agents.iter().map(Agent::to_string).collect()),
+        supported()
+    )
+}
+
 /// The agents this build can act on, listed the way they would be said aloud.
 ///
 /// Named rather than counted, because the user this line is for has just been
 /// told that nothing happened, and what they need to know next is whether their
 /// agent is one this build has heard of.
 fn supported() -> String {
-    let agents: Vec<String> = agentbus_install::supported()
-        .iter()
-        .map(Agent::to_string)
-        .collect();
-    match agents.split_last() {
+    listed(
+        agentbus_install::supported()
+            .iter()
+            .map(Agent::to_string)
+            .collect(),
+    )
+}
+
+/// Several names, as a sentence rather than a list.
+fn listed(names: Vec<String>) -> String {
+    match names.split_last() {
         None => "no agent at all".to_owned(),
         Some((last, [])) => last.clone(),
         Some((last, rest)) => format!("{} and {last}", rest.join(", ")),

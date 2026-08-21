@@ -106,7 +106,7 @@ impl Installer for Codex {
 
 /// The file the entries go in.
 fn hooks(env: &Environment) -> PathBuf {
-    Agent::Codex.config_dir(env.home()).join(HOOKS_FILE)
+    Agent::Codex.config_dir(env).join(HOOKS_FILE)
 }
 
 /// What one event's entry is, and where it belongs.

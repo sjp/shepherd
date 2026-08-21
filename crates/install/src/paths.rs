@@ -8,12 +8,14 @@
 //! from there. A test describes a machine instead of having to be run on one,
 //! and nothing below this module reads a variable.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
-use std::os::unix::fs::PermissionsExt;
+use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 
 use crate::Error;
+use crate::agent::OVERRIDE_VARS;
 
 /// The variable naming the user's home directory.
 pub const HOME_VAR: &str = "HOME";
@@ -42,6 +44,36 @@ const DEFAULT_STATE_HOME: &str = ".local/state";
 /// Where the data directory sits when `XDG_DATA_HOME` does not say.
 const DEFAULT_DATA_HOME: &str = ".local/share";
 
+/// What a machine is, as far as running a command by name goes.
+///
+/// The two families disagree about the one question this crate asks of a search
+/// path — what a command is called and what makes it runnable — and they
+/// disagree about it in a way no amount of care with paths papers over. Naming
+/// the family, rather than compiling one answer in, is also what lets a machine
+/// of either kind be described by a test running on the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    /// A machine whose commands are files with the executable bit set.
+    Unix,
+    /// A machine whose commands are files whose extension says how to run them.
+    Windows,
+}
+
+/// The extensions a bare command name can turn out to carry on Windows: a
+/// compiled program, and the shims an installer writes so that a script can be
+/// run by name.
+const SHIMS: [&str; 4] = [".exe", ".cmd", ".bat", ".ps1"];
+
+impl Platform {
+    /// The kind of machine this program is running on.
+    pub const fn host() -> Self {
+        match cfg!(windows) {
+            true => Self::Windows,
+            false => Self::Unix,
+        }
+    }
+}
+
 /// One machine, as far as installing hooks is concerned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Environment {
@@ -49,6 +81,8 @@ pub struct Environment {
     path: Vec<PathBuf>,
     state_dir: PathBuf,
     data_dir: PathBuf,
+    vars: BTreeMap<&'static str, PathBuf>,
+    platform: Platform,
 }
 
 impl Environment {
@@ -69,6 +103,8 @@ impl Environment {
             home,
             state_dir,
             data_dir,
+            vars: overrides(),
+            platform: Platform::host(),
         })
     }
 
@@ -80,6 +116,8 @@ impl Environment {
             data_dir: below(&home, None, DEFAULT_DATA_HOME),
             path: Vec::new(),
             home,
+            vars: BTreeMap::new(),
+            platform: Platform::host(),
         }
     }
 
@@ -91,9 +129,48 @@ impl Environment {
         self
     }
 
+    /// The same machine, with `name` set to `value`.
+    ///
+    /// Only the variables the agents document as saying where their
+    /// configuration lives are ever asked for, so only those are worth setting;
+    /// an empty value is what a machine that does not set one looks like, and
+    /// is stored as such.
+    #[must_use]
+    pub fn with_var(mut self, name: &'static str, value: impl Into<OsString>) -> Self {
+        let value = value.into();
+        match value.is_empty() {
+            true => self.vars.remove(name),
+            false => self.vars.insert(name, PathBuf::from(value)),
+        };
+        self
+    }
+
+    /// The same machine, taken to be one of `platform`.
+    #[must_use]
+    pub fn with_platform(mut self, platform: Platform) -> Self {
+        self.platform = platform;
+        self
+    }
+
     /// The user's home directory.
     pub fn home(&self) -> &Path {
         &self.home
+    }
+
+    /// What kind of machine this is.
+    pub fn platform(&self) -> Platform {
+        self.platform
+    }
+
+    /// The directory `name` names, if the machine sets it to one.
+    ///
+    /// A leading `~` is expanded here rather than taken literally. A variable
+    /// set in a shell arrives expanded already, but one set in a container
+    /// image, a service manager or an agent's own configuration file does not,
+    /// and honouring it as written would put an agent's hooks in a directory
+    /// actually called `~`.
+    pub fn var(&self, name: &str) -> Option<PathBuf> {
+        self.vars.get(name).map(|value| expand(&self.home, value))
     }
 
     /// The file recording which paths this program has written and which of
@@ -120,12 +197,86 @@ impl Environment {
     /// whether the agent is installed.
     pub fn look_up(&self, command: &str) -> Option<PathBuf> {
         self.path.iter().find_map(|dir| {
-            let candidate = dir.join(command);
-            let executable = candidate
-                .metadata()
-                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0);
-            executable.then_some(candidate)
+            candidates(dir, command, self.platform)
+                .into_iter()
+                .find(|candidate| self.runnable(candidate))
         })
+    }
+
+    /// Whether `path` is a file this machine would run.
+    fn runnable(&self, path: &Path) -> bool {
+        path.metadata().is_ok_and(|meta| {
+            meta.is_file()
+                && match self.platform {
+                    // Nothing here is the equivalent of the executable bit: an
+                    // extension the machine knows how to run is the whole of
+                    // what makes a file a command, and the name it was found
+                    // under already carried one.
+                    Platform::Windows => true,
+                    Platform::Unix => executable(&meta),
+                }
+        })
+    }
+}
+
+/// Every file a bare command name could be, in one directory.
+///
+/// A Windows command is run by a name whose extension says what runs it, and
+/// which extension that is depends on how the thing was installed — so all of
+/// them are tried. A name that already carries an extension is the file itself
+/// and is left alone.
+fn candidates(dir: &Path, command: &str, platform: Platform) -> Vec<PathBuf> {
+    let named = dir.join(command);
+    if platform == Platform::Unix || Path::new(command).extension().is_some() {
+        return vec![named];
+    }
+    std::iter::once(named)
+        .chain(SHIMS.map(|shim| dir.join(format!("{command}{shim}"))))
+        .collect()
+}
+
+/// Whether a file's permissions let anybody run it.
+#[cfg(unix)]
+fn executable(meta: &Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    meta.permissions().mode() & 0o111 != 0
+}
+
+/// Whether a file's permissions let anybody run it, where they cannot say.
+///
+/// A machine of one family being read by a program built for the other can only
+/// answer the part of the question it can see, which is that the file is there.
+#[cfg(not(unix))]
+fn executable(_meta: &Metadata) -> bool {
+    true
+}
+
+/// The directories the agents' own variables point their configuration at.
+///
+/// Read once, with the rest of the machine, so that no rule below this module
+/// depends on the environment of the process it happens to be running in.
+fn overrides() -> BTreeMap<&'static str, PathBuf> {
+    OVERRIDE_VARS
+        .iter()
+        .filter_map(|name| {
+            let value = env::var_os(name).filter(|value| !value.is_empty())?;
+            Some((*name, PathBuf::from(value)))
+        })
+        .collect()
+}
+
+/// A path as a variable held it, with a leading `~` replaced by `home`.
+fn expand(home: &Path, value: &Path) -> PathBuf {
+    let Some(text) = value.to_str() else {
+        return value.to_owned();
+    };
+    match text {
+        "~" => home.to_owned(),
+        _ => match text.strip_prefix("~/").or_else(|| text.strip_prefix("~\\")) {
+            Some(rest) => home.join(rest),
+            None => value.to_owned(),
+        },
     }
 }
 
@@ -154,7 +305,15 @@ fn search_path(path: Option<OsString>) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
+
+    /// A directory with `name` in it, that anybody may run.
+    fn runnable(dir: &Path, name: &str) {
+        std::fs::write(dir.join(name), "").unwrap();
+        std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 
     #[test]
     fn a_directory_follows_the_base_directory_when_there_is_one() {
@@ -238,5 +397,105 @@ mod tests {
         std::fs::create_dir(dir.path().join("claude")).unwrap();
 
         assert_eq!(env.look_up("claude"), None);
+    }
+
+    #[test]
+    fn a_command_on_a_windows_machine_is_found_under_the_extension_it_was_installed_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Environment::rooted(dir.path())
+            .with_path([dir.path()])
+            .with_platform(Platform::Windows);
+        // Written without the executable bit, which is what a file on a machine
+        // that has no such thing looks like from here.
+        std::fs::write(dir.path().join("agy.cmd"), "").unwrap();
+
+        assert_eq!(env.look_up("agy"), Some(dir.path().join("agy.cmd")));
+        assert_eq!(
+            env.look_up("agy.exe"),
+            None,
+            "a name that carries an extension is the file itself"
+        );
+    }
+
+    #[test]
+    fn a_windows_shim_is_not_a_command_on_a_unix_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Environment::rooted(dir.path())
+            .with_path([dir.path()])
+            .with_platform(Platform::Unix);
+        runnable(dir.path(), "agy.cmd");
+
+        assert_eq!(env.look_up("agy"), None);
+    }
+
+    #[test]
+    fn the_command_itself_comes_before_any_shim_of_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Environment::rooted(dir.path())
+            .with_path([dir.path()])
+            .with_platform(Platform::Windows);
+        std::fs::write(dir.path().join("agy"), "").unwrap();
+        std::fs::write(dir.path().join("agy.exe"), "").unwrap();
+
+        assert_eq!(env.look_up("agy"), Some(dir.path().join("agy")));
+    }
+
+    #[test]
+    fn a_directory_of_the_right_name_is_not_a_command_on_a_windows_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Environment::rooted(dir.path())
+            .with_path([dir.path()])
+            .with_platform(Platform::Windows);
+        std::fs::create_dir(dir.path().join("agy.exe")).unwrap();
+
+        assert_eq!(env.look_up("agy"), None);
+    }
+
+    #[test]
+    fn a_search_path_is_read_in_the_order_it_was_given() {
+        let root = tempfile::tempdir().unwrap();
+        let (first, second) = (root.path().join("first"), root.path().join("second"));
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        runnable(&first, "codex");
+        runnable(&second, "codex");
+
+        let env = Environment::rooted(root.path()).with_path([&second, &first]);
+
+        assert_eq!(env.look_up("codex"), Some(second.join("codex")));
+    }
+
+    #[test]
+    fn a_variable_is_read_back_as_the_directory_it_names() {
+        let env = Environment::rooted("/home/u").with_var(crate::agent::CODEX_HOME_VAR, "/srv/c");
+
+        assert_eq!(
+            env.var(crate::agent::CODEX_HOME_VAR),
+            Some(PathBuf::from("/srv/c"))
+        );
+        assert_eq!(env.var(crate::agent::QWEN_HOME_VAR), None);
+    }
+
+    #[test]
+    fn a_variable_set_to_nothing_is_one_that_was_not_set() {
+        let env = Environment::rooted("/home/u")
+            .with_var(crate::agent::CODEX_HOME_VAR, "/srv/c")
+            .with_var(crate::agent::CODEX_HOME_VAR, "");
+
+        assert_eq!(env.var(crate::agent::CODEX_HOME_VAR), None);
+    }
+
+    #[test]
+    fn a_home_directory_a_variable_only_gestured_at_is_the_one_this_machine_has() {
+        let home = Path::new("/home/u");
+
+        assert_eq!(expand(home, Path::new("~")), home);
+        assert_eq!(expand(home, Path::new("~/agents")), home.join("agents"));
+        assert_eq!(expand(home, Path::new("~\\agents")), home.join("agents"));
+        assert_eq!(
+            expand(home, Path::new("/srv/~/agents")),
+            Path::new("/srv/~/agents"),
+            "a tilde that is not at the front is part of the path"
+        );
     }
 }

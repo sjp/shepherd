@@ -1041,3 +1041,69 @@ fn a_plugin_of_the_users_own_survives_an_uninstall() {
 
     assert_eq!(fs::read_to_string(&path).unwrap(), theirs);
 }
+
+#[test]
+fn an_agent_this_build_has_no_installer_for_is_refused_when_it_is_named() {
+    let machine = Machine::new();
+
+    let output = machine.run(&["install", "--agent", "devin"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "naming an agent nothing can be done for is a mistake in the command \
+         line, not a failure to install"
+    );
+    let said = String::from_utf8(output.stderr).expect("output is not UTF-8");
+    assert!(said.contains("cannot install devin yet"), "{said}");
+    assert!(said.contains("claude, codex and opencode"), "{said}");
+    assert!(is_untouched(&machine.state));
+}
+
+#[test]
+fn an_agent_this_build_has_no_installer_for_is_refused_by_the_uninstall_too() {
+    let machine = Machine::new();
+
+    let output = machine.run(&["uninstall", "--agent", "devin"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    let said = String::from_utf8(output.stderr).expect("output is not UTF-8");
+    assert!(said.contains("cannot uninstall devin yet"), "{said}");
+}
+
+#[test]
+fn a_name_that_is_no_agent_at_all_is_refused_with_every_agent_there_is() {
+    let machine = Machine::new();
+
+    let output = machine.run(&["install", "--agent", "nonesuch"]);
+
+    assert!(!output.status.success(), "{output:?}");
+    let said = String::from_utf8(output.stderr).expect("output is not UTF-8");
+    assert!(said.contains("nonesuch"), "{said}");
+    for agent in ["claude", "cursor", "github-copilot", "qwen"] {
+        assert!(said.contains(agent), "{said} omits {agent}");
+    }
+}
+
+#[test]
+fn an_agent_this_build_has_no_installer_for_is_reported_and_passed_over() {
+    let machine = Machine::new().installed("devin");
+
+    let report = machine.report(&["install"]);
+
+    assert!(report.contains("found devin"), "{report}");
+    assert!(
+        report.contains("nothing to install: this build only handles claude, codex and opencode\n"),
+        "{report}"
+    );
+    assert!(is_untouched(&machine.state));
+}
+
+#[test]
+fn an_agent_run_by_a_name_that_is_not_its_own_is_found_by_that_name() {
+    let machine = Machine::new().installed("cursor-agent");
+
+    let report = machine.report(&["install"]);
+
+    assert!(report.contains("found cursor (command "), "{report}");
+}

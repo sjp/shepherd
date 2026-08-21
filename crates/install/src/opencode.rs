@@ -96,7 +96,7 @@ impl Installer for OpenCode {
 
 /// The directory OpenCode loads this user's plugins from.
 fn plugin_dir(env: &Environment) -> PathBuf {
-    Agent::OpenCode.config_dir(env.home()).join(PLUGIN_DIR)
+    Agent::OpenCode.config_dir(env).join(PLUGIN_DIR)
 }
 
 /// The script this program drops in there.

@@ -1146,6 +1146,20 @@ fn hooks(args: &InstallArgs, direction: install::Direction) -> ExitCode {
         true => found.iter().map(|found| found.agent).collect(),
         false => args.agent.clone(),
     };
+    // An agent this build has no installer for is passed over in a run that
+    // asked about the whole machine — there is nothing to say about it that the
+    // report does not already say by leaving it out — but refused in a run that
+    // named it, which is somebody asking a question that deserves an answer.
+    let unhandled: Vec<Agent> = args
+        .agent
+        .iter()
+        .copied()
+        .filter(|agent| !agentbus_install::supported().contains(agent))
+        .collect();
+    if !unhandled.is_empty() {
+        eprintln!("{context}: {}", install::unhandled(&unhandled, direction));
+        return ExitCode::from(USAGE);
+    }
     let mode = args.mode();
     let outcomes = match direction {
         install::Direction::Install => agentbus_install::install(&env, &chosen, mode),

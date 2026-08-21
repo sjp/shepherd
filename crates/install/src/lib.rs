@@ -47,7 +47,7 @@ pub use agent::{Agent, DetectedAgent, UnknownAgent, detect};
 pub use change::Change;
 pub use command::Invocation;
 pub use merge::Placement;
-pub use paths::Environment;
+pub use paths::{Environment, Platform};
 pub use state::State;
 
 /// Why an installation could not be carried out.
