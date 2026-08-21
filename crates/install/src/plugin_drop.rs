@@ -172,13 +172,18 @@ impl Installer for PluginDrop {
     /// directory — so there is nothing else to confirm and nothing that can be
     /// in need of repair. What the mark inside the file says is the answer.
     fn status(&self, env: &Environment) -> Result<HookStatus, Error> {
-        let Some(text) = read(&self.plugin(env))? else {
+        let Some(text) = read(&self.asset(env))? else {
             return Ok(HookStatus::NotInstalled);
         };
         if !sentinel::is_generated(&text) {
             return Ok(HookStatus::NotInstalled);
         }
         Ok(HookStatus::of_text(self.agent, &text))
+    }
+
+    /// The plugin this program drops in, which is the file the mark is in.
+    fn asset(&self, env: &Environment) -> PathBuf {
+        self.plugin(env)
     }
 }
 

@@ -171,7 +171,7 @@ impl Installer for Claude {
     /// installation whose wrapper has since moved, because it names the path it
     /// was written with and not wherever one is now.
     fn status(&self, env: &Environment) -> Result<HookStatus, Error> {
-        let path = wrapper(env);
+        let path = self.asset(env);
         let Some(text) = read(&path)? else {
             return Ok(HookStatus::NotInstalled);
         };
@@ -180,6 +180,11 @@ impl Installer for Claude {
         }
         let status = HookStatus::of_text(self.agent(), &text);
         Ok(status.confirmed(is_pointed_at(env)?))
+    }
+
+    /// The wrapper this program drops in, which is the file the mark is in.
+    fn asset(&self, env: &Environment) -> PathBuf {
+        wrapper(env)
     }
 }
 

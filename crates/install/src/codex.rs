@@ -158,7 +158,7 @@ impl Installer for Codex {
     /// somebody has switched back off, both leave a perfectly current file that
     /// nothing ever runs.
     fn status(&self, env: &Environment) -> Result<HookStatus, Error> {
-        let path = wrapper(env);
+        let path = self.asset(env);
         let Some(text) = read(&path)? else {
             return Ok(HookStatus::NotInstalled);
         };
@@ -167,6 +167,11 @@ impl Installer for Codex {
         }
         let status = HookStatus::of_text(self.agent(), &text);
         Ok(status.confirmed(is_pointed_at(env)? && is_switched_on(env)?))
+    }
+
+    /// The wrapper this program drops in, which is the file the mark is in.
+    fn asset(&self, env: &Environment) -> PathBuf {
+        wrapper(env)
     }
 }
 

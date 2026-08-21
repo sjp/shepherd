@@ -201,7 +201,7 @@ impl Installer for Kimi {
     /// file that nothing ever runs, which is the case worth telling somebody
     /// about.
     fn status(&self, env: &Environment) -> Result<HookStatus, Error> {
-        let path = wrapper(env);
+        let path = self.asset(env);
         let Some(text) = read(&path)? else {
             return Ok(HookStatus::NotInstalled);
         };
@@ -210,6 +210,11 @@ impl Installer for Kimi {
         }
         let status = HookStatus::of_text(self.agent(), &text);
         Ok(status.confirmed(is_registered(env)?))
+    }
+
+    /// The wrapper this program drops in, which is the file the mark is in.
+    fn asset(&self, env: &Environment) -> PathBuf {
+        wrapper(env)
     }
 }
 

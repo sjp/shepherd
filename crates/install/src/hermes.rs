@@ -160,7 +160,7 @@ impl Installer for Hermes {
     /// imports — so anything missing there is said out loud rather than rounded
     /// up to working.
     fn status(&self, env: &Environment) -> Result<HookStatus, Error> {
-        let Some(text) = read(&module(env))? else {
+        let Some(text) = read(&self.asset(env))? else {
             return Ok(HookStatus::NotInstalled);
         };
         if !sentinel::is_generated(&text) {
@@ -168,6 +168,11 @@ impl Installer for Hermes {
         }
         let status = HookStatus::of_text(self.agent(), &text);
         Ok(status.confirmed(is_wired(env)?))
+    }
+
+    /// The module this program drops in, which is the file the mark is in.
+    fn asset(&self, env: &Environment) -> PathBuf {
+        module(env)
     }
 }
 

@@ -162,7 +162,7 @@ impl Installer for GithubCopilot {
     /// working file in an installation that never runs, which is exactly the
     /// case worth telling somebody about.
     fn status(&self, env: &Environment) -> Result<HookStatus, Error> {
-        let path = wrapper(env);
+        let path = self.asset(env);
         let Some(text) = read(&path)? else {
             return Ok(HookStatus::NotInstalled);
         };
@@ -171,6 +171,11 @@ impl Installer for GithubCopilot {
         }
         let status = HookStatus::of_text(self.agent(), &text);
         Ok(status.confirmed(is_pointed_at(env)?))
+    }
+
+    /// The wrapper this program drops in, which is the file the mark is in.
+    fn asset(&self, env: &Environment) -> PathBuf {
+        wrapper(env)
     }
 }
 

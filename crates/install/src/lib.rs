@@ -248,6 +248,14 @@ pub trait Installer {
     /// what else has to be in place for that file to ever be run, are both
     /// things only it knows.
     fn status(&self, env: &Environment) -> Result<HookStatus, Error>;
+
+    /// The file on `env` whose mark says which generation this agent's hooks
+    /// are — the one [`Installer::status`] reads.
+    ///
+    /// Named whether or not it is there, because the caller asking is reporting
+    /// on a machine rather than acting on it, and the answer to "where would it
+    /// be?" is the same path as the answer to "where is it?".
+    fn asset(&self, env: &Environment) -> PathBuf;
 }
 
 /// Every agent this build can install for.

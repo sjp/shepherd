@@ -1754,3 +1754,49 @@ outside the plan — would print out of order at best and not at all on a dry ru
 at worst, which is the run the remark matters most on. It changes nothing on the
 machine, like the step that records who a setting belongs to, and an agent whose
 whole plan is one remark is still correctly reported as having nothing to do.
+
+## 2026-08-21 — asking a machine what its hooks are
+
+### The question gets a noun of its own
+
+**`agentbus hooks status`, not a flag on `agentbus status`.** `status` already
+means the sessions the bus knows about, which is the live question a person
+asks all day; what is installed in the agents on a disk is a different subject
+that happens to want the same word. Rather than overload it, the thing that was
+installed becomes the noun and the question hangs off that, which leaves room
+for anything else worth asking about installed hooks later. `install` and
+`uninstall` stay where they are: they are what everybody already types, and
+moving them under the new noun would be renaming a command to tidy a menu.
+
+The report is one line per agent, and every agent this program knows is on it
+whether or not it is on the machine — a report that silently omitted what it
+had nothing to say about could not be trusted to be complete. Four answers, and
+each names the next thing to do: current, behind this build, current but run by
+nothing, and absent. An absent agent that is nevertheless *on* the machine is
+the one case where the line ends in the command that would fix it, because that
+is the only one where the reader has a decision to make rather than a repair.
+
+### The file that answered is named, and where nothing answered nothing is named
+
+**Every state but "not installed" ends in the path the reading came from.**
+Somebody told their hooks are old, or that what is there never runs, is about to
+go and look at it, and the path is the whole of what they need in order to. An
+agent with nothing installed has no such file, and printing where one *would* go
+would be describing an installation that does not exist. So the installers grew
+one more thing they answer for — which of their files carries the mark — beside
+the reading of it they already did.
+
+### An install mentions the agents it was not asked about
+
+**One sentence on stderr, after a successful install, naming the other agents
+whose hooks a newer build has left behind.** Somebody who installs for one agent
+has said which agent they care about now, not that the rest of their machine has
+stopped mattering, and the moment they are already thinking about hooks is the
+cheapest one they will ever get to hear that the others are behind. It goes to
+stderr because it is not part of the account of what this run did to the agents
+it was asked about.
+
+It is deliberately a narrower question than the one the report answers: agents
+that have *no* hooks are never mentioned, because having none was somebody's
+choice and a command that has just finished doing what it was told is no place
+to argue with it. Uninstalling says nothing at all, for the same reason.

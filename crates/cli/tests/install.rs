@@ -1656,3 +1656,85 @@ fn an_agent_run_by_a_name_that_is_not_its_own_is_found_by_that_name() {
         "the name it was found under is what a user would recognize: {report}"
     );
 }
+
+/// Rolls the generation in `path` back, so that what is there looks like what
+/// an earlier build of this program left behind.
+fn aged(path: &Path) {
+    let text = fs::read_to_string(path).expect("nothing was installed there");
+    let marker = "AGENTBUS_HOOK_VERSION=";
+    let older: Vec<String> = text
+        .lines()
+        .map(|line| match line.contains(marker) {
+            true => format!("# {marker}0"),
+            false => line.to_owned(),
+        })
+        .collect();
+    fs::write(path, older.join("\n")).expect("cannot age the file");
+}
+
+#[test]
+fn an_install_says_which_other_agents_a_newer_build_has_left_behind() {
+    let machine = Machine::new().configured("codex").configured("claude");
+    machine.report(&["install", "--agent", "codex"]);
+    aged(&machine.codex_wrapper());
+
+    let output = machine.run(&["install", "--agent", "claude"]);
+
+    assert!(output.status.success(), "{output:?}");
+    let said = String::from_utf8(output.stderr).expect("output is not UTF-8");
+    assert!(
+        said.contains("codex still has hooks from an earlier build"),
+        "{said}"
+    );
+    assert!(
+        said.contains("agentbus install --agent codex"),
+        "the sentence is worth having only if it can be acted on: {said}"
+    );
+    let report = String::from_utf8(output.stdout).expect("output is not UTF-8");
+    assert!(
+        !report.contains("earlier build"),
+        "the report is the account of what this run did: {report}"
+    );
+}
+
+#[test]
+fn an_install_that_has_left_nothing_behind_says_nothing_about_the_others() {
+    let machine = Machine::new().configured("codex").configured("claude");
+    machine.report(&["install", "--agent", "codex"]);
+
+    let output = machine.run(&["install", "--agent", "claude"]);
+
+    let said = String::from_utf8(output.stderr).expect("output is not UTF-8");
+    assert!(said.is_empty(), "{said}");
+}
+
+#[test]
+fn an_agent_this_run_was_about_is_not_reported_as_left_behind() {
+    let machine = Machine::new().configured("codex");
+    machine.report(&["install", "--agent", "codex"]);
+    aged(&machine.codex_wrapper());
+
+    let output = machine.run(&["install", "--agent", "codex"]);
+
+    let said = String::from_utf8(output.stderr).expect("output is not UTF-8");
+    assert!(
+        said.is_empty(),
+        "this run has just brought codex up to date: {said}"
+    );
+}
+
+#[test]
+fn taking_the_hooks_back_out_says_nothing_about_the_others() {
+    let machine = Machine::new().configured("codex").configured("claude");
+    machine.report(&["install", "--agent", "codex"]);
+    aged(&machine.codex_wrapper());
+    machine.report(&["install", "--agent", "claude"]);
+
+    let output = machine.run(&["uninstall", "--agent", "claude"]);
+
+    let said = String::from_utf8(output.stderr).expect("output is not UTF-8");
+    assert!(
+        said.is_empty(),
+        "somebody taking hooks out is not being told to put more in: {said}"
+    );
+}

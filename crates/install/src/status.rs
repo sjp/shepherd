@@ -17,7 +17,7 @@
 //! and say that what is there is not working, which is a different answer from
 //! either of the first two and needs a different sentence said about it.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::agent::{Agent, DetectedAgent, detect};
 use crate::paths::Environment;
@@ -91,6 +91,14 @@ pub struct Recommendation {
     pub detected: Option<DetectedAgent>,
     /// What its hooks are.
     pub status: HookStatus,
+    /// The file the answer was read out of, where there was one to read.
+    ///
+    /// Somebody told their hooks are behind, or that what is there does not
+    /// run, is usually about to go and look at it, and the path is the whole of
+    /// what they need to. An agent with nothing installed has no such file:
+    /// naming where one would go would be describing an installation that does
+    /// not exist.
+    pub asset: Option<PathBuf>,
 }
 
 impl Recommendation {
@@ -126,10 +134,15 @@ pub fn recommendations(env: &Environment) -> Result<Vec<Recommendation>, Error> 
                 Some(installer) => installer.status(env)?,
                 None => HookStatus::NotInstalled,
             };
+            let asset = match status {
+                HookStatus::NotInstalled => None,
+                _ => installer.map(|installer| installer.asset(env)),
+            };
             Ok(Recommendation {
                 agent,
                 detected: found.iter().find(|one| one.agent == agent).cloned(),
                 status,
+                asset,
             })
         })
         .collect()

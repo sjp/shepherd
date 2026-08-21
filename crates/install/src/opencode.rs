@@ -181,7 +181,7 @@ impl Installer for OpenCode {
     /// identity is not known until something happens in it — so anything
     /// missing there is said out loud rather than rounded up to working.
     fn status(&self, env: &Environment) -> Result<HookStatus, Error> {
-        let Some(text) = read(&plugin(env))? else {
+        let Some(text) = read(&self.asset(env))? else {
             return Ok(HookStatus::NotInstalled);
         };
         if !sentinel::is_generated(&text) {
@@ -189,6 +189,11 @@ impl Installer for OpenCode {
         }
         let status = HookStatus::of_text(self.agent(), &text);
         Ok(status.confirmed(is_wired(env)?))
+    }
+
+    /// The plugin the events come through, which is the file the mark is in.
+    fn asset(&self, env: &Environment) -> PathBuf {
+        plugin(env)
     }
 }
 

@@ -26,6 +26,7 @@ pub mod detect;
 pub mod emit;
 pub mod ensure;
 pub mod foreground;
+pub mod hooks;
 pub mod install;
 pub mod manifests;
 pub mod status;
@@ -49,7 +50,7 @@ use agentbus_daemon::remote::targets::{CONFIG_DIR_VAR, DOCKER, SSH, Targets};
 use agentbus_daemon::remote::transport::Transport;
 use agentbus_daemon::{Daemon, Settings, SocketPaths, clock, paths::DIR_VAR};
 use agentbus_detect::{CATALOG_URL_VAR, CheckResult, ManifestStore, Status, catalog_url};
-use agentbus_install::{Agent, Environment, Mode, UnknownAgent};
+use agentbus_install::{Agent, Environment, Mode, Outcome, Recommendation, UnknownAgent};
 use agentbus_protocol::ForegroundEntry;
 use clap::{Args, Parser, Subcommand};
 use tracing::info;
@@ -128,6 +129,7 @@ const ATTACH: &str = "agentbus attach";
 const DETACH: &str = "agentbus detach";
 const TARGETS: &str = "agentbus targets";
 const MANIFESTS: &str = "agentbus manifests";
+const HOOKS: &str = "agentbus hooks";
 
 /// What is said after a machine has been provisioned and its agents have been
 /// left alone, which is what happens unless somebody asks for the other half.
@@ -201,6 +203,9 @@ enum Command {
     Install(InstallArgs),
     /// Take those hooks back out again.
     Uninstall(InstallArgs),
+    /// Report on the hooks this program has put into the coding agents on this machine.
+    #[command(subcommand)]
+    Hooks(HooksCommand),
     /// Declare another endpoint whose events should be merged into this bus.
     Attach(DeclarationArgs),
     /// Stop wanting one attached.
@@ -210,6 +215,27 @@ enum Command {
     /// Report on the manifests this machine reads screens and hook payloads with, and fetch newer ones.
     #[command(subcommand)]
     Manifests(ManifestsCommand),
+}
+
+/// What to ask about the hooks installed on this machine.
+///
+/// A group of its own rather than a flag on `status`, because `status` is
+/// already the question of what the sessions on the bus are doing. These are
+/// questions about files on a disk, which is a different subject with the same
+/// name.
+#[derive(Debug, Subcommand)]
+enum HooksCommand {
+    /// Print what each agent's hooks are: what this build writes, older than it, in need of repair, or absent.
+    ///
+    /// Every agent this program knows is reported on, including the ones that
+    /// are not on this machine, so that the list is the same length whatever
+    /// the answers are. One that is here and has no hooks is told which command
+    /// would give it some.
+    ///
+    /// The answers are read from the files themselves rather than from this
+    /// program's record of what it wrote, so a machine whose configuration was
+    /// copied from somewhere else, or edited by hand, is reported as it now is.
+    Status(HooksStatusArgs),
 }
 
 /// What to do about the manifests on this machine.
@@ -239,6 +265,18 @@ enum ManifestsCommand {
     ///
     ///   agentbus manifests show claude > ~/.config/agentbus/manifests/screen/claude.toml
     Show(ShowArgs),
+}
+
+/// What to report about the hooks here, and how.
+#[derive(Debug, Args)]
+struct HooksStatusArgs {
+    /// Print only the agents whose hooks are older than this build's, or do not run
+    #[arg(long)]
+    outdated_only: bool,
+
+    /// Print the report as JSON instead of as lines
+    #[arg(long)]
+    json: bool,
 }
 
 /// Which bus a command is about.
@@ -715,6 +753,9 @@ where
             Command::Emit(args) => emit(&args, started),
             Command::Install(args) => elsewhere(&args, install::Direction::Install),
             Command::Uninstall(args) => elsewhere(&args, install::Direction::Uninstall),
+            Command::Hooks(command) => match command {
+                HooksCommand::Status(args) => hooks_status(&args),
+            },
             Command::Attach(args) => attach(&args),
             Command::Detach(args) => detach(&args),
             Command::Targets(args) => targets(&args),
@@ -1140,7 +1181,7 @@ fn stated(value: &Option<std::ffi::OsString>) -> Option<&str> {
 /// Naming an agent explicitly acts on it whether or not it was detected. The
 /// detection rules are two guesses about a machine, and somebody who knows their
 /// own machine better than this does should not have to argue with them.
-fn hooks(args: &InstallArgs, direction: install::Direction) -> ExitCode {
+fn here(args: &InstallArgs, direction: install::Direction) -> ExitCode {
     let context = direction.context();
     let env = match Environment::from_env() {
         Ok(env) => env,
@@ -1176,10 +1217,60 @@ fn hooks(args: &InstallArgs, direction: install::Direction) -> ExitCode {
     };
 
     let report = install::render(&found, &outcomes, direction, mode);
-    match std::io::stdout().write_all(report.as_bytes()) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => fail(context, &error),
+    if let Err(error) = std::io::stdout().write_all(report.as_bytes()) {
+        return fail(context, &error);
     }
+    if direction == install::Direction::Install {
+        if let Some(sentence) = install::also_behind(&others_behind(&env, &outcomes)) {
+            eprintln!("{context}: {sentence}");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// The agents this run was not about whose hooks are older than what this build
+/// writes, or are no longer run by anything.
+///
+/// Somebody who installs for one agent has told this program which agent they
+/// care about, not that the rest of their machine has stopped mattering — and
+/// the moment they are already thinking about their hooks is the cheapest one
+/// they will ever get to hear that the others are behind. A machine that cannot
+/// be read for this says nothing: the run being reported on succeeded, and a
+/// remark beside it is no reason to say otherwise.
+fn others_behind(env: &Environment, outcomes: &[Outcome]) -> Vec<Agent> {
+    let Ok(reported) = agentbus_install::recommendations(env) else {
+        return Vec::new();
+    };
+    hooks::behind(&reported)
+        .into_iter()
+        .filter(|agent| !outcomes.iter().any(|outcome| outcome.agent == *agent))
+        .collect()
+}
+
+/// Prints what this program's hooks are in each agent on this machine.
+///
+/// Nothing has to be installed for this to answer, and nothing about it changes
+/// the machine: it is the report a user reads before deciding whether to run
+/// anything at all, so it says what is there and stops.
+fn hooks_status(args: &HooksStatusArgs) -> ExitCode {
+    let env = match Environment::from_env() {
+        Ok(env) => env,
+        Err(error) => return fail(HOOKS, &error),
+    };
+    let reported = match agentbus_install::recommendations(&env) {
+        Ok(reported) => reported,
+        Err(error) => return fail(HOOKS, &error),
+    };
+    let reported: Vec<&Recommendation> = reported
+        .iter()
+        .filter(|one| !args.outdated_only || hooks::is_behind(one))
+        .collect();
+
+    let text = match args.json {
+        true => hooks::json(&reported),
+        false => hooks::render(&reported),
+    };
+    wrote(HOOKS, &text)
 }
 
 /// Acts on this machine, or on the endpoint the command line named instead.
@@ -1191,7 +1282,7 @@ fn hooks(args: &InstallArgs, direction: install::Direction) -> ExitCode {
 /// both is refused rather than quietly doing half of what it says.
 fn elsewhere(args: &InstallArgs, direction: install::Direction) -> ExitCode {
     let Some(endpoint) = &args.endpoint else {
-        return hooks(args, direction);
+        return here(args, direction);
     };
     let context = direction.context();
     if !args.agent.is_empty() || args.dry_run {

@@ -90,6 +90,37 @@ pub fn render(
     out
 }
 
+/// What to say to somebody who has just installed, about the agents this run
+/// was not about whose hooks are behind what this build writes.
+///
+/// On stderr and not in the report, because it is not about this run: the
+/// report is the account of what was done to the agents that were asked for,
+/// and a sentence about the others in the middle of it would read as something
+/// that happened to them. Nothing is said when there is nothing to say — a
+/// machine whose every other agent is current is one where this line would be
+/// noise on every install anybody ever ran.
+///
+/// The command is written out in full, agent by agent, so that it can be run by
+/// copying it: somebody who has just been told about three agents at once
+/// should not have to work out how to name three agents on a command line.
+pub fn also_behind(agents: &[Agent]) -> Option<String> {
+    if agents.is_empty() {
+        return None;
+    }
+    let mut command = String::from("agentbus install");
+    for agent in agents {
+        let _ = write!(command, " --agent {agent}");
+    }
+    Some(format!(
+        "{} {} hooks from an earlier build; run {command}",
+        listed(agents.iter().map(Agent::to_string).collect()),
+        match agents.len() {
+            1 => "still has",
+            _ => "still have",
+        },
+    ))
+}
+
 /// What to say to a run that named an agent this build cannot act on yet.
 ///
 /// This program knows more agents than it can install for: knowing one is what
@@ -281,6 +312,28 @@ mod tests {
             rendered.contains("  would update /home/u/.codex/hooks.json\n"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn the_agents_a_newer_build_has_left_behind_are_named_with_the_command_that_fixes_them() {
+        let one = also_behind(&[Agent::Codex]).expect("there is one to name");
+        let several = also_behind(&[Agent::Codex, Agent::OpenCode]).expect("there are two");
+
+        assert_eq!(
+            one,
+            "codex still has hooks from an earlier build; \
+             run agentbus install --agent codex"
+        );
+        assert_eq!(
+            several,
+            "codex and opencode still have hooks from an earlier build; \
+             run agentbus install --agent codex --agent opencode"
+        );
+    }
+
+    #[test]
+    fn a_machine_with_nothing_left_behind_is_told_nothing() {
+        assert_eq!(also_behind(&[]), None);
     }
 
     #[test]
