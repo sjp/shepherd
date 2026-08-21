@@ -192,6 +192,14 @@ pub const HERMES_PLUGIN: Asset = Asset::portable(include_str!("../assets/hermes/
 pub const HERMES_PLUGIN_MANIFEST: Asset =
     Asset::portable(include_str!("../assets/hermes/plugin.yaml"));
 
+/// The plugin Kilo loads out of its plugin directory, which is handed every
+/// event its plugin interface produces.
+pub const KILO_PLUGIN: Asset = Asset::portable(include_str!("../assets/kilo/agentbus.js"));
+
+/// The extension Omp loads out of its extension directory, which subscribes to
+/// the events it publishes.
+pub const OMP_EXTENSION: Asset = Asset::portable(include_str!("../assets/omp/agentbus.ts"));
+
 /// The plugin OpenCode loads out of its plugin directory, which is handed every
 /// event its plugin interface produces.
 pub const OPENCODE_PLUGIN: Asset = Asset::portable(include_str!("../assets/opencode/agentbus.js"));
@@ -200,6 +208,10 @@ pub const OPENCODE_PLUGIN: Asset = Asset::portable(include_str!("../assets/openc
 /// that interface has open.
 pub const OPENCODE_TUI_PLUGIN: Asset =
     Asset::portable(include_str!("../assets/opencode/agentbus-tui.js"));
+
+/// The extension Pi loads out of its extension directory, which subscribes to
+/// the events it publishes.
+pub const PI_EXTENSION: Asset = Asset::portable(include_str!("../assets/pi/agentbus.ts"));
 
 #[cfg(test)]
 pub(crate) mod tests {

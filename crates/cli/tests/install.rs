@@ -337,8 +337,8 @@ fn a_machine_with_no_agent_on_it_is_told_so() {
         report,
         "no coding agent found on this machine\n\
          nothing to install: this build only handles antigravity, claude, codex, \
-         cursor, devin, droid, github-copilot, grok, hermes, kimi, mastracode, opencode, \
-         qodercli and qwen\n"
+         cursor, devin, droid, github-copilot, grok, hermes, kilo, kimi, mastracode, \
+         omp, opencode, pi, qodercli and qwen\n"
     );
 }
 
@@ -1629,41 +1629,6 @@ fn a_plugin_of_the_users_own_survives_an_uninstall() {
 }
 
 #[test]
-fn an_agent_this_build_has_no_installer_for_is_refused_when_it_is_named() {
-    let machine = Machine::new();
-
-    let output = machine.run(&["install", "--agent", "pi"]);
-
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "naming an agent nothing can be done for is a mistake in the command \
-         line, not a failure to install"
-    );
-    let said = String::from_utf8(output.stderr).expect("output is not UTF-8");
-    assert!(said.contains("cannot install pi yet"), "{said}");
-    assert!(
-        said.contains(
-            "antigravity, claude, codex, cursor, devin, droid, github-copilot, grok, \
-             hermes, kimi, mastracode, opencode, qodercli and qwen"
-        ),
-        "{said}"
-    );
-    assert!(is_untouched(&machine.state));
-}
-
-#[test]
-fn an_agent_this_build_has_no_installer_for_is_refused_by_the_uninstall_too() {
-    let machine = Machine::new();
-
-    let output = machine.run(&["uninstall", "--agent", "pi"]);
-
-    assert_eq!(output.status.code(), Some(2));
-    let said = String::from_utf8(output.stderr).expect("output is not UTF-8");
-    assert!(said.contains("cannot uninstall pi yet"), "{said}");
-}
-
-#[test]
 fn a_name_that_is_no_agent_at_all_is_refused_with_every_agent_there_is() {
     let machine = Machine::new();
 
@@ -1675,24 +1640,6 @@ fn a_name_that_is_no_agent_at_all_is_refused_with_every_agent_there_is() {
     for agent in ["claude", "cursor", "github-copilot", "qwen"] {
         assert!(said.contains(agent), "{said} omits {agent}");
     }
-}
-
-#[test]
-fn an_agent_this_build_has_no_installer_for_is_reported_and_passed_over() {
-    let machine = Machine::new().installed("pi");
-
-    let report = machine.report(&["install"]);
-
-    assert!(report.contains("found pi"), "{report}");
-    assert!(
-        report.contains(
-            "nothing to install: this build only handles antigravity, claude, codex, \
-         cursor, devin, droid, github-copilot, grok, hermes, kimi, mastracode, opencode, \
-         qodercli and qwen\n"
-        ),
-        "{report}"
-    );
-    assert!(is_untouched(&machine.state));
 }
 
 #[test]

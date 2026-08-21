@@ -1,0 +1,71 @@
+id = "omp"
+version = "2026.08.21.1"
+min_engine_version = 1
+updated_at = "2026-08-21T00:00:00Z"
+
+# This agent has no hook commands: it loads extensions and lets each one
+# subscribe to its events, so the payload described here is the one the
+# installed extension writes — the name of the event that fired, the session the
+# agent named, what the agent says about the interface that session is running
+# under, the tool an event about a tool is about, and the directory the agent is
+# working in.
+#
+# Nothing below is narrowed to an interface, unlike the agent that shares this
+# extension layout. This one reports whether somebody is looking at it as a flag
+# rather than as the name of an interface, and a condition here compares written
+# values against strings; a mapping that claimed to read a flag would be a
+# condition that is silently never satisfied. What that costs is the sessions
+# this agent is driven through rather than typed at, which are reported as
+# sessions, which is what they are.
+[payload]
+event = "event"
+session = ["session_id"]
+cwd = ["cwd"]
+
+[[events]]
+name = "session_start"
+kind = "session_start"
+
+# The user left the session they were in for another one. Reported as a session
+# beginning because that is what it is from this side: a different session id, in
+# the same place, with nothing of the old one carried over.
+[[events]]
+name = "session_switch"
+kind = "session_start"
+
+[[events]]
+name = "session_shutdown"
+kind = "session_end"
+
+# The agent is about to think, and has stopped. These fire each time it picks
+# the work up rather than once for each thing the user asks, so turns cannot be
+# counted by counting them — what is kept is whether the session is working.
+[[events]]
+name = "agent_start"
+kind = "turn_start"
+
+[[events]]
+name = "agent_end"
+kind = "turn_end"
+
+[[events]]
+name = "tool_execution_start"
+kind = "tool_start"
+detail = [{ field = "tool", from = "tool" }]
+
+[[events]]
+name = "tool_execution_end"
+kind = "tool_end"
+detail = [{ field = "tool", from = "tool" }]
+
+# Asked and answered. This agent says when an approval was resolved as well as
+# when one was wanted, so leaving the block comes from the agent rather than
+# being inferred from the activity that follows.
+[[events]]
+name = "tool_approval_requested"
+kind = "blocked"
+detail = [{ field = "tool", from = "tool" }]
+
+[[events]]
+name = "tool_approval_resolved"
+kind = "unblocked"

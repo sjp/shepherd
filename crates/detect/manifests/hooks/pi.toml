@@ -1,0 +1,45 @@
+id = "pi"
+version = "2026.08.21.1"
+min_engine_version = 1
+updated_at = "2026-08-21T00:00:00Z"
+
+# This agent has no hook commands: it loads extensions and lets each one
+# subscribe to its events, so the payload described here is the one the
+# installed extension writes — the name of the event that fired, the session the
+# agent named, what the agent says about the interface that session is running
+# under, and the directory the agent is working in.
+[payload]
+event = "event"
+session = ["session_id"]
+cwd = ["cwd"]
+
+# Every event below is narrowed to the interface a person is sitting in front
+# of. The agent runs the same events for the modes it is driven through rather
+# than typed at — a request over a socket, a single question answered and
+# printed — and those are sessions nobody is looking at a screen for. The one
+# that is not narrowed away is named rather than inferred from a flag beside it,
+# because that flag is true of the socket mode as well.
+#
+# The narrowing lives here rather than in the extension on purpose. What an event
+# means is decided by this file, and the extension forwards what it was given: a
+# list of interfaces that changes is a mapping to ship, not an extension
+# directory to visit.
+
+[[events]]
+name = "session_start"
+kind = "session_start"
+when = { field = "mode", equals = "tui" }
+
+# The agent is about to think. This fires each time it picks the work up rather
+# than once for each thing the user asks, so turns cannot be counted by counting
+# these — what is kept is that the session is working, and, on a session picked
+# up again, this is the first thing heard of it at all.
+[[events]]
+name = "agent_start"
+kind = "turn_start"
+when = { field = "mode", equals = "tui" }
+
+[[events]]
+name = "agent_settled"
+kind = "turn_end"
+when = { field = "mode", equals = "tui" }

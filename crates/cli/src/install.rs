@@ -205,6 +205,27 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_this_build_cannot_act_on_is_named_along_with_the_ones_it_can() {
+        // Every agent this build knows has an installer, so the sentence below
+        // is not one a command line can reach today. It is checked here because
+        // the list it is built from is not fixed: an agent recognized before it
+        // can be installed for is the case this exists to answer, and the
+        // answer has to be right the first time one turns up again.
+        let said = unhandled(&[Agent::Claude, Agent::Codex], Direction::Install);
+
+        assert!(
+            said.starts_with("cannot install claude and codex yet"),
+            "{said}"
+        );
+        assert!(said.contains(&supported()), "{said}");
+        assert!(
+            unhandled(&[Agent::Qwen], Direction::Uninstall)
+                .starts_with("cannot uninstall qwen yet"),
+            "the direction the run was going is what a user is told about",
+        );
+    }
+
+    #[test]
     fn what_was_found_is_named_before_anything_is_done_about_it() {
         let found = [DetectedAgent {
             agent: Agent::Claude,

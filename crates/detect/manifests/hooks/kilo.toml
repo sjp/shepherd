@@ -1,0 +1,80 @@
+id = "kilo"
+version = "2026.08.21.1"
+min_engine_version = 1
+updated_at = "2026-08-21T00:00:00Z"
+
+# This agent has no hook commands: it loads plugins and hands each one an event
+# object, so the payload described here is the one the installed plugin writes —
+# the event's own `type`, the directory the plugin was loaded for, and the
+# event's properties spread out beside them. Two spellings of the session are
+# accepted because those properties are the agent's own and this file does not
+# control them; taking both costs a lookup and saves every event in a session
+# from being dropped over a convention that changed.
+[payload]
+event = "type"
+session = ["sessionID", "session_id"]
+cwd = ["directory"]
+
+[[events]]
+name = "session.created"
+kind = "session_start"
+
+[[events]]
+name = "session.deleted"
+kind = "session_end"
+
+# Not an event of the agent's. It is the callback its plugin interface calls
+# when the user sends a message, which the installed plugin forwards under the
+# interface's own name for it. It is the one thing here that says a turn began.
+[[events]]
+name = "chat.message"
+kind = "turn_start"
+
+[[events]]
+name = "session.idle"
+kind = "turn_end"
+
+[[events]]
+name = "session.compacted"
+kind = "compact"
+
+[[events]]
+name = "session.error"
+kind = "error"
+
+[[events]]
+name = "tool.execute.before"
+kind = "tool_start"
+detail = [{ field = "tool", from = "tool" }]
+
+[[events]]
+name = "tool.execute.after"
+kind = "tool_end"
+detail = [{ field = "tool", from = "tool" }]
+
+# Asked and answered, in both of the ways this agent asks: for permission to do
+# something, and for an answer to a question. Each says when it was resolved as
+# well as when it was raised, so leaving the block comes from the agent rather
+# than being inferred from the activity that follows.
+[[events]]
+name = "permission.asked"
+kind = "blocked"
+detail = [{ field = "tool", from = "tool" }]
+
+[[events]]
+name = "permission.replied"
+kind = "unblocked"
+
+[[events]]
+name = "question.asked"
+kind = "blocked"
+
+[[events]]
+name = "question.replied"
+kind = "unblocked"
+
+# A question the user dismissed rather than answered. It is still an answer as
+# far as this goes: the agent is no longer waiting on them.
+[[events]]
+name = "question.rejected"
+kind = "unblocked"

@@ -31,15 +31,18 @@ pub(crate) const BUNDLED_HOOKS: &[(&str, &str)] = &[
     ),
     ("grok", include_str!("../../manifests/hooks/grok.toml")),
     ("hermes", include_str!("../../manifests/hooks/hermes.toml")),
+    ("kilo", include_str!("../../manifests/hooks/kilo.toml")),
     ("kimi", include_str!("../../manifests/hooks/kimi.toml")),
     (
         "mastracode",
         include_str!("../../manifests/hooks/mastracode.toml"),
     ),
+    ("omp", include_str!("../../manifests/hooks/omp.toml")),
     (
         "opencode",
         include_str!("../../manifests/hooks/opencode.toml"),
     ),
+    ("pi", include_str!("../../manifests/hooks/pi.toml")),
     (
         "qodercli",
         include_str!("../../manifests/hooks/qodercli.toml"),
@@ -67,7 +70,7 @@ mod tests {
 
     /// How many agents the bundled mappings cover. Asserted rather than derived
     /// so that a mapping dropped from the list has to be an explicit decision.
-    const BUNDLED_COUNT: usize = 14;
+    const BUNDLED_COUNT: usize = 17;
 
     #[test]
     fn every_bundled_manifest_loads_cleanly_under_the_key_it_is_filed_by() {
@@ -168,6 +171,11 @@ mod tests {
             Some("/w"),
         ),
         (
+            "kilo",
+            r#"{"type": "session.created", "sessionID": "s1", "directory": "/w"}"#,
+            Some("/w"),
+        ),
+        (
             "kimi",
             r#"{"hook_event_name": "SessionStart", "session_id": "s1", "cwd": "/w",                "session_title": "a session", "client_type": "kimi_code_cli"}"#,
             Some("/w"),
@@ -178,8 +186,18 @@ mod tests {
             Some("/w"),
         ),
         (
+            "omp",
+            r#"{"event": "session_start", "session_id": "s1", "has_ui": true,                "cwd": "/w"}"#,
+            Some("/w"),
+        ),
+        (
             "opencode",
             r#"{"type": "session.created", "sessionID": "s1", "directory": "/w"}"#,
+            Some("/w"),
+        ),
+        (
+            "pi",
+            r#"{"event": "session_start", "session_id": "s1", "mode": "tui",                "cwd": "/w"}"#,
             Some("/w"),
         ),
         (
@@ -357,6 +375,122 @@ mod tests {
                 manifest.normalize(&payload(name, "subagent")).is_none(),
                 "{name} was reported for a session nobody is sitting at",
             );
+        }
+    }
+
+    #[test]
+    fn the_agent_whose_extension_reports_the_interface_by_name_is_read_only_at_a_terminal() {
+        let manifest = compiled("pi");
+        let payload = |event: &str, mode: &str| -> Value {
+            serde_json::from_str(&format!(
+                r#"{{"event": "{event}", "session_id": "s1", "mode": "{mode}",
+                     "cwd": "/w"}}"#
+            ))
+            .expect("a payload")
+        };
+        let mapped = [
+            ("session_start", Kind::SessionStart),
+            ("agent_start", Kind::TurnStart),
+            ("agent_settled", Kind::TurnEnd),
+        ];
+
+        for (name, kind) in mapped {
+            let event = manifest
+                .normalize(&payload(name, "tui"))
+                .unwrap_or_else(|| panic!("{name} produced nothing"));
+            assert_eq!(event.kind, kind, "{name}");
+            assert_eq!(event.session, "s1", "{name}");
+            assert_eq!(event.cwd.as_deref(), Some("/w"), "{name}");
+
+            // The same event, in a mode the agent is driven through rather than
+            // typed at. The extension forwards it either way; this is where it
+            // stops.
+            assert!(
+                manifest.normalize(&payload(name, "rpc")).is_none(),
+                "{name} was reported for a session nobody is sitting at",
+            );
+        }
+    }
+
+    #[test]
+    fn the_agent_that_shares_that_extension_layout_maps_its_own_wider_event_set() {
+        let manifest = compiled("omp");
+        let expected = [
+            ("session_start", Kind::SessionStart),
+            ("session_switch", Kind::SessionStart),
+            ("session_shutdown", Kind::SessionEnd),
+            ("agent_start", Kind::TurnStart),
+            ("agent_end", Kind::TurnEnd),
+            ("tool_execution_start", Kind::ToolStart),
+            ("tool_execution_end", Kind::ToolEnd),
+            ("tool_approval_requested", Kind::Blocked),
+            ("tool_approval_resolved", Kind::Unblocked),
+        ];
+
+        for (name, kind) in expected {
+            let payload: Value = serde_json::from_str(&format!(
+                r#"{{"event": "{name}", "session_id": "s1", "has_ui": true,
+                     "tool": "bash", "cwd": "/w"}}"#
+            ))
+            .expect("a payload");
+
+            let event = manifest
+                .normalize(&payload)
+                .unwrap_or_else(|| panic!("{name} produced nothing"));
+            assert_eq!(event.kind, kind, "{name}");
+            assert_eq!(event.session, "s1", "{name}");
+            assert_eq!(event.cwd.as_deref(), Some("/w"), "{name}");
+        }
+
+        let payload: Value = serde_json::from_str(
+            r#"{"event": "tool_execution_start", "session_id": "s1", "tool": "bash"}"#,
+        )
+        .expect("a payload");
+        assert_eq!(
+            manifest
+                .normalize(&payload)
+                .expect("an event")
+                .detail
+                .expect("a detail")["tool"],
+            Value::from("bash"),
+        );
+    }
+
+    #[test]
+    fn the_callback_an_installed_plugin_names_for_itself_is_what_starts_a_turn() {
+        let manifest = compiled("kilo");
+        let payload: Value = serde_json::from_str(
+            r#"{"type": "chat.message", "sessionID": "s1", "directory": "/w"}"#,
+        )
+        .expect("a payload");
+
+        let event = manifest.normalize(&payload).expect("an event");
+
+        assert_eq!(event.kind, Kind::TurnStart);
+        assert_eq!(event.session, "s1");
+        assert_eq!(event.cwd.as_deref(), Some("/w"));
+    }
+
+    #[test]
+    fn an_agent_that_says_when_it_stopped_waiting_has_both_halves_mapped() {
+        let manifest = compiled("kilo");
+        let expected = [
+            ("permission.asked", Kind::Blocked),
+            ("permission.replied", Kind::Unblocked),
+            ("question.asked", Kind::Blocked),
+            ("question.replied", Kind::Unblocked),
+            ("question.rejected", Kind::Unblocked),
+        ];
+
+        for (name, kind) in expected {
+            let payload: Value =
+                serde_json::from_str(&format!(r#"{{"type": "{name}", "sessionID": "s1"}}"#))
+                    .expect("a payload");
+
+            let event = manifest
+                .normalize(&payload)
+                .unwrap_or_else(|| panic!("{name} produced nothing"));
+            assert_eq!(event.kind, kind, "{name}");
         }
     }
 

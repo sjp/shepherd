@@ -50,6 +50,7 @@ pub mod merge;
 pub mod nested_json;
 pub mod opencode;
 pub mod paths;
+pub mod plugin_drop;
 pub mod sentinel;
 pub mod state;
 pub mod status;
@@ -148,6 +149,19 @@ pub enum Error {
         agent: Agent,
         found: String,
         needed: String,
+    },
+    /// Two agents that read the same layout have been pointed at one
+    /// directory. Both load everything they find there, so a plugin installed
+    /// for either would be loaded by both and would report one agent's sessions
+    /// under the other's name. Both agents are named because the one thing a
+    /// user in this position has to decide is which of them keeps the directory.
+    #[error(
+        "{agent} and {other} both load their plugins from {path}; give them separate directories, then install again"
+    )]
+    Shared {
+        agent: Agent,
+        other: Agent,
+        path: PathBuf,
     },
     /// A file this program would write is one somebody else wrote.
     #[error(
@@ -252,9 +266,12 @@ pub fn installers() -> Vec<&'static dyn Installer> {
         &github_copilot::GithubCopilot,
         &grok::Grok,
         &hermes::Hermes,
+        &plugin_drop::KILO,
         &kimi::Kimi,
         &mastracode::Mastracode,
+        &plugin_drop::OMP,
         &opencode::OpenCode,
+        &plugin_drop::PI,
         &nested_json::QODERCLI,
         &nested_json::QWEN,
     ]
