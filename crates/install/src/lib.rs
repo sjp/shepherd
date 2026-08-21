@@ -41,6 +41,7 @@ pub mod cursor;
 pub mod file;
 pub mod github_copilot;
 pub mod grok;
+pub mod hermes;
 pub mod json;
 pub mod kimi;
 mod lines;
@@ -105,6 +106,13 @@ pub enum Error {
         path: PathBuf,
         #[source]
         problem: toml_text::Problem,
+    },
+    /// A list in a file kept by hand could be read but not safely added to.
+    #[error("refusing to change {path}, which was left as it was")]
+    NotListable {
+        path: PathBuf,
+        #[source]
+        problem: yaml_text::Problem,
     },
     /// A file holds something other than what an entry has to go into.
     #[error("{path} holds something unexpected at {at}, where this needs {needed}")]
@@ -243,6 +251,7 @@ pub fn installers() -> Vec<&'static dyn Installer> {
         &nested_json::DROID,
         &github_copilot::GithubCopilot,
         &grok::Grok,
+        &hermes::Hermes,
         &kimi::Kimi,
         &mastracode::Mastracode,
         &opencode::OpenCode,

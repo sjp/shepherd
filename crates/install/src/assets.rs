@@ -179,6 +179,19 @@ pub const QWEN_WRAPPER: Asset = Asset::pair(
     include_str!("../assets/qwen/agentbus.ps1"),
 );
 
+/// The plugin Hermes loads out of its plugin directory, which is called back on
+/// each of the events it asks for.
+pub const HERMES_PLUGIN: Asset = Asset::portable(include_str!("../assets/hermes/__init__.py"));
+
+/// What Hermes reads to find out what the directory holding that plugin is.
+///
+/// Not a wrapper: it runs nothing and hands nothing over, and is here because
+/// the plugin beside it is not loaded without it. It carries the same two marks
+/// all the same, because it is a whole file this program writes and an
+/// uninstall has to be able to tell it from a file of the user's own.
+pub const HERMES_PLUGIN_MANIFEST: Asset =
+    Asset::portable(include_str!("../assets/hermes/plugin.yaml"));
+
 /// The plugin OpenCode loads out of its plugin directory, which is handed every
 /// event its plugin interface produces.
 pub const OPENCODE_PLUGIN: Asset = Asset::portable(include_str!("../assets/opencode/agentbus.js"));

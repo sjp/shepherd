@@ -30,6 +30,7 @@ pub(crate) const BUNDLED_HOOKS: &[(&str, &str)] = &[
         include_str!("../../manifests/hooks/github-copilot.toml"),
     ),
     ("grok", include_str!("../../manifests/hooks/grok.toml")),
+    ("hermes", include_str!("../../manifests/hooks/hermes.toml")),
     ("kimi", include_str!("../../manifests/hooks/kimi.toml")),
     (
         "mastracode",
@@ -66,7 +67,7 @@ mod tests {
 
     /// How many agents the bundled mappings cover. Asserted rather than derived
     /// so that a mapping dropped from the list has to be an explicit decision.
-    const BUNDLED_COUNT: usize = 13;
+    const BUNDLED_COUNT: usize = 14;
 
     #[test]
     fn every_bundled_manifest_loads_cleanly_under_the_key_it_is_filed_by() {
@@ -159,6 +160,11 @@ mod tests {
         (
             "grok",
             r#"{"hookEventName": "SessionStart", "sessionId": "s1", "cwd": "/w"}"#,
+            Some("/w"),
+        ),
+        (
+            "hermes",
+            r#"{"event": "on_session_start", "session_id": "s1", "platform": "tui",                "cwd": "/w"}"#,
             Some("/w"),
         ),
         (
@@ -316,6 +322,40 @@ mod tests {
                     .normalize_named(&payload, Some("SomethingElse"))
                     .is_none(),
                 "{id} answered to an event it does not map",
+            );
+        }
+    }
+
+    #[test]
+    fn the_agent_whose_plugin_reports_every_interface_is_read_only_where_a_person_is_at_one() {
+        let manifest = compiled("hermes");
+        let payload = |event: &str, platform: &str| -> Value {
+            serde_json::from_str(&format!(
+                r#"{{"event": "{event}", "session_id": "s1", "platform": "{platform}",
+                     "cwd": "/w"}}"#
+            ))
+            .expect("a payload")
+        };
+        let mapped = [
+            ("on_session_start", Kind::SessionStart),
+            ("on_session_reset", Kind::SessionStart),
+            ("pre_llm_call", Kind::TurnStart),
+        ];
+
+        for (name, kind) in mapped {
+            let event = manifest
+                .normalize(&payload(name, "tui"))
+                .unwrap_or_else(|| panic!("{name} produced nothing"));
+            assert_eq!(event.kind, kind, "{name}");
+            assert_eq!(event.session, "s1", "{name}");
+            assert_eq!(event.cwd.as_deref(), Some("/w"), "{name}");
+
+            // The same callback, for a session the agent is running underneath
+            // the one somebody opened. The plugin forwards it either way; this
+            // is where it stops.
+            assert!(
+                manifest.normalize(&payload(name, "subagent")).is_none(),
+                "{name} was reported for a session nobody is sitting at",
             );
         }
     }

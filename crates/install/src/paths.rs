@@ -31,6 +31,21 @@ pub const STATE_HOME_VAR: &str = "XDG_STATE_HOME";
 /// program ships.
 pub const DATA_HOME_VAR: &str = "XDG_DATA_HOME";
 
+/// The variable naming the directory a Windows machine keeps a user's own
+/// application data in.
+pub const LOCAL_APP_DATA_VAR: &str = "LOCALAPPDATA";
+
+/// The variable naming the profile directory a Windows machine gives a user.
+pub const USER_PROFILE_VAR: &str = "USERPROFILE";
+
+/// The variables that describe the machine rather than any agent.
+///
+/// Read alongside the agents' own, and named here rather than beside them,
+/// because they belong to Windows: an agent whose default location is written
+/// in terms of them is reading what the machine says about itself, not
+/// something it documents for its users to set.
+const MACHINE_VARS: [&str; 2] = [LOCAL_APP_DATA_VAR, USER_PROFILE_VAR];
+
 /// The name of this program's own directory, inside whichever base directory it
 /// sits under.
 const DIR_NAME: &str = "agentbus";
@@ -204,7 +219,11 @@ impl Environment {
     }
 
     /// Whether `path` is a file this machine would run.
-    fn runnable(&self, path: &Path) -> bool {
+    ///
+    /// Asked directly, rather than through [`look_up`](Self::look_up), where an
+    /// agent's own installer leaves its program inside the agent's directory
+    /// instead of anywhere a command is normally run from.
+    pub fn runnable(&self, path: &Path) -> bool {
         path.metadata().is_ok_and(|meta| {
             meta.is_file()
                 && match self.platform {
@@ -252,13 +271,15 @@ fn executable(_meta: &Metadata) -> bool {
     true
 }
 
-/// The directories the agents' own variables point their configuration at.
+/// The directories the agents' own variables point their configuration at, and
+/// the ones the machine names for itself.
 ///
 /// Read once, with the rest of the machine, so that no rule below this module
 /// depends on the environment of the process it happens to be running in.
 fn overrides() -> BTreeMap<&'static str, PathBuf> {
     OVERRIDE_VARS
         .iter()
+        .chain(MACHINE_VARS.iter())
         .filter_map(|name| {
             let value = env::var_os(name).filter(|value| !value.is_empty())?;
             Some((*name, PathBuf::from(value)))

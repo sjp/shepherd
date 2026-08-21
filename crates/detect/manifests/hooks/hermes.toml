@@ -1,0 +1,49 @@
+id = "hermes"
+version = "2026.08.21.1"
+min_engine_version = 1
+updated_at = "2026-08-21T00:00:00Z"
+
+# This agent has no hook commands: it imports a plugin and calls it back with
+# keyword arguments, so the payload described here is the one the installed
+# plugin writes — the name of the callback that fired, the session the agent
+# named, the interface that session is running under, and the directory the
+# agent is working in.
+[payload]
+event = "event"
+session = ["session_id"]
+cwd = ["cwd"]
+
+# Every event below is narrowed to the interfaces a person is sitting in front
+# of. The agent calls the same callbacks for the sessions it runs underneath one
+# of those — a subagent doing a piece of the work — and those end by themselves
+# while the session somebody opened is still there; reporting them would be
+# reporting a second session in a place where there is only one.
+#
+# The narrowing lives here rather than in the plugin on purpose. What an event
+# means is decided by this file, and the plugin forwards what it was given: a
+# list of interfaces that changes is a mapping to ship, not a plugin directory
+# to visit.
+
+[[events]]
+name = "on_session_start"
+kind = "session_start"
+when = { field = "platform", in = ["cli", "tui", "desktop", "acp"] }
+
+# The user began again inside a session that was already open. Reported as a
+# session beginning because that is what it is from this side: a new session id,
+# in the same place, with nothing of the old one carried over.
+[[events]]
+name = "on_session_reset"
+kind = "session_start"
+when = { field = "platform", in = ["cli", "tui", "desktop", "acp"] }
+
+# The agent is about to think. This fires before each call the agent makes to a
+# model rather than once for each thing the user asks, so turns cannot be
+# counted by counting these — what is lost is the count, and what is kept is
+# both halves of what this is for: the session is working, and, on a session
+# picked up again from the command line, this is the first thing heard of it at
+# all.
+[[events]]
+name = "pre_llm_call"
+kind = "turn_start"
+when = { field = "platform", in = ["cli", "tui", "desktop", "acp"] }

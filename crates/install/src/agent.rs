@@ -25,7 +25,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use crate::paths::{Environment, Platform};
+use crate::paths::{Environment, LOCAL_APP_DATA_VAR, Platform, USER_PROFILE_VAR};
 
 /// A coding agent the bus can install hooks into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -139,6 +139,18 @@ pub const OVERRIDE_VARS: [&str; 13] = [
 /// The directory Omp keeps its agent directory in when nothing says otherwise.
 const OMP_DIR: &str = ".omp";
 
+/// What Hermes calls its own directory below a home directory.
+const HERMES_DIR: &str = ".hermes";
+
+/// What Hermes calls it below the directory a Windows machine keeps a user's
+/// application data in, where there is no leading dot to hide it with.
+const HERMES_APP_DIR: &str = "hermes";
+
+/// The file Hermes' own installer leaves on a Windows machine, and the
+/// directories below its own it may leave it in.
+const HERMES_PROGRAM: &str = "hermes.exe";
+const HERMES_PROGRAM_DIRS: [&str; 2] = ["bin", "Scripts"];
+
 impl Agent {
     /// What the agent is called, on a command line and in a report.
     ///
@@ -196,7 +208,7 @@ impl Agent {
             Self::Droid => below_home(env, &[".factory"]),
             Self::GithubCopilot => overridable(env, COPILOT_HOME_VAR, &[".copilot"]),
             Self::Grok => overridable(env, GROK_HOME_VAR, &[".grok"]),
-            Self::Hermes => overridable(env, HERMES_HOME_VAR, &[".hermes"]),
+            Self::Hermes => hermes_dir(env),
             Self::Kilo => below_home(env, &[".config", "kilo"]),
             Self::Kimi => overridable(env, KIMI_HOME_VAR, &[".kimi-code"]),
             Self::Mastracode => below_home(env, &[".mastracode"]),
@@ -261,11 +273,65 @@ impl Agent {
     }
 
     /// Where the agent's command is on `env`, if it is anywhere.
+    ///
+    /// The search path first, and then — for the one agent whose own installer
+    /// puts its program inside its configuration directory rather than
+    /// somewhere commands are run from — the places that installer leaves it.
+    /// Without the second look, a machine with that agent installed and that
+    /// directory off the search path is one this program says the agent is not
+    /// on.
     pub fn command(self, env: &Environment) -> Option<PathBuf> {
         self.commands(env.platform())
             .iter()
             .find_map(|name| env.look_up(name))
+            .or_else(|| self.beside_its_configuration(env))
     }
+
+    /// Where the agent's own installer would have left its program inside the
+    /// agent's directory, if it is there.
+    ///
+    /// One agent on one kind of machine. Everywhere else this is nothing: a
+    /// program found by guessing at another installer's layout is a guess, and
+    /// it is only worth making where the layout is documented and the command
+    /// would otherwise be missed.
+    fn beside_its_configuration(self, env: &Environment) -> Option<PathBuf> {
+        let candidates = match (self, env.platform()) {
+            (Self::Hermes, Platform::Windows) => {
+                let dir = self.config_dir(env);
+                let mut candidates = vec![dir.join(HERMES_PROGRAM)];
+                candidates.extend(
+                    HERMES_PROGRAM_DIRS
+                        .iter()
+                        .map(|below| dir.join(below).join(HERMES_PROGRAM)),
+                );
+                candidates
+            }
+            _ => return None,
+        };
+        candidates.into_iter().find(|path| env.runnable(path))
+    }
+}
+
+/// Where Hermes keeps its configuration on `env`.
+///
+/// The one agent here whose default depends on what kind of machine it is on.
+/// A Windows machine gives every user a profile directory, and Hermes puts its
+/// own directory under the application-data directory beside it rather than
+/// there. But a user of such a machine may also have a home directory in the
+/// unix sense — set by a shell that brings one with it — and Hermes reads that
+/// in preference, so a person who has one finds their configuration where it is
+/// on every other machine they use.
+fn hermes_dir(env: &Environment) -> PathBuf {
+    if let Some(named) = env.var(HERMES_HOME_VAR) {
+        return named;
+    }
+    if env.platform() == Platform::Windows
+        && env.var(USER_PROFILE_VAR).as_deref() == Some(env.home())
+        && let Some(data) = env.var(LOCAL_APP_DATA_VAR)
+    {
+        return data.join(HERMES_APP_DIR);
+    }
+    below_home(env, &[HERMES_DIR])
 }
 
 /// The directory `var` names on `env`, or the one `segments` name below its
@@ -551,6 +617,78 @@ mod tests {
             Path::new("/home/u/.config/kilo"),
             "an agent that documents no such thing keeps its fixed directory"
         );
+    }
+
+    #[test]
+    fn the_agent_that_keeps_its_configuration_somewhere_else_on_windows_does_so() {
+        let windows = || machine().with_platform(Platform::Windows);
+
+        // A machine giving the user nothing but the profile directory it makes
+        // for them: the agent goes under the application data beside it.
+        let plain = windows()
+            .with_var(USER_PROFILE_VAR, "/home/u")
+            .with_var(LOCAL_APP_DATA_VAR, "/home/u/AppData/Local");
+        assert_eq!(
+            Agent::Hermes.config_dir(&plain),
+            Path::new("/home/u/AppData/Local/hermes")
+        );
+
+        // A machine where the user has a home directory of their own as well.
+        // That is where they would look, so that is where it goes.
+        let owned = plain.clone().with_var(USER_PROFILE_VAR, "/c/Users/u");
+        assert_eq!(
+            Agent::Hermes.config_dir(&owned),
+            Path::new("/home/u/.hermes")
+        );
+        assert_eq!(
+            Agent::Hermes.config_dir(&windows()),
+            Path::new("/home/u/.hermes"),
+            "a machine that names neither is read the way every other one is",
+        );
+
+        // And the agent's own variable wins over all of it, as everywhere else.
+        assert_eq!(
+            Agent::Hermes.config_dir(&plain.with_var(HERMES_HOME_VAR, "/srv/h")),
+            Path::new("/srv/h")
+        );
+        assert_eq!(
+            Agent::Hermes.config_dir(&machine().with_var(LOCAL_APP_DATA_VAR, "/nowhere")),
+            Path::new("/home/u/.hermes"),
+            "what a Windows machine says about itself moves nothing on a unix one",
+        );
+    }
+
+    #[test]
+    fn an_agent_its_own_installer_puts_beside_its_configuration_is_still_found() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let env = Environment::rooted(&home)
+            .with_platform(Platform::Windows)
+            .with_var(HERMES_HOME_VAR, home.join("hermes"));
+        let dir = Agent::Hermes.config_dir(&env);
+
+        assert_eq!(Agent::Hermes.command(&env), None);
+        assert!(detect(&env).is_empty(), "nothing is on this machine yet");
+
+        for below in ["Scripts", "bin", ""] {
+            let program = dir.join(below).join("hermes.exe");
+            std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+            std::fs::write(&program, "").unwrap();
+
+            assert_eq!(
+                Agent::Hermes.command(&env),
+                Some(program.clone()),
+                "{below:?} is not looked in",
+            );
+            let found = detect(&env);
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(found[0].command.as_deref(), Some(program.as_path()));
+        }
+
+        // The same layout on a machine that is not a Windows one is not a
+        // layout at all, and nothing there is a command.
+        let unix = env.with_platform(Platform::Unix);
+        assert_eq!(Agent::Hermes.command(&unix), None);
     }
 
     #[test]

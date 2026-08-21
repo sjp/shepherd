@@ -337,7 +337,7 @@ fn a_machine_with_no_agent_on_it_is_told_so() {
         report,
         "no coding agent found on this machine\n\
          nothing to install: this build only handles antigravity, claude, codex, \
-         cursor, devin, droid, github-copilot, grok, kimi, mastracode, opencode, \
+         cursor, devin, droid, github-copilot, grok, hermes, kimi, mastracode, opencode, \
          qodercli and qwen\n"
     );
 }
@@ -1645,7 +1645,7 @@ fn an_agent_this_build_has_no_installer_for_is_refused_when_it_is_named() {
     assert!(
         said.contains(
             "antigravity, claude, codex, cursor, devin, droid, github-copilot, grok, \
-             kimi, mastracode, opencode, qodercli and qwen"
+             hermes, kimi, mastracode, opencode, qodercli and qwen"
         ),
         "{said}"
     );
@@ -1687,7 +1687,7 @@ fn an_agent_this_build_has_no_installer_for_is_reported_and_passed_over() {
     assert!(
         report.contains(
             "nothing to install: this build only handles antigravity, claude, codex, \
-         cursor, devin, droid, github-copilot, grok, kimi, mastracode, opencode, \
+         cursor, devin, droid, github-copilot, grok, hermes, kimi, mastracode, opencode, \
          qodercli and qwen\n"
         ),
         "{report}"
