@@ -13,6 +13,9 @@
 //!   maintains by hand. Where there is no drop-in, merge into the file rather
 //!   than replacing it, and refuse a file that cannot be rewritten without
 //!   changing what it means.
+//! - Where the file is one a person keeps, change the bytes being changed and
+//!   no others, so that their comments, spacing and line endings survive an
+//!   install. See [`cst`].
 //! - Mark every entry written, so that upgrading and uninstalling can find
 //!   exactly this program's own work and nothing else. See [`sentinel`].
 //! - Copy a file before changing it, and change it by renaming a complete new
@@ -32,6 +35,7 @@ pub mod change;
 pub mod claude;
 pub mod codex;
 pub mod command;
+pub mod cst;
 pub mod file;
 pub mod json;
 pub mod merge;

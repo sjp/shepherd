@@ -21,6 +21,10 @@ agentbus-install = { path = "crates/install" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
+# Pinned exactly: its concrete-syntax-tree API is what lets a file somebody
+# maintains by hand be edited without reformatting the rest of it, and a
+# change in how that tree renders would change files on users' machines.
+jsonc-parser = { version = "=0.33.1", default-features = false, features = ["cst", "serde_json"] }
 libc = "0.2"
 regex = "1"
 rustls-graviola = "0.4"

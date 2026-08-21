@@ -6,6 +6,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+jsonc-parser = { workspace = true }
 serde = { workspace = true }
 # `preserve_order` so that rewriting a file somebody else owns hands their keys
 # back in the order they wrote them.

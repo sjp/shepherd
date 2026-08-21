@@ -1364,3 +1364,48 @@ base64 of UTF-16, for the hook runners that put what they are given through a
 shell of their own — is built here rather than taken from a library. It is one
 table and one loop used in one place, and a dependency for it would be more to
 keep an eye on than to keep.
+
+## 2026-08-21 — editing a file somebody keeps
+
+### A concrete syntax tree for the two configuration files people hand-edit
+
+**`jsonc-parser`, pinned to an exact version, with its `cst` and `serde_json`
+features and nothing else.** This is the first dependency this workspace has
+taken for a job it could in principle do itself, so it is worth saying what it
+buys. Most of the files `agentbus install` writes into belong to an agent: it
+generates them, this program adds to them, and nobody reads them for pleasure.
+Rewriting one whole from a parsed value is right for those, and that is what the
+existing merge path does.
+
+Two of them do not belong to an agent. They are files people open in an editor
+and keep, with comments in them, sections written on one line because that is
+how their author likes them, and whatever line endings their machine uses. A
+whole-file rewrite of one of those is a config file quietly reformatted and a
+diff nobody asked for, and the loss is not only cosmetic — a rewrite cannot
+carry a comment at all, because the value it parsed never held one.
+
+Editing text in place needs a parse that keeps the punctuation and the
+whitespace as well as the values, and that is a fair amount of code to get
+right: escapes, comment placement, where a comma goes. Writing it here would be
+a JSON parser this repository maintains in order to add two lines to two files.
+The exact pin is because the thing being depended on is not an API but an
+output — how the tree renders is what lands in a user's file — and that is not
+something to let float.
+
+### Every edit is checked by reading back what it wrote
+
+**The desired value is worked out first, and an edit whose text does not parse
+back to exactly that value is refused.** Splicing text is guesswork in a way
+that serializing a value is not: where the comma goes in a one-line object,
+which side of a trailing comma a new element belongs on, whether the comma found
+before the closing bracket is a real one or one inside a comment. Rather than
+try to be right about every such case, each edit states what the document is to
+mean, makes the change, reads the file back and compares. A disagreement of any
+kind is a refusal that names the file and changes nothing, and the planner turns
+it into a failed plan.
+
+That check is also what makes the shortcut underneath it safe. An edit whose
+desired value is the value the document already holds writes no text at all and
+hands back the original bytes, so installing twice, or taking out exactly what
+was just put in, leaves a file with the modification time it had before anybody
+looked at it.
