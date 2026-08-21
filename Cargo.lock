@@ -69,6 +69,8 @@ dependencies = [
 name = "agentbus-install"
 version = "0.1.0"
 dependencies = [
+ "agentbus-detect",
+ "agentbus-protocol",
  "jsonc-parser",
  "serde",
  "serde_json",

@@ -15,6 +15,13 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+# The mapping engine and the envelope it produces, so that a plugin installed
+# here can be run and the payload it writes fed through the same mapping the
+# binary would read it with. Testing an asset against a description of what it
+# ought to emit would only prove the description; testing it against the
+# mapping proves the pair.
+agentbus-detect = { workspace = true }
+agentbus-protocol = { workspace = true }
 # Only ever used to check that what the text editors produce really is TOML.
 # Nothing in this crate generates TOML through it: a serializer would give the
 # file back reformatted, which is the thing those editors exist to avoid.
