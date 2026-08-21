@@ -1628,3 +1628,65 @@ anyway would mean guessing at another program's layout, writing a settings file
 into a directory that program may never read, and leaving this program answerable
 for a directory it invented. Saying "install the agent first" costs a user one
 line and nothing else.
+
+## 2026-08-21 — the agents that hand over a region of their own
+
+### Ownership is claimed by region where an agent offers one
+
+**Where an agent lets a tool have a whole key or a whole file, that region is
+the mark.** Everywhere else, this program finds its own work again by the key it
+writes into every entry, because its entries sit in an array beside the user's
+and nothing else could tell them apart. Two agents make that unnecessary.
+Antigravity keys its hooks file by the name of a *hook* rather than by the name
+of an event, so everything one tool registers hangs below one key of that tool's
+choosing; Grok merges every JSON file in a directory, so a tool can own a file
+outright and never open a shared one.
+
+Taking those offers costs nothing and buys the simplest installs here: install
+writes the region, upgrade rewrites it whole, uninstall removes it, and no other
+key or file is read, written or counted. It also avoids a real risk — a mark is
+a key somebody else's schema did not ask for, and an agent that validates its
+hooks strictly would be within its rights to reject a document carrying one.
+
+What the record still has to hold is which files this program *created*, exactly
+as before: an empty hooks file this program made is litter and one it merely
+added a key to is the user's, and nothing on disk can tell those apart.
+
+### The event's name may come from the command line
+
+**`agentbus emit --event <name>`, and a mapping that names no event field.**
+Every agent here but one puts the name of the event in the payload, and the
+mapping reads it out of a field the manifest names. Antigravity does not: it
+delivers one payload shape per event and expects whoever registered the hook to
+remember which event they registered for.
+
+Three ways to bridge that were available, and the payload rule decided between
+them. The wrapper could have edited the payload on its way past — but a wrapper
+that adds a field is a wrapper putting this program's words in the agent's
+mouth, and the mapping would then be written against a shape nobody documents.
+The mapping could have named a field the payload does not have and quietly never
+fire. Instead the name travels *beside* the payload: the entry written into the
+agent passes it to the wrapper, the wrapper passes it to `emit`, and what is on
+standard input reaches the far end exactly as the agent wrote it.
+
+The payload wins wherever it answers. A name from a command line is a fact about
+which hook was run; a payload that names its own event is the agent itself
+speaking, and somebody reading a manifest against a captured payload should be
+able to work out what will happen from the payload alone.
+
+A manifest that names no event field is new expressive power rather than an
+omission, so it is behind a hook-engine version: an older engine refuses such a
+manifest outright instead of half-reading it.
+
+### One wrapper answers, because silence is an answer there
+
+**Antigravity's wrapper prints an empty object and nothing else.** Every other
+wrapper here says nothing at all on standard output, because the agents read
+what a hook prints as an instruction and this program has none. Antigravity
+reads a hook's standard output as a list of steps to insert into the user's
+session, and an empty object is how "no steps" is spelled. Saying nothing there
+is not the same as saying nothing to insert — it is leaving the agent to make
+what it will of silence.
+
+So the rule stands and the exception is written down: the wrapper prints exactly
+that object, on every path out of it, and prints nothing else ever.

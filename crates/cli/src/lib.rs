@@ -513,6 +513,10 @@ struct EmitArgs {
     #[arg(long, value_name = "NAME")]
     agent: Option<String>,
 
+    /// Which of the agent's events the payload is about, for an agent whose payload does not say
+    #[arg(long, value_name = "EVENT")]
+    event: Option<String>,
+
     /// Where the claim comes from: hook, the default, or observed
     #[arg(long, value_name = "SOURCE")]
     source: Option<String>,
@@ -1105,6 +1109,7 @@ fn emit(args: &EmitArgs, started: Instant) -> ExitCode {
     let connection = std::env::var_os(emit::SSH_CONNECTION_VAR);
     let request = emit::Request {
         agent: args.agent.as_deref(),
+        event: args.event.as_deref(),
         source: args.source.as_deref(),
         correlation: stated(&pane).or_else(|| stated(&fallback)),
         ssh_connection: stated(&connection),

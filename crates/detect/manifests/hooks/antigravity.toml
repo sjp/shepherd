@@ -1,0 +1,37 @@
+id = "antigravity"
+version = "2026.08.21.1"
+min_engine_version = 2
+updated_at = "2026-08-21T00:00:00Z"
+aliases = ["agy", "antigravity-cli"]
+
+# The one agent here whose payload never says which event it is about. Its hook
+# reference gives one payload shape per event and expects whoever registered the
+# hook to remember which event they registered for, so there is no field to read
+# the name out of and none is named below. The name arrives from the command
+# that ran the hook instead, which is why this mapping needs an engine that
+# knows how to be told one.
+#
+# The conversation is what this agent calls the thing every other agent here
+# calls a session, and it is the reason the hook is installed at all: it is the
+# id that resumes the same conversation later.
+#
+# The directory is not read. This agent reports where it is working as a list of
+# workspace paths rather than as one directory, and a field naming a list is not
+# a field this dialect can take a directory out of. A payload that names none
+# simply reports no directory, which is the honest answer here.
+#
+# Every field below is taken from this agent's published hook reference rather
+# than from a payload captured off a running session, which is a weaker thing to
+# rest on: a field that turns out to be spelled differently reports nothing at
+# all rather than reporting wrongly, but it still reports nothing.
+[payload]
+session = ["conversationId"]
+
+# The event fired once the user's input has been submitted and before the model
+# is called. It is the only one of this agent's five events mapped, because it
+# is the only one that carries the conversation, and it is registered for under
+# that name rather than under the name the other agents use for a session
+# beginning — an installer's job is to write the file the agent reads.
+[[events]]
+name = "PreInvocation"
+kind = "session_start"

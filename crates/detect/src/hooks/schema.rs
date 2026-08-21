@@ -40,7 +40,10 @@ use crate::version::ManifestVersion;
 ///
 /// A manifest may declare the lowest engine it needs; anything above this is
 /// refused rather than half-understood.
-pub const HOOKS_ENGINE_VERSION: u32 = 1;
+///
+/// Two, since a mapping may leave out the field naming the event, for the
+/// agents whose payload does not carry one. See [`PayloadFields::event`].
+pub const HOOKS_ENGINE_VERSION: u32 = 2;
 
 /// One agent's hook-mapping manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -75,7 +78,17 @@ pub struct HookManifest {
 #[serde(deny_unknown_fields)]
 pub struct PayloadFields {
     /// The field whose string value names the event.
-    pub event: String,
+    ///
+    /// Left out by a mapping for an agent whose payload does not name its own
+    /// event — one payload shape per event, with whoever registered the hook
+    /// expected to know which one they registered. Such a payload can only be
+    /// read by a caller that says which event it is about, and one that does
+    /// not say produces nothing at all. Naming a field is therefore the normal
+    /// case and leaving it out is a claim about the agent, which is why it has
+    /// to be written down rather than inferred from a payload that happens to
+    /// be missing it.
+    #[serde(default)]
+    pub event: Option<String>,
     /// Fields the session id may be under, best first. The first one holding a
     /// non-empty string answers.
     ///
@@ -217,7 +230,12 @@ impl HookManifest {
             _ => {}
         }
 
-        if self.payload.event.trim().is_empty() {
+        if self
+            .payload
+            .event
+            .as_ref()
+            .is_some_and(|field| field.trim().is_empty())
+        {
             return Err(self.fault(HookFault::EmptyFieldName { field: "event" }));
         }
         if self.payload.session.is_empty() {
@@ -529,7 +547,7 @@ detail = [
         assert_eq!(manifest.min_engine_version, Some(1));
         assert_eq!(manifest.updated_at.as_deref(), Some("2026-08-20"));
         assert_eq!(manifest.aliases, ["other-name"]);
-        assert_eq!(manifest.payload.event, "hook_event_name");
+        assert_eq!(manifest.payload.event.as_deref(), Some("hook_event_name"));
         assert_eq!(manifest.payload.session, ["session_id", "sessionID"]);
         assert_eq!(manifest.payload.cwd, ["cwd", "directory"]);
         assert_eq!(manifest.events.len(), 2);

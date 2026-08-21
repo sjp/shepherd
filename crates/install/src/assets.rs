@@ -32,6 +32,13 @@
 //! it is written down beside the wrapper, because a mapping is written against
 //! it.
 //!
+//! One agent's payload does not say which of its events it is about — one shape
+//! per event, and whoever registered the hook is expected to remember which. Its
+//! wrapper is told the name by the entry that runs it and passes the name on
+//! beside the payload, which stays untouched: a wrapper that edited what the
+//! agent wrote would be putting this program's words in the agent's mouth, and
+//! the mapping would then be written against something nobody documents.
+//!
 //! # What a wrapper may not do
 //!
 //! A wrapper runs inside somebody's coding session, on every event their agent
@@ -39,7 +46,10 @@
 //!
 //! - It never writes to the standard output the agent is reading. Several agents
 //!   interpret what a hook prints as an instruction, and this program has no
-//!   instructions for anybody's agent.
+//!   instructions for anybody's agent. The exception is the one agent that reads
+//!   silence as an answer of its own rather than as no answer: there, having no
+//!   instructions is itself something that has to be said, and the wrapper says
+//!   exactly that and nothing else, on every path out of it.
 //! - It always reports success. A failure raised here is a fault the user did
 //!   not ask for, in a session that had nothing to do with this program.
 //! - It never keeps the agent waiting beyond the moment the event is handed
@@ -97,6 +107,12 @@ impl Asset {
     }
 }
 
+/// The wrapper Antigravity runs on each of its events.
+pub const ANTIGRAVITY_WRAPPER: Asset = Asset::pair(
+    include_str!("../assets/antigravity/agentbus.sh"),
+    include_str!("../assets/antigravity/agentbus.ps1"),
+);
+
 /// The wrapper Claude Code runs on each of its events.
 pub const CLAUDE_WRAPPER: Asset = Asset::pair(
     include_str!("../assets/claude/agentbus.sh"),
@@ -131,6 +147,12 @@ pub const DROID_WRAPPER: Asset = Asset::pair(
 pub const GITHUB_COPILOT_WRAPPER: Asset = Asset::pair(
     include_str!("../assets/github-copilot/agentbus.sh"),
     include_str!("../assets/github-copilot/agentbus.ps1"),
+);
+
+/// The wrapper Grok runs on each of its events.
+pub const GROK_WRAPPER: Asset = Asset::pair(
+    include_str!("../assets/grok/agentbus.sh"),
+    include_str!("../assets/grok/agentbus.ps1"),
 );
 
 /// The wrapper MastraCode runs on each of its events.

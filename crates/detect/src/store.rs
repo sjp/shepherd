@@ -861,9 +861,26 @@ impl ManifestStore {
         agent: &str,
         payload: &serde_json::Value,
     ) -> Option<UnstampedEvent> {
+        self.normalize_hook_named(agent, payload, None)
+    }
+
+    /// The same, with the name of the event to fall back on where the payload
+    /// does not say which event it is about.
+    ///
+    /// Some harnesses deliver one payload shape per event and leave whoever
+    /// registered the hook to know which one it was. A caller that does know
+    /// says so here; the payload still wins wherever it answers the question
+    /// itself. See
+    /// [`CompiledHookManifest::normalize_named`](crate::hooks::CompiledHookManifest::normalize_named).
+    pub fn normalize_hook_named(
+        &self,
+        agent: &str,
+        payload: &serde_json::Value,
+        named: Option<&str>,
+    ) -> Option<UnstampedEvent> {
         let entry = self.hooks.entry(agent);
         let active = entry.active.as_ref()?;
-        active.compiled.normalize(payload)
+        active.compiled.normalize_named(payload, named)
     }
 
     /// What was passed over on the way to the mapping that answers for
@@ -927,7 +944,7 @@ mod tests {
     /// mappings counted separately: the two families describe overlapping sets
     /// of agents and a summary is per family, not per agent.
     const BUNDLED_SCREEN_COUNT: usize = 20;
-    const BUNDLED_HOOK_COUNT: usize = 10;
+    const BUNDLED_HOOK_COUNT: usize = 12;
     const BUNDLED_COUNT: usize = BUNDLED_SCREEN_COUNT + BUNDLED_HOOK_COUNT;
 
     /// An agent the bundled corpus describes the screen of and says nothing

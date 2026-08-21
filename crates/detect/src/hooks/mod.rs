@@ -87,9 +87,33 @@ impl CompiledHookManifest {
     /// not think to normalize is still in there, which is what makes a gap in
     /// the dialect an inconvenience rather than a loss.
     pub fn normalize(&self, payload: &Value) -> Option<UnstampedEvent> {
+        self.normalize_named(payload, None)
+    }
+
+    /// The same, with the name of the event to fall back on where the payload
+    /// does not say which event it is about.
+    ///
+    /// Not every harness puts the event's name in the payload. Some deliver one
+    /// payload shape per event and leave the caller to know which event it
+    /// registered for, and a mapping written against such an agent would
+    /// otherwise have no field to read the name out of — the payload is
+    /// perfectly good and simply does not answer that one question.
+    ///
+    /// The payload wins wherever it does answer. A name supplied by a caller is
+    /// a fact about which hook was run, and a payload that names its own event
+    /// is the agent itself speaking; where the two disagree the agent is right,
+    /// and a mapping author reading a manifest against a captured payload
+    /// should be able to work out what will happen from the payload alone.
+    pub fn normalize_named(&self, payload: &Value, named: Option<&str>) -> Option<UnstampedEvent> {
         let object = payload.as_object()?;
 
-        let name = string(object, &self.manifest.payload.event)?;
+        let name = self
+            .manifest
+            .payload
+            .event
+            .as_deref()
+            .and_then(|field| string(object, field))
+            .or(named)?;
         let mapping = self
             .manifest
             .events

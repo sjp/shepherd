@@ -152,7 +152,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// What one invocation was asked to do.
 ///
-/// The three fields are the whole of this command's input: two flags and one
+/// These fields are the whole of this command's input: three flags and one
 /// environment variable. Nothing else is read, and nothing is consulted that
 /// could be slow — no configuration file, no directory walk, no lookup that
 /// could touch a network.
@@ -160,6 +160,14 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
 pub struct Request<'a> {
     /// `--agent`: the agent whose hook payload is on stdin.
     pub agent: Option<&'a str>,
+    /// `--event`: which of that agent's events the payload is about.
+    ///
+    /// For the agents whose payload does not name its own event — one payload
+    /// shape per event, and whoever registered the hook is expected to know
+    /// which one they registered. The mapping still reads the name out of the
+    /// payload wherever the payload gives one, so this changes nothing for the
+    /// agents that do.
+    pub event: Option<&'a str>,
     /// `--source`: where the claim comes from. Absent means a hook.
     pub source: Option<&'a str>,
     /// The value of [`PANE_VAR`], or of [`PANE_FALLBACK_VAR`] where that is
@@ -264,7 +272,7 @@ fn normalize(store: &ManifestStore, request: &Request<'_>, raw: &Value) -> Optio
             if agent == PANIC_AGENT {
                 panic!("{PANIC_AGENT}");
             }
-            let normalized = store.normalize_hook(agent, raw);
+            let normalized = store.normalize_hook_named(agent, raw, request.event);
             // What the store passed over on the way to the mapping that
             // answered — a copy it could not read, one describing somebody
             // else. Said whether or not there was an event, because the file a
@@ -563,6 +571,51 @@ mod tests {
             event.correlation.as_deref(),
             Some("  w9:p3 / anything at all  ")
         );
+    }
+
+    #[test]
+    fn an_agent_whose_payload_names_no_event_is_read_when_the_command_line_names_one() {
+        let (_home, store) = bundled();
+        // No field in it says which event this is; the agent delivers one shape
+        // per event and leaves the hook to know which one it registered for.
+        let payload = json!({"conversationId": "c1", "workspacePaths": ["/w"]});
+        let request = Request {
+            agent: Some("antigravity"),
+            event: Some("PreInvocation"),
+            ..Request::default()
+        };
+
+        let event = normalize(&store, &request, &payload).expect("that should have been an event");
+
+        assert_eq!(event.agent, agent("antigravity"));
+        assert_eq!(event.kind, Kind::SessionStart);
+        assert_eq!(event.session, "c1");
+        assert!(
+            normalize(
+                &store,
+                &Request {
+                    event: None,
+                    ..request
+                },
+                &payload,
+            )
+            .is_none(),
+            "a payload nothing names the event of is not an event",
+        );
+    }
+
+    #[test]
+    fn a_payload_that_names_its_own_event_is_believed_over_the_command_line() {
+        let (_home, store) = bundled();
+        let request = Request {
+            agent: Some("claude"),
+            event: Some("SessionStart"),
+            ..Request::default()
+        };
+
+        let event = normalize(&store, &request, &hook_payload()).expect("an event");
+
+        assert_eq!(event.kind, Kind::TurnStart, "the payload says so itself");
     }
 
     #[test]

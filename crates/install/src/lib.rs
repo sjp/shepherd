@@ -30,6 +30,7 @@
 //! machine instead of the one the tests happen to run on.
 
 pub mod agent;
+pub mod antigravity;
 pub mod assets;
 pub mod change;
 pub mod claude;
@@ -39,6 +40,7 @@ pub mod cst;
 pub mod cursor;
 pub mod file;
 pub mod github_copilot;
+pub mod grok;
 pub mod json;
 mod lines;
 pub mod mastracode;
@@ -220,12 +222,14 @@ pub trait Installer {
 /// without any of them naming an agent.
 pub fn installers() -> Vec<&'static dyn Installer> {
     vec![
+        &antigravity::Antigravity,
         &claude::Claude,
         &codex::Codex,
         &cursor::Cursor,
         &nested_json::DEVIN,
         &nested_json::DROID,
         &github_copilot::GithubCopilot,
+        &grok::Grok,
         &mastracode::Mastracode,
         &opencode::OpenCode,
         &nested_json::QODERCLI,

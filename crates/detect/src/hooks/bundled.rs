@@ -16,6 +16,10 @@
 /// mapping describes normalizes to nothing, which is the same answer an
 /// unmapped event gets.
 pub(crate) const BUNDLED_HOOKS: &[(&str, &str)] = &[
+    (
+        "antigravity",
+        include_str!("../../manifests/hooks/antigravity.toml"),
+    ),
     ("claude", include_str!("../../manifests/hooks/claude.toml")),
     ("codex", include_str!("../../manifests/hooks/codex.toml")),
     ("cursor", include_str!("../../manifests/hooks/cursor.toml")),
@@ -25,6 +29,7 @@ pub(crate) const BUNDLED_HOOKS: &[(&str, &str)] = &[
         "github-copilot",
         include_str!("../../manifests/hooks/github-copilot.toml"),
     ),
+    ("grok", include_str!("../../manifests/hooks/grok.toml")),
     (
         "mastracode",
         include_str!("../../manifests/hooks/mastracode.toml"),
@@ -60,7 +65,7 @@ mod tests {
 
     /// How many agents the bundled mappings cover. Asserted rather than derived
     /// so that a mapping dropped from the list has to be an explicit decision.
-    const BUNDLED_COUNT: usize = 10;
+    const BUNDLED_COUNT: usize = 12;
 
     #[test]
     fn every_bundled_manifest_loads_cleanly_under_the_key_it_is_filed_by() {
@@ -110,11 +115,16 @@ mod tests {
     /// agent here, which is exactly the thing the mapping exists to absorb.
     ///
     /// The third column is the directory the mapping is expected to report.
-    /// Almost every agent names one; the one that does not names a list of
-    /// working roots instead, which is not something a directory can be read out
-    /// of, and a mapping that claimed otherwise would report a key that is
-    /// silently always absent.
+    /// Almost every agent names one; the two that do not name a list of working
+    /// roots instead, which is not something a directory can be read out of, and
+    /// a mapping that claimed otherwise would report a key that is silently
+    /// always absent.
     const SESSION_STARTS: &[(&str, &str, Option<&str>)] = &[
+        (
+            "antigravity",
+            r#"{"conversationId": "s1", "workspacePaths": ["/w"]}"#,
+            None,
+        ),
         (
             "claude",
             r#"{"hook_event_name": "SessionStart", "session_id": "s1", "cwd": "/w"}"#,
@@ -146,6 +156,11 @@ mod tests {
             Some("/w"),
         ),
         (
+            "grok",
+            r#"{"hookEventName": "SessionStart", "sessionId": "s1", "cwd": "/w"}"#,
+            Some("/w"),
+        ),
+        (
             "mastracode",
             r#"{"hook_event_name": "SessionStart", "session_id": "s1", "cwd": "/w"}"#,
             Some("/w"),
@@ -167,6 +182,22 @@ mod tests {
         ),
     ];
 
+    /// The agents whose payload does not name its own event, and the name
+    /// whoever runs the hook has to supply for it.
+    ///
+    /// One shape per event and no field saying which, so the mapping names no
+    /// event field and the name comes from the caller. Everything not listed
+    /// here says so in its payload and is read without help.
+    const NAMED_BY_CALLER: &[(&str, &str)] = &[("antigravity", "PreInvocation")];
+
+    /// What the caller has to say about `id`'s payload, if anything.
+    fn named(id: &str) -> Option<&'static str> {
+        NAMED_BY_CALLER
+            .iter()
+            .find(|(agent, _)| *agent == id)
+            .map(|(_, event)| *event)
+    }
+
     /// The mapping filed under `id`, ready to read a payload with.
     fn compiled(id: &str) -> CompiledHookManifest {
         let (_, content) = bundled_hook_manifests()
@@ -187,7 +218,7 @@ mod tests {
         for (id, payload, cwd) in SESSION_STARTS {
             let payload: Value = serde_json::from_str(payload).expect("a payload");
             let event = compiled(id)
-                .normalize(&payload)
+                .normalize_named(&payload, named(id))
                 .unwrap_or_else(|| panic!("{id} said nothing about a session starting"));
 
             assert_eq!(event.agent.as_str(), *id);
@@ -251,6 +282,49 @@ mod tests {
                 "{name} should read the second spelling of the session",
             );
         }
+    }
+
+    #[test]
+    fn an_agent_whose_payload_names_no_event_is_read_only_when_the_caller_names_one() {
+        for (id, event) in NAMED_BY_CALLER {
+            let (_, payload, _) = SESSION_STARTS
+                .iter()
+                .find(|(agent, _, _)| agent == id)
+                .unwrap_or_else(|| panic!("no payload for {id:?}"));
+            let payload: Value = serde_json::from_str(payload).expect("a payload");
+            let manifest = compiled(id);
+
+            assert!(
+                manifest.normalize(&payload).is_none(),
+                "{id} was read without being told which event this is",
+            );
+            assert_eq!(
+                manifest
+                    .normalize_named(&payload, Some(event))
+                    .expect("an event")
+                    .kind,
+                Kind::SessionStart,
+            );
+            assert!(
+                manifest
+                    .normalize_named(&payload, Some("SomethingElse"))
+                    .is_none(),
+                "{id} answered to an event it does not map",
+            );
+        }
+    }
+
+    #[test]
+    fn a_payload_that_names_its_own_event_is_believed_over_the_caller() {
+        let payload: Value =
+            serde_json::from_str(r#"{"hookEventName": "SessionStart", "sessionId": "s1"}"#)
+                .expect("a payload");
+
+        let event = compiled("grok")
+            .normalize_named(&payload, Some("Stop"))
+            .expect("an event");
+
+        assert_eq!(event.kind, Kind::SessionStart);
     }
 
     #[test]

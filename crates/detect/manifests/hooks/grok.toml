@@ -1,0 +1,29 @@
+id = "grok"
+version = "2026.08.21.1"
+min_engine_version = 1
+updated_at = "2026-08-21T00:00:00Z"
+aliases = ["grok-cli"]
+
+# The envelope this agent's hook reference gives for every one of its events,
+# spelled in lower camel case throughout. The second spelling of the session is
+# the one the agents that write in snake case use, accepted because this agent
+# documents itself as following their hook design and a payload that arrives in
+# their spelling is still a payload about a session.
+#
+# Every field below is taken from this agent's published hook reference rather
+# than from a payload captured off a running session, which is a weaker thing to
+# rest on: a field that turns out to be spelled differently reports nothing at
+# all rather than reporting wrongly, but it still reports nothing.
+[payload]
+event = "hookEventName"
+session = ["sessionId", "session_id"]
+cwd = ["cwd"]
+
+# The wrapper installed for this agent is registered for the one event that says
+# which session is running. The rest of its lifecycle arrives at nothing, which
+# is what an event no mapping describes gets everywhere; growing this file is
+# how they start being understood, and nothing about the installation has to
+# change for that.
+[[events]]
+name = "SessionStart"
+kind = "session_start"
