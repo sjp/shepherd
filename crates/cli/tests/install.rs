@@ -240,6 +240,16 @@ impl Machine {
         self.opencode_plugin_dir().join("agentbus.js")
     }
 
+    /// Where the plugin OpenCode's terminal interface loads by name is written.
+    fn opencode_tui_plugin(&self) -> PathBuf {
+        self.home.join(".config/opencode/agentbus-tui.js")
+    }
+
+    /// The file that terminal interface reads its own settings from.
+    fn opencode_tui_config(&self) -> PathBuf {
+        self.home.join(".config/opencode/tui.jsonc")
+    }
+
     /// What is in a JSON file on this machine now.
     fn document(&self, path: &Path) -> serde_json::Value {
         let text = fs::read_to_string(path)
@@ -1310,12 +1320,11 @@ fn parses(script: &Path) -> Option<bool> {
 }
 
 #[test]
-fn installing_for_opencode_drops_a_plugin_in_where_there_was_none() {
+fn installing_for_opencode_drops_both_plugins_in_where_there_were_none() {
     let machine = Machine::new().installed("opencode");
 
     let report = machine.report(&["install", "--agent", "opencode"]);
 
-    let path = machine.opencode_plugin();
     assert!(
         report.contains(&format!(
             "created {}",
@@ -1323,41 +1332,75 @@ fn installing_for_opencode_drops_a_plugin_in_where_there_was_none() {
         )),
         "{report}"
     );
-    assert!(
-        report.contains(&format!("created {}", path.display())),
-        "{report}"
-    );
-    let script = fs::read_to_string(&path).expect("no plugin was written");
-    // Marked, because that is the whole of how an upgrade and an uninstall later
-    // tell this program's own file from one that merely shares its name.
-    assert!(
-        agentbus_install::sentinel::is_generated(&script),
-        "the plugin was left unmarked: {script}"
-    );
-    let quoted = format!("\"{}\"", env!("CARGO_BIN_EXE_agentbus"));
-    assert!(
-        script.contains(&quoted),
-        "the plugin does not name the binary that wrote it: {script}"
-    );
-    assert!(
-        script.contains("emit --agent opencode"),
-        "the plugin does not emit: {script}"
-    );
-    assert!(!script.contains('@'), "a placeholder was left in: {script}");
+    for path in [machine.opencode_plugin(), machine.opencode_tui_plugin()] {
+        assert!(
+            report.contains(&format!("created {}", path.display())),
+            "{report}"
+        );
+        let script = fs::read_to_string(&path).expect("no plugin was written");
+        // Marked, because that is the whole of how an upgrade and an uninstall
+        // later tell this program's own file from one that merely shares its
+        // name.
+        assert!(
+            agentbus_install::sentinel::is_generated(&script),
+            "{} was left unmarked: {script}",
+            path.display()
+        );
+        let quoted = format!("\"{}\"", env!("CARGO_BIN_EXE_agentbus"));
+        assert!(
+            script.contains(&quoted),
+            "{} does not name the binary that wrote it: {script}",
+            path.display()
+        );
+        assert!(
+            script.contains(r#""emit", "--agent", "opencode""#),
+            "{} does not emit: {script}",
+            path.display()
+        );
+        assert!(
+            !script.contains('@'),
+            "a placeholder was left in {}: {script}",
+            path.display()
+        );
+    }
 }
 
 #[test]
-fn the_plugin_opencode_is_given_is_javascript_that_parses() {
+fn installing_for_opencode_tells_the_terminal_interface_to_load_the_second_one() {
+    let machine = Machine::new().installed("opencode");
+
+    let report = machine.report(&["install", "--agent", "opencode"]);
+
+    let config = machine.opencode_tui_config();
+    assert!(
+        report.contains(&format!("created {}", config.display())),
+        "{report}"
+    );
+    // The entry names the file as its own reader resolves it, which is from the
+    // directory the configuration file is in.
+    assert_eq!(
+        machine.document(&config)["plugin"],
+        serde_json::json!(["./agentbus-tui.js"])
+    );
+    assert!(
+        machine.opencode_tui_plugin().is_file(),
+        "the interface was told to load a file that is not there"
+    );
+}
+
+#[test]
+fn the_plugins_opencode_is_given_are_javascript_that_parses() {
     let machine = Machine::new().installed("opencode");
     machine.report(&["install", "--agent", "opencode"]);
 
-    let path = machine.opencode_plugin();
-
-    match parses(&path) {
-        Some(parsed) => assert!(parsed, "{} is not valid JavaScript", path.display()),
-        // Nothing to run it with here. The assertions above already pin that the
-        // substitution happened and that nothing of the template is left.
-        None => assert!(path.is_file()),
+    for path in [machine.opencode_plugin(), machine.opencode_tui_plugin()] {
+        match parses(&path) {
+            Some(parsed) => assert!(parsed, "{} is not valid JavaScript", path.display()),
+            // Nothing to run it with here. The assertions above already pin that
+            // the substitution happened and that nothing of the template is
+            // left.
+            None => assert!(path.is_file()),
+        }
     }
 }
 
@@ -1379,24 +1422,50 @@ fn a_path_that_needs_escaping_still_gives_opencode_javascript_that_parses() {
 }
 
 #[test]
+fn a_dry_run_for_opencode_says_what_the_real_run_does_and_writes_none_of_it() {
+    let machine = Machine::new().installed("opencode");
+
+    let planned = machine.report(&["install", "--dry-run", "--agent", "opencode"]);
+
+    assert!(!machine.opencode_plugin().exists());
+    assert!(!machine.opencode_tui_plugin().exists());
+    assert!(!machine.opencode_tui_config().exists());
+    assert!(is_untouched(&machine.state));
+
+    let done = machine.report(&["install", "--agent", "opencode"]);
+
+    assert_eq!(planned.replace("would create", "created"), done);
+}
+
+#[test]
 fn installing_for_opencode_twice_changes_nothing_the_second_time() {
     let machine = Machine::new().installed("opencode");
     machine.report(&["install", "--agent", "opencode"]);
-    let path = machine.opencode_plugin();
-    let after_one = fs::read_to_string(&path).unwrap();
+    let paths = [
+        machine.opencode_plugin(),
+        machine.opencode_tui_plugin(),
+        machine.opencode_tui_config(),
+    ];
+    let after_one: Vec<String> = paths
+        .iter()
+        .map(|path| fs::read_to_string(path).unwrap())
+        .collect();
 
     let report = machine.report(&["install", "--agent", "opencode"]);
 
     assert!(report.contains("  already installed\n"), "{report}");
-    assert!(
-        report.contains(&format!("unchanged {}", path.display())),
-        "{report}"
-    );
-    assert_eq!(fs::read_to_string(&path).unwrap(), after_one);
-    assert!(
-        machine.backups_of(&path).is_empty(),
-        "a run that changed nothing still copied the file"
-    );
+    for (path, before) in paths.iter().zip(after_one) {
+        assert!(
+            report.contains(&format!("unchanged {}", path.display())),
+            "{report}"
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), before);
+        assert!(
+            machine.backups_of(path).is_empty(),
+            "a run that changed nothing still copied {}",
+            path.display()
+        );
+    }
 }
 
 #[test]
@@ -1445,28 +1514,76 @@ fn a_plugin_of_the_users_own_with_the_same_name_is_left_exactly_as_it_was() {
 }
 
 #[test]
-fn uninstalling_for_opencode_takes_away_the_plugin_and_the_directory_it_made() {
+fn uninstalling_for_opencode_takes_away_both_plugins_and_the_directories_it_made() {
     let machine = Machine::new().installed("opencode");
     machine.report(&["install", "--agent", "opencode"]);
-    let path = machine.opencode_plugin();
 
     let report = machine.report(&["uninstall", "--agent", "opencode"]);
 
-    assert!(
-        report.contains(&format!("removed {}", path.display())),
-        "{report}"
-    );
-    assert!(!path.exists(), "{} was left behind", path.display());
-    // Nothing of this program's is left, down to the directory it made — which
-    // is also why there is nowhere for a copy of the file to have survived.
+    for path in [machine.opencode_plugin(), machine.opencode_tui_plugin()] {
+        assert!(
+            report.contains(&format!("removed {}", path.display())),
+            "{report}"
+        );
+        assert!(!path.exists(), "{} was left behind", path.display());
+    }
+    // Nothing of this program's is left, down to the directories it made —
+    // which is also why there is nowhere for a copy of a file to have survived.
+    // Both go: this machine had no configuration for the agent at all before
+    // the install, so the directory holding it is one this program made.
     assert!(
         !machine.opencode_plugin_dir().exists(),
         "the directory this program made was left behind"
     );
     assert!(
-        machine.home.join(".config/opencode").is_dir(),
-        "the agent's own configuration directory was removed"
+        !machine.home.join(".config/opencode").exists(),
+        "a configuration directory this program made was left behind"
     );
+}
+
+#[test]
+fn uninstalling_for_opencode_puts_a_configuration_of_the_users_own_back_as_it_was() {
+    let machine = Machine::new().configured("opencode");
+    let config = machine.opencode_tui_config();
+    let theirs = "{\n  // the ones I chose myself\n  \"plugin\": [\"./mine.js\"],\n}\n";
+    fs::write(&config, theirs).unwrap();
+    machine.report(&["install", "--agent", "opencode"]);
+    let installed = fs::read_to_string(&config).unwrap();
+    assert!(installed.contains("./agentbus-tui.js"), "{installed}");
+    assert!(
+        installed.contains("// the ones I chose myself"),
+        "{installed}"
+    );
+
+    machine.report(&["uninstall", "--agent", "opencode"]);
+
+    assert_eq!(
+        fs::read_to_string(&config).unwrap(),
+        theirs,
+        "the file was not put back exactly as it was"
+    );
+}
+
+#[test]
+fn a_terminal_configuration_that_cannot_take_the_entry_stops_the_install() {
+    let machine = Machine::new().configured("opencode");
+    let config = machine.opencode_tui_config();
+    let theirs = "{\n  \"plugin\": \"./mine.js\"\n}\n";
+    fs::write(&config, theirs).unwrap();
+
+    let output = machine.run(&["install", "--agent", "opencode"]);
+
+    assert!(!output.status.success(), "{output:?}");
+    let complaint = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        complaint.contains(&config.display().to_string()),
+        "{complaint}"
+    );
+    // Refused while the whole change was still only a plan, so not one file of
+    // the agent's was written.
+    assert_eq!(fs::read_to_string(&config).unwrap(), theirs);
+    assert!(!machine.opencode_plugin().exists());
+    assert!(!machine.opencode_tui_plugin().exists());
 }
 
 #[test]

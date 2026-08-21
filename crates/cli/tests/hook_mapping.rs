@@ -229,6 +229,15 @@ const EXPECTED: &[Expected] = &[
         kind: Some(Kind::SessionStart),
         detail: None,
     },
+    // Not one of the agent's own events: the plugin its terminal interface
+    // loads writes this when the user opens a session, which is the only thing
+    // that interface knows and the events do not.
+    Expected {
+        agent: "opencode",
+        stem: "tui.session.selected",
+        kind: Some(Kind::SessionStart),
+        detail: None,
+    },
     Expected {
         agent: "opencode",
         stem: "session.deleted",

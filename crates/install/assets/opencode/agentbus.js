@@ -3,20 +3,38 @@
 // without it is somebody's own and is never touched, so a copy you want to keep
 // is a copy you rename.
 //
-// The plugin carries no logic. Everything that decides what an event means lives
-// in the binary named below, which means this file never has to be upgraded in
-// step with anything: it hands the event over verbatim and forgets about it.
+// AGENTBUS_HOOK_VERSION=1
 //
-// Three rules govern what happens here, and all three come from where it runs —
+// One of two files installed here. The agent loads this one out of its plugin
+// directory and calls the handler below with every event its plugin interface
+// produces. The other is loaded by the terminal interface instead, and says
+// which session that interface has open — between them the session being worked
+// in is known from the moment it is chosen rather than from the first event
+// that happens to name it.
+//
+// Neither file carries any logic. Everything that decides what an event means
+// lives in the binary named below, which means neither has to be upgraded in
+// step with anything: they hand over what they were given and forget about it.
+//
+// The plugin interface hands a handler an event object and no standard input,
+// so there is nothing to pass through as it arrived. What goes to the command
+// instead is a small object of this file's own — the event's `type`, the
+// `directory` the plugin was loaded for, and the event's own properties spread
+// out beside them — and the mapping for this agent is written against that
+// shape.
+//
+// Three rules govern what happens here, and all three come from where it runs:
 // inside somebody's coding session, on every event their agent produces.
 //
 //   * It never throws. An exception raised inside somebody's editor is a fault
 //     they did not ask for and cannot act on.
 //   * It never waits. The command is started and then let go of, so nothing the
 //     user is waiting for is ever waiting for this.
-//   * It never speaks. The command is run quietly and its failure is ignored,
-//     because losing one event is an acceptable outcome and interrupting a
-//     session is not.
+//   * It never speaks. The command's output goes nowhere and its failure is
+//     ignored, because losing one event is an acceptable outcome and
+//     interrupting a session is not.
+
+import { spawn } from "node:child_process";
 
 // Where this machine keeps the binary the events are handed to. An absolute
 // path, written in when the file was generated: the directory it lives in is
@@ -24,27 +42,39 @@
 // command that cannot be found fails where nobody is looking.
 const BINARY = "@BINARY@";
 
-export const AgentBus = async ({ $, directory }) => ({
+// Hands one payload over and stops caring what becomes of it.
+//
+// The command and its arguments are passed separately rather than as a line for
+// something else to split, so a path with a space or a quote in it reaches the
+// binary as written. The child is released from the parent's accounting at
+// once, which is what lets a session end without waiting for it, and both of
+// the ways a spawn reports trouble asynchronously — a binary that is not there,
+// a pipe closed before the payload was written — are listened for, because an
+// unheard one of those is thrown at the session.
+//
+// Not exported. Everything this file exports is offered to the agent as a
+// plugin to call, and a helper offered as a plugin would be called with the
+// agent's own arguments the moment the file is loaded.
+function handOver(payload) {
+  try {
+    const child = spawn(BINARY, ["emit", "--agent", "opencode"], {
+      stdio: ["pipe", "ignore", "ignore"],
+      windowsHide: true,
+    });
+    child.on("error", () => {});
+    child.stdin.on("error", () => {});
+    child.unref();
+    child.stdin.end(JSON.stringify(payload));
+  } catch {
+    // Deliberately nothing. There is no failure here worth a user's attention.
+  }
+}
+
+export const AgentBus = async ({ directory }) => ({
   event: async ({ event }) => {
-    try {
-      // The whole event, flattened: what kind it is, where the session is
-      // working, and whatever else the event carried. Nothing is selected or
-      // renamed here, because the far end is where that decision belongs.
-      const payload = JSON.stringify({
-        type: event?.type,
-        directory,
-        ...event?.properties,
-      });
-      // The shell does not run a command until somebody looks at its promise.
-      // This looks, and then stops caring: the work is under way, and waiting
-      // for it to finish is the one thing an event handler must not do.
-      const started = $`${BINARY} emit --agent opencode`
-        .stdin(payload)
-        .quiet()
-        .nothrow();
-      Promise.resolve(started).catch(() => {});
-    } catch {
-      // Deliberately nothing. There is no failure here worth a user's attention.
-    }
+    // Nothing is selected or renamed on the way past. The far end is where the
+    // decision about what an event means belongs, and a field dropped here is
+    // one it can never get back.
+    handOver({ type: event?.type, directory, ...event?.properties });
   },
 });

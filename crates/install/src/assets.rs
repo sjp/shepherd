@@ -109,9 +109,14 @@ pub const CODEX_WRAPPER: Asset = Asset::pair(
     include_str!("../assets/codex/agentbus.ps1"),
 );
 
-/// The plugin OpenCode is given, as a single file dropped into its plugin
-/// directory.
-pub const OPENCODE_PLUGIN: &str = include_str!("../assets/opencode/agentbus.js");
+/// The plugin OpenCode loads out of its plugin directory, which is handed every
+/// event its plugin interface produces.
+pub const OPENCODE_PLUGIN: Asset = Asset::portable(include_str!("../assets/opencode/agentbus.js"));
+
+/// The plugin OpenCode's terminal interface loads, which reports which session
+/// that interface has open.
+pub const OPENCODE_TUI_PLUGIN: Asset =
+    Asset::portable(include_str!("../assets/opencode/agentbus-tui.js"));
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -140,9 +145,9 @@ pub(crate) mod tests {
         if !sentinel::is_generated(text) {
             faults.push("does not say on its first line who wrote it".to_owned());
         }
-        let handover = handover(agent);
-        if !text.contains(&handover) {
-            faults.push(format!("never runs `{handover}`"));
+        let handovers = handovers(agent);
+        if !handovers.iter().any(|handover| text.contains(handover)) {
+            faults.push(format!("never runs `{}`", handovers[0]));
         }
         faults
     }
@@ -160,9 +165,18 @@ pub(crate) mod tests {
     }
 
     /// What the far end of every wrapper is: this program, told which agent is
-    /// speaking.
-    fn handover(agent: Agent) -> String {
-        format!("emit --agent {agent}")
+    /// speaking, in each of the ways a file may spell it.
+    ///
+    /// Two spellings, because a file hands the arguments over in whichever form
+    /// the thing that runs it takes them — a command line for a shell to split,
+    /// or a list that nothing splits at all. What is being checked is that the
+    /// far end is this program and that it is told which agent is speaking, and
+    /// both spellings say exactly that.
+    fn handovers(agent: Agent) -> [String; 2] {
+        [
+            format!("emit --agent {agent}"),
+            format!("\"emit\", \"--agent\", \"{agent}\""),
+        ]
     }
 
     /// A wrapper that obeys every rule, as a starting point for text that does
@@ -175,7 +189,7 @@ pub(crate) mod tests {
              exec agentbus {} </dev/null\n",
             sentinel::KEY,
             version::expected_version(agent),
-            handover(agent),
+            handovers(agent)[0],
         )
     }
 
@@ -208,9 +222,22 @@ pub(crate) mod tests {
     #[test]
     fn a_wrapper_that_hands_the_event_to_something_else_is_caught() {
         let agent = Agent::Codex;
-        let astray = well_formed(agent).replace(&handover(agent), "emit --agent somebody-else");
+        let astray = well_formed(agent).replace(&handovers(agent)[0], "emit --agent somebody-else");
 
         assert_eq!(faults(agent, &astray).len(), 1, "{astray}");
+    }
+
+    #[test]
+    fn a_wrapper_that_hands_the_arguments_over_one_at_a_time_says_the_same_thing() {
+        let agent = Agent::OpenCode;
+        let spelled = well_formed(agent).replace(&handovers(agent)[0], &handovers(agent)[1]);
+
+        assert!(faults(agent, &spelled).is_empty(), "{spelled}");
+        assert_eq!(
+            faults(agent, &spelled.replace(agent.name(), "somebody-else")).len(),
+            1,
+            "an agent named in that spelling is still checked"
+        );
     }
 
     #[test]

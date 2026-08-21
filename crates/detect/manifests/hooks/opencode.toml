@@ -1,10 +1,10 @@
 id = "opencode"
-version = "2026.08.20.1"
+version = "2026.08.21.1"
 min_engine_version = 1
-updated_at = "2026-08-20T00:00:00Z"
+updated_at = "2026-08-21T00:00:00Z"
 
 # This agent has no hook commands: it loads plugins and hands each one an event
-# object, so the payload described here is the one the installed plugin writes —
+# object, so the payload described here is the one the installed plugins write —
 # the event's own `type`, the directory the plugin was loaded for, and the
 # event's properties spread out beside them. Two spellings of the session are
 # accepted because those properties are the agent's own and this file does not
@@ -17,6 +17,16 @@ cwd = ["directory"]
 
 [[events]]
 name = "session.created"
+kind = "session_start"
+
+# Not an event of the agent's. The other plugin installed for it is loaded by
+# the terminal interface, which produces no events at all — what it has instead
+# is the session the user has open, and it says which one that is under the name
+# below. It is reported as a session beginning because from the bus's side that
+# is what it is: the first this program hears of a session somebody has opened
+# and may not yet have typed anything into.
+[[events]]
+name = "tui.session.selected"
 kind = "session_start"
 
 [[events]]
