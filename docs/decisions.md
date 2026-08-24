@@ -1859,3 +1859,116 @@ that could be verified without such a machine is verified by describing one —
 every rule above is exercised from a test machine of that family, described from
 this one — and what is left over is a spot check on real hardware, which is the
 one thing a description cannot stand in for.
+
+## 2026-08-24 — the toolkit, and what it needs from the machine
+
+### The window and its widgets
+
+**`gpui` for the window, the renderer and the element tree, and `gpui-component`
+for the widgets built on top of it.** This was chosen directly rather than won in
+a comparison, so what follows is not an argument that it beat anything; it is the
+record of what was checked before the choice became load-bearing. A retained
+element tree that redraws on notification rather than on a clock is the right
+shape for a program whose screen is mostly still and then changes all at once,
+and the widget layer means the parts of a terminal multiplexer that are not the
+terminal — the panes, the lists, the chrome — are not written from rectangles.
+
+The spike that settled it is not kept. It opened a window, painted one frame and
+left; everything it proved is written down here, and a program whose whole
+purpose was to be run once is worth less in the tree than the paragraph it
+produced.
+
+### Both crates come from crates.io, and nothing is patched
+
+**`gpui = "0.2"` and `gpui-component = "0.5"` resolve and build with no git
+dependency and no `[patch.crates-io]` section.** Two lines in a manifest lock 757
+packages, every one of them from the registry. This was worth checking rather
+than assuming, because the widget layer's own repository does not build that way:
+its workspace takes `gpui` and its neighbours straight from the editor project's
+git tree and patches the registry underneath itself. That is what developing
+against an unreleased dependency looks like, and it is not inherited by anybody
+who depends on the published crate.
+
+The reason it is not inherited is that the upstream forks are themselves
+published under their own names — a renamed HTTP client, a stack-growth crate
+wrapping the assembly one — so what a patch supplies in that workspace an
+ordinary version requirement supplies here. The published widget crate asks for
+`gpui` by version and gets it.
+
+So the dependency graph stays the shape the rest of this repository already has:
+registry sources, a committed lock file, and no revision anywhere that has to be
+chased when a branch moves. Had it gone the other way the fallback was pinned
+revisions rather than branches, but it did not, and the fallback is recorded here
+only so that a later reader knows it was considered and did not happen.
+
+### What the container is actually missing, which is less than expected
+
+**Six packages: `libxcb1-dev`, `libxkbcommon-dev`, `libxkbcommon-x11-dev`,
+`libvulkan1`, `mesa-vulkan-drivers`, `xvfb`.** Each one was arrived at by
+building or running without it and reading the failure, which is why the list is
+shorter than the one a person would write from memory.
+
+The first three are the whole of what the final link asks for, as `-lxcb`,
+`-lxkbcommon` and `-lxkbcommon-x11`. There is no `-lX11`, because the toolkit
+speaks xcb and never touches the X11 client library proper. There is no
+`cmake` and no `clang`: every native build script in the tree, freetype and
+fontconfig and the parser generators among them, compiles from vendored source
+with the C compiler already here. And there is no development package for
+fontconfig, freetype or Wayland, because those libraries are opened by name at
+run time rather than linked — which also settles, without a decision having to be
+made about it, that pursuing the X11 backend costs nothing in Wayland packages.
+
+The last three are what it takes to run rather than to build. Drawing goes
+through Vulkan, so a loader and at least one driver have to be present; with no
+`/dev/dri` in this container the driver must be the software rasteriser that
+`mesa-vulkan-drivers` carries. This is not a soft dependency that degrades — with
+the loader unable to find a usable driver the process does not fall back to
+anything, it fails on startup with no supported device found, which is how the
+requirement was confirmed. `xvfb` supplies the display, and building needs none
+of it: a compile with neither `DISPLAY` nor `WAYLAND_DISPLAY` set succeeds.
+
+### What a virtual display here can and cannot show
+
+**A window opens and a frame is drawn without panicking or hanging, but the
+pixels cannot be read back off this display, so anything about how the program
+*looks* has to be judged on real hardware.** Under Xvfb the window is created at
+the size asked for and reports itself viewable, the renderer initialises against
+the software rasteriser, the frame is drawn and the process exits zero. What
+cannot be had is the frame itself: reading the window back gives uniform black.
+
+It is worth saying why, so that nobody spends the afternoon again. The toolkit
+takes a 32-bit visual whenever the server offers one, and offering one is
+something Xvfb does at every screen depth it will start at. A plain Vulkan
+program on the same display, on a 24-bit visual, reads back its own picture
+correctly, so neither the rasteriser nor the presentation path is at fault — it
+is the combination of a translucent-capable window and a display with nothing
+composing it. Running a compositor changes what is underneath the window without
+putting the window's own contents there.
+
+The consequence is a boundary on what this container is for. It builds, it links,
+it proves a change has not broken startup, and it can be trusted when it says a
+program crashed. It cannot be asked whether something is drawn correctly, and a
+screenshot taken here is not evidence.
+
+### The licences of the two toolkit crates
+
+**Both are Apache-2.0, neither ships a `NOTICE`, and nothing needs adding to this
+repository for depending on them.** The published metadata says `Apache-2.0` for
+each, and the licence file inside each published crate was read rather than
+trusted from an API summary — which matters, because a catalog reports the widget
+crate's terms as undetermined. The reason it does is benign: both files carry a
+copyright line above the licence text, which stops a classifier matching them,
+and beneath that line the terms are the standard ones. Compared against the copy
+of Apache-2.0 already in this tree the two are identical to each other and differ
+from it only by omitting the appendix, which is the instructional template rather
+than a term.
+
+Attribution obligations under that licence attach to redistributing the work, and
+this repository redistributes neither: both are ordinary registry dependencies
+that a build fetches on the machine doing the building, and no source from either
+is vendored here. That is the distinction from the manifest data elsewhere in
+this tree, which is copied in and therefore carries a `NOTICE` of its own. Should
+this ever ship a compiled binary to somebody, that artifact would be the thing
+being redistributed and would need to carry both licences and their copyright
+lines — the widget crate's to Longbridge, the toolkit's to Zed Industries — and
+that belongs to whatever comes to do the packaging.
