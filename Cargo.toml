@@ -6,6 +6,8 @@ members = [
     "crates/daemon",
     "crates/install",
     "crates/cli",
+    "crates/shepherd-core",
+    "crates/shepherd",
 ]
 
 [workspace.package]
@@ -18,9 +20,13 @@ agentbus-protocol = { path = "crates/protocol" }
 agentbus-detect = { path = "crates/detect" }
 agentbus-daemon = { path = "crates/daemon" }
 agentbus-install = { path = "crates/install" }
+shepherd-core = { path = "crates/shepherd-core" }
 
+alacritty_terminal = "0.26"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
+gpui = "0.2"
+gpui-component = "0.5"
 # Pinned exactly: its concrete-syntax-tree API is what lets a file somebody
 # maintains by hand be edited without reformatting the rest of it, and a
 # change in how that tree renders would change files on users' machines.

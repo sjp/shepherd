@@ -1,0 +1,14 @@
+[package]
+name = "shepherd-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+agentbus-detect = { workspace = true }
+agentbus-protocol = { workspace = true }
+alacritty_terminal = { workspace = true }
+
+[lints]
+workspace = true

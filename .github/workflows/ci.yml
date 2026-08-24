@@ -17,6 +17,11 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install Shepherd's link libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
       - name: cargo fmt --check
         run: cargo fmt --check
       - name: cargo clippy
@@ -33,6 +38,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v7
       - uses: actions/setup-python@v7
+      - name: Install Shepherd's link libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
       - name: cargo test
         run: cargo test --workspace
       - name: Asset tests
@@ -57,8 +67,11 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
+      # Only the crates that actually ship as static Linux binaries: Shepherd
+      # is never provisioned that way, and its GUI dependencies are not
+      # expected to build against musl at all.
       - name: cargo check
-        run: cargo check --workspace --target x86_64-unknown-linux-musl
+        run: cargo check --workspace --exclude shepherd --exclude shepherd-core --target x86_64-unknown-linux-musl
 
   check-windows:
     name: Check (x86_64-pc-windows-msvc)

@@ -1972,3 +1972,65 @@ this ever ship a compiled binary to somebody, that artifact would be the thing
 being redistributed and would need to carry both licences and their copyright
 lines — the widget crate's to Longbridge, the toolkit's to Zed Industries — and
 that belongs to whatever comes to do the packaging.
+
+## 2026-08-24 — the two new crates
+
+### The GUI has a library crate of its own, and the split is not optional
+
+**`shepherd-core` holds the model, the rollup, the bus subscriber, config, and
+the terminal core; `shepherd` holds the window, the renderer and input, and
+nothing else.** This is the same reasoning that put the toolkit behind a crate
+of its own rather than pulling it straight into a single binary: this
+container has no GPU and cannot open a window, and every crate under
+`crates/` still has to build and test here on every change. Splitting the
+half of Shepherd that has no business touching a display into a library
+means that half stays exercised by an ordinary test binary, and only the
+crate that actually links `gpui` is out of reach of `cargo test` on a machine
+without one.
+
+`shepherd-core` is not a bus crate, and lacking a GUI dependency does not make
+it one. It is held to the same rule the GUI binary is: neither may depend on
+anything under `crates/daemon`, `crates/install` or `crates/cli`, and no bus
+crate may depend on either of them or even name them. `scripts/check-boundary.sh`
+now excludes both directories from its "no crate may mention shepherd" and
+"no path dependency on shepherd" checks, by an exact two-way match rather than
+a prefix — precise enough that a later crate merely starting with the same five
+letters is not accidentally swept in.
+
+### The terminal core lives in the library, unused until there is a shell to run
+
+**`alacritty_terminal` is a dependency of `shepherd-core`, declared at the
+workspace level like every other shared dependency and resolved into the
+committed lock file, though nothing calls into it yet.** Embedding it rather
+than writing a terminal emulator gets pty handling, escape-sequence parsing,
+grid and scrollback for free, leaving rendering and input as the only things
+Shepherd has to write itself. Putting it in the library crate rather than the
+GUI binary is what will let a shell's live grid be asserted against in a test
+that opens no window, once there is code that does so.
+
+Declaring it now, before anything uses it, is what turns "this will build"
+into something checked rather than assumed — the same standard the toolkit
+crates were held to when the crates.io-versus-git question was settled: a
+dependency that only exists in a manifest and never resolves proves nothing
+about whether it actually compiles against everything else here.
+
+### The Linux and musl check jobs, now that a GUI crate is in the workspace
+
+**The `lint` and `test` jobs install the same three link libraries the
+devcontainer does before running cargo, and the musl check no longer covers
+either new crate.** `-lxcb`, `-lxkbcommon` and `-lxkbcommon-x11` are what the
+final link asks for once `gpui` is in the dependency graph, and a bare
+`ubuntu-latest` runner starts without them — exactly the packages
+`.devcontainer/post-create.sh` installs and for the same reason, minus the
+three that are only needed to open a window rather than to build and test.
+
+The musl target exists to produce the static `agentbus` binaries this
+repository ships onto machines with no matching libc; Shepherd is never
+provisioned that way; and a GUI toolkit whose rendering path goes through
+Vulkan and platform windowing libraries is not expected to check against musl
+at all. `check-musl` now runs `cargo check --workspace --exclude shepherd
+--exclude shepherd-core --target x86_64-unknown-linux-musl`, which keeps the
+job checking exactly the crates it was written to guard. `check-macos`, in
+contrast, still checks the whole workspace: macOS is a hard platform
+requirement Shepherd is built for, so that job is left able to fail loudly if
+it ever stops working there.

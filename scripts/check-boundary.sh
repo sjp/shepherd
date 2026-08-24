@@ -7,17 +7,20 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 
-# Every crate in the workspace except crates/shepherd, derived at runtime so that a
-# crate added later is scanned without anyone remembering to update this list.
+# Every crate in the workspace except crates/shepherd and crates/shepherd-core,
+# derived at runtime so that a crate added later is scanned without anyone
+# remembering to update this list.
 CRATES=
 for dir in crates/*/; do
 	crate=${dir%/}
 	if [ ! -d "$crate" ]; then
 		continue
 	fi
-	if [ "$crate" = "crates/shepherd" ]; then
+	case "$crate" in
+	crates/shepherd | crates/shepherd-core)
 		continue
-	fi
+		;;
+	esac
 	CRATES="${CRATES:+$CRATES }$crate"
 done
 
