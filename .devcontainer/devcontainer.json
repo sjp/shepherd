@@ -19,9 +19,7 @@
 		}
 	},
 	"mounts": [
-		"source=claude-code-config,target=/home/vscode/.claude,type=volume",
-		"source=codex-config,target=/home/vscode/.codex,type=volume",
-		"source=opencode-config,target=/home/vscode/.config/opencode,type=volume"
+		"source=claude-code-config,target=/home/vscode/.claude,type=volume"
 	],
 	"remoteUser": "vscode",
 	"postCreateCommand": "${containerWorkspaceFolder}/.devcontainer/post-create.sh"
