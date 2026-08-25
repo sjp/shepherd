@@ -88,7 +88,8 @@ impl BusState {
             }
             Update::Foreground(change) => self.observe(change),
             Update::Assertion(assertion) => {
-                self.sessions.apply_assertion(&claim(assertion), &assertion.ts);
+                self.sessions
+                    .apply_assertion(&claim(assertion), &assertion.ts);
             }
             // A heartbeat says the stream is alive, which is the reader's
             // business rather than this one's, and a disconnection changes what

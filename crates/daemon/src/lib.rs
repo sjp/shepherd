@@ -94,9 +94,9 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::broadcast::error::TryRecvError;
 use tracing::{debug, error, info};
 
+pub use agentbus_paths::SocketPaths;
 pub use bus::Bus;
 pub use emit::EmitListener;
-pub use agentbus_paths::SocketPaths;
 pub use lock::InstanceLock;
 pub use subscribe::SubscribeListener;
 

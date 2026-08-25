@@ -26,8 +26,9 @@ const AGENT: &str = "claude";
 const PANE: &str = "w1:p1";
 
 /// The crates the binary is allowed to be built from.
-const BUS_CRATES: [&str; 5] = [
+const BUS_CRATES: [&str; 6] = [
     "agentbus-protocol",
+    "agentbus-paths",
     "agentbus-detect",
     "agentbus-daemon",
     "agentbus-install",

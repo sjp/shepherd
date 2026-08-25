@@ -49,8 +49,8 @@ use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
 
 use crate::bus::{Bus, Published};
-use agentbus_paths::SOCKET_MODE;
 use crate::{ACCEPT_RETRY_DELAY, clock};
+use agentbus_paths::SOCKET_MODE;
 
 /// How many lines may be waiting to be written to one subscriber.
 ///

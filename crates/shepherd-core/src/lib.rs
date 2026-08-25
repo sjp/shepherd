@@ -38,11 +38,17 @@
 //! published stream on a thread of its own and hands over [`Update`]s;
 //! [`BusState`] folds them into what is currently true of every agent session,
 //! which is the other half of what a sidebar needs in order to draw a badge.
-//! Neither of them knows anything about this model — attributing a session to a
-//! shell is a separate step, and the bus itself knows nothing about either.
+//! Neither of them knows anything about this model — the bus is not allowed to,
+//! and the half that reads it has no reason to.
+//!
+//! [`Attribution`] is where the two meet, and it is the only place they do: it
+//! takes the workspaces as they are and the sessions as the bus reports them and
+//! says which shell each is running in. What it cannot place it says so about,
+//! rather than guessing.
 
 #![warn(missing_docs)]
 
+pub mod attribution;
 pub mod bus;
 pub mod correlation;
 pub mod ids;
@@ -50,9 +56,10 @@ pub mod rollup;
 pub mod split;
 pub mod workspace;
 
+pub use attribution::{Attribution, ShellStatus, status_source};
 pub use bus::{BusState, Subscriber, SubscriberHandle, Update};
 pub use correlation::{CorrelationError, correlation_for, parse_correlation};
-pub use ids::{ShellId, ShellIds, TabId, TabIds, WorkspaceId, WorkspaceIds};
+pub use ids::{ShellAddress, ShellId, ShellIds, TabId, TabIds, WorkspaceId, WorkspaceIds};
 pub use rollup::{RollupStatus, rollup, shell_status};
 pub use split::{Axis, Branch, Closed, Direction, PlacedShell, Rect, Split, SplitTree};
 pub use workspace::{Tab, Workspace, WorkspaceSettings};

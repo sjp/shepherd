@@ -2034,3 +2034,110 @@ job checking exactly the crates it was written to guard. `check-macos`, in
 contrast, still checks the whole workspace: macOS is a hard platform
 requirement Shepherd is built for, so that job is left able to fail loudly if
 it ever stops working there.
+
+## 2026-08-25 — reading the bus from something that is not the bus
+
+### Finding the socket is a crate, not a copy and not the daemon
+
+**The socket directory rules move out of `crates/daemon` into `crates/paths`
+(`agentbus-paths`), which depends on the standard library and `libc` and
+nothing else.** `SocketPaths` was already the one place the `AGENTBUS_DIR` /
+`XDG_RUNTIME_DIR` / `/tmp/agentbus-$UID` precedence was written, which was
+right; what was wrong is that it was written inside the daemon, so the only
+ways for a subscriber to find `sub.sock` were to link a daemon's worth of
+runtime, sockets, TLS and state, or to copy three rules that decide where two
+programs meet. Copies of a rule like that do not fail loudly when they drift.
+They fail as silence on a socket nobody is listening to.
+
+That gap belongs to the bus's own public surface rather than to whoever hit it
+first: anybody writing a second subscriber in Rust would find exactly the same
+thing. So it is fixed where it is, generically, and the crate graph the design
+draws is left intact — the GUI's library crate depends on `protocol`, `detect`
+and now `paths`, and on nothing else of the bus's. `agentbus_daemon::paths` is
+gone rather than kept as a re-export, because two names for one module is how a
+crate ends up with two of them.
+
+The `agentbus` binary is still built from bus crates alone; the test that
+asserts it now names six of them rather than five.
+
+### The clock moves to the type that defines the format
+
+**`Timestamp::now()` and `Timestamp::from_unix_millis()` live in
+`crates/protocol`; the daemon's `clock` module keeps its name and delegates to
+them.** The protocol crate has no clock in the sense that matters — the fold
+still takes time as an input, which is what makes it exhaustively testable —
+and reading `SystemTime` adds no dependency and no I/O. What it removes is the
+prospect of the calendar arithmetic existing once per program that has to stamp
+something, drifting from the difference in `millis_since` that it has to agree
+with to the millisecond.
+
+`clock::scatter` stays in the daemon. Spreading retries so that two things
+recovering from one outage do not recover in step is the daemon's problem and
+nobody else's.
+
+### The subscriber blocks on a thread, and takes no runtime with it
+
+**`shepherd-core` reads the stream with blocking sockets on a thread of its
+own, and acquires no async runtime.** The daemon is asynchronous because it
+serves many connections at once and must never let a slow subscriber delay an
+emit; a subscriber reads exactly one connection, where a runtime would add
+start-up cost, a second scheduler inside a GUI process that already has one,
+and a harder shutdown. The command line reached the same conclusion for
+`agentbus subscribe`, and for the same reason. What comes back is an ordinary
+`std::sync::mpsc` receiver, which any event loop can drain.
+
+The socket's read timeout is the only timer: it is what lets a stream that has
+gone silent and a handle that has been dropped both be noticed by a thread that
+is otherwise blocked on a read. Dropping the handle lets go of the receiving
+end before it joins the thread, so a reader blocked on a full queue is woken by
+the far end going away rather than waited on forever.
+
+### A slow caller is dropped by the bus, not compensated for here
+
+**The queue between the reading thread and its caller is bounded, and a full
+one blocks the reader.** A caller that stops draining therefore stops the
+socket being read, the daemon disconnects a subscriber that is not keeping up,
+and the reconnection that follows brings a fresh snapshot. That is the
+protocol's own remedy, and letting it happen is better than either of the
+alternatives: an unbounded queue accumulates a backlog nobody will look at, and
+dropping updates locally would leave a view that is quietly wrong with no
+snapshot coming to correct it.
+
+### The local view is the bus's own table, fed the same lines
+
+**What the subscriber hands over is folded through `SessionTable` — the same
+type, with the same rules, that the daemon folds its own sessions with.** The
+alternative is every consumer working out for itself what a `session_end` does
+to a status, which of two views of one correlated slot to believe, and when a
+quiet session becomes stale. Those rules are subtle, they are the protocol's,
+and they are already written and exhaustively tested. Feeding the published
+lines back into them is what makes a subscriber's answer the same answer as
+`agentbus status`, which is what lets that command stay an independent oracle
+when something looks wrong.
+
+Time reaches it the same way it reaches the fold: through a `tick` a caller
+makes, never from a clock read inside it.
+
+### A fresh snapshot supersedes; it never merges
+
+**Every reconnection replaces the whole view rather than updating it.** The
+protocol's backpressure design assumes precisely this — a subscriber that was
+dropped has no way to know what it missed, and the snapshot it is sent on
+reconnecting is the bus's complete account as of that moment. Merging would
+keep exactly the rows the bus has stopped vouching for. A disconnection on its
+own changes nothing about what is held, because losing sight of a session is
+not evidence that it ended; it only records that what is on screen is now a
+recollection.
+
+### A gap is measured on numbered lines, and an unknown line still counts
+
+**Only lines that were allotted a sequence number take part in gap detection,
+and a line whose `kind` this build does not know still advances the count.** A
+heartbeat carries the counter *as of now* rather than a number of its own, so
+it can legitimately name a line that is still on its way; reconnecting on that
+would be reconnecting at random. An unknown line is the opposite case: it did
+take a number, and ignoring the number along with the line would make the next
+line look like a gap — which would put every older subscriber into a
+reconnection loop against a daemon that had merely learned to say something
+new. `seq` belongs to the envelope rather than to any one kind, so it is read
+from a line whose kind cannot be.

@@ -395,9 +395,7 @@ impl Reader {
                 self.send(Update::Heartbeat(heartbeat));
                 Verdict::Continue
             }
-            StreamLine::Event(event) => {
-                self.carry(event.seq, expected, || Update::Event(event))
-            }
+            StreamLine::Event(event) => self.carry(event.seq, expected, || Update::Event(event)),
             StreamLine::ForegroundChange(change) => {
                 self.carry(change.seq, expected, || Update::Foreground(change))
             }

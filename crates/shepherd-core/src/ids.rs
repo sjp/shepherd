@@ -10,6 +10,11 @@
 //! shell arrive from outside this process and can arrive after it has gone, and
 //! reusing its id would attribute what it did to whatever took its place.
 //!
+//! Tab and shell numbering restarts per workspace, so a shell id on its own
+//! names a shell only once it is known which workspace's it is.
+//! [`ShellAddress`] is the two of them together, which is what anything holding
+//! shells from more than one workspace at a time has to key them by.
+//!
 //! # Why a counter rather than a random identifier
 //!
 //! These ids are handed out and consumed inside one running process, so the
@@ -138,9 +143,53 @@ id_type! {
     ShellIds
 }
 
+/// Which shell, anywhere in the application: the workspace, and the shell's
+/// number within it.
+///
+/// Shell numbers restart per workspace, so `s3` names a shell only once the
+/// workspace is known. Anything holding shells from several workspaces at once
+/// — what is attributed to each of them, what is running in each of them —
+/// keys them by this rather than by a number that two workspaces both use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ShellAddress {
+    /// The workspace the shell is open in.
+    pub workspace: WorkspaceId,
+    /// Which of that workspace's shells.
+    pub shell: ShellId,
+}
+
+impl ShellAddress {
+    /// The address of `shell` in `workspace`.
+    pub const fn new(workspace: WorkspaceId, shell: ShellId) -> Self {
+        Self { workspace, shell }
+    }
+}
+
+impl From<(WorkspaceId, ShellId)> for ShellAddress {
+    fn from((workspace, shell): (WorkspaceId, ShellId)) -> Self {
+        Self::new(workspace, shell)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_address_is_the_workspace_and_the_shell_within_it() {
+        let address = ShellAddress::new(WorkspaceId::from_raw(9), ShellId::from_raw(3));
+        assert_eq!(
+            address,
+            (WorkspaceId::from_raw(9), ShellId::from_raw(3)).into()
+        );
+        assert_eq!(address.workspace, WorkspaceId::from_raw(9));
+        assert_eq!(address.shell, ShellId::from_raw(3));
+        // The same number in two workspaces is two shells.
+        assert_ne!(
+            address,
+            ShellAddress::new(WorkspaceId::FIRST, ShellId::from_raw(3))
+        );
+    }
 
     #[test]
     fn ids_are_handed_out_in_order_and_never_repeat() {
