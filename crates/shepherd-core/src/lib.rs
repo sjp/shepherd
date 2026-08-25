@@ -41,6 +41,13 @@
 //! Neither of them knows anything about this model — the bus is not allowed to,
 //! and the half that reads it has no reason to.
 //!
+//! [`Lifecycle`] is what makes sure there is a stream to read at all. The bus's
+//! daemon is an ordinary program somebody may already be running; where nobody
+//! is, this starts one, watches it, and — when there is none to start — says so
+//! in a form a window can put in front of a person. It starts a daemon and
+//! nothing else: what hooks a coding agent has is its user's decision, made with
+//! the bus's own command, and this application never edits their configuration.
+//!
 //! [`Attribution`] is where the two meet, and it is the only place they do: it
 //! takes the workspaces as they are and the sessions as the bus reports them and
 //! says which shell each is running in. What it cannot place it says so about,
@@ -80,8 +87,10 @@ pub mod attribution;
 pub mod bus;
 pub mod config;
 pub mod correlation;
+pub mod daemon;
 pub mod devcontainer;
 pub mod ids;
+mod lookup;
 pub mod naming;
 pub mod rollup;
 pub mod split;
@@ -92,6 +101,7 @@ pub use attribution::{Attribution, ShellStatus, status_source};
 pub use bus::{BusState, Subscriber, SubscriberHandle, Update};
 pub use config::{CONFIG_VAR, Config, ConfigError, TreeError};
 pub use correlation::{CorrelationError, correlation_for, parse_correlation};
+pub use daemon::{DaemonError, Daemons, Ended, Host, Lifecycle, Presence, Unavailable};
 pub use devcontainer::{
     ContainerError, Containers, Devcontainer, Machine, Outcome, Shells, StartError, described,
 };

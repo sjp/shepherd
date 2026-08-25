@@ -56,8 +56,6 @@
 //! [`WorkspaceSettings::devcontainer`]: crate::workspace::WorkspaceSettings::devcontainer
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
-use std::fs::Metadata;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -67,6 +65,7 @@ use tracing::debug;
 
 use crate::correlation::correlation_for;
 use crate::ids::ShellAddress;
+use crate::lookup::{PATH_VAR, look_up, search_path};
 use crate::terminal::{Program, Shell, ShellOptions, SpawnError};
 use crate::workspace::Workspace;
 
@@ -89,9 +88,6 @@ pub const CONFIG_FILE: &str = ".devcontainer.json";
 /// have it. This is the one shell a unix is required to have, which is the only
 /// thing that can be assumed about a container nobody has described further.
 pub const DEFAULT_PROGRAM: &str = "/bin/sh";
-
-/// The variable naming the directories a command is looked for in.
-const PATH_VAR: &str = "PATH";
 
 /// Bring the container up.
 const UP: &str = "up";
@@ -206,9 +202,7 @@ impl Machine {
 
     /// Where the command is, if it is anywhere this machine looks.
     fn look_up(&self) -> Option<PathBuf> {
-        self.path
-            .iter()
-            .find_map(|dir| candidates(dir).into_iter().find(|path| runnable(path)))
+        look_up(&self.path, COMMAND)
     }
 }
 
@@ -529,59 +523,4 @@ fn said(output: &process::Output) -> String {
         }
     }
     UNEXPLAINED.to_owned()
-}
-
-/// Splits a `PATH` into the directories it names.
-///
-/// An empty entry means the working directory by long convention, and is
-/// dropped rather than honoured: a command found beside whatever directory this
-/// application happened to be started from is not the machine's container tool.
-fn search_path(path: Option<OsString>) -> Vec<PathBuf> {
-    path.map(|path| {
-        std::env::split_paths(&path)
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .collect()
-    })
-    .unwrap_or_default()
-}
-
-/// Every file the command could be, in one directory.
-///
-/// A machine that decides what runs a file from its extension has several
-/// spellings of one command, depending on how it was installed, and all of them
-/// are tried. Everywhere else there is exactly one name.
-fn candidates(dir: &Path) -> Vec<PathBuf> {
-    /// The extensions such a machine runs a command installed as a script or a
-    /// program under.
-    const SHIMS: [&str; 3] = [".cmd", ".exe", ".ps1"];
-
-    let named = dir.join(COMMAND);
-    if !cfg!(windows) {
-        return vec![named];
-    }
-    std::iter::once(named)
-        .chain(SHIMS.map(|shim| dir.join(format!("{COMMAND}{shim}"))))
-        .collect()
-}
-
-/// Whether `path` is a file this machine would run.
-fn runnable(path: &Path) -> bool {
-    path.metadata()
-        .is_ok_and(|meta| meta.is_file() && executable(&meta))
-}
-
-/// Whether a file's permissions let anybody run it.
-#[cfg(unix)]
-fn executable(meta: &Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-
-    meta.permissions().mode() & 0o111 != 0
-}
-
-/// Whether a file's permissions let anybody run it, where the question has no
-/// such answer: the extension it was found under is the whole of what makes a
-/// file a command there.
-#[cfg(not(unix))]
-fn executable(_meta: &Metadata) -> bool {
-    true
 }

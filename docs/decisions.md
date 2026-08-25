@@ -2395,3 +2395,72 @@ describing their nine workspaces replaced the moment they open a tab. Holding it
 makes that impossible without a deliberate second act; the version is read before
 the shape for the same reason, so that a file a later build wrote is recognised
 as one rather than parsed into whatever this build can make of it.
+
+## 2026-08-25 — making sure there is a bus to read
+
+### The subscriber's stream is the only test of whether a daemon is there
+
+**Nothing in the GUI's lifecycle code connects to a socket, stats one, or looks
+for a process.** There is already a connection being made — the subscriber's —
+and what it reports is a better answer than any of those: a socket file outlives
+the daemon that bound it, and a process with the right name in it may be serving
+another directory entirely. So the lifecycle is fed the same `Update`s the
+sidebar is, and every decision it makes comes from those and from the clock.
+
+That is also why it is driven rather than driving. It holds no thread and no
+timer; a `tick` is where a daemon gets started and where one that never served is
+given up on, and the caller does that from the loop it already runs. The two
+inputs — what the bus said, and what time it is — are the whole of it, which is
+what lets every case worth asserting be arranged by arithmetic instead of by
+sleeping.
+
+### What is started is `agentbus daemon --dir <directory>`, and nothing else
+
+**No flag, no argument and no environment variable that somebody starting a
+daemon by hand would not also use, and a test asserts both halves of that** — the
+argument vector exactly, and that the daemon's environment gains nothing this
+process did not already have. A bus that behaved differently because the GUI
+started it would be a bus whose behaviour could not be reasoned about from its
+own documentation, and the same daemon has to serve the shell scripts and the
+command line reading it alongside the window.
+
+The one thing the daemon is told that a person would not type is its working
+directory, which is `/`: not visible to it, not something it can behave
+differently because of, and it keeps a directory somebody may want to unmount
+from being held open by a process nobody can see.
+
+A daemon that finds the directory's lock held exits with a status the bus keeps
+for exactly that, and this treats it as success — a daemon is running, this is
+simply not the process serving it. Reading that status is the GUI depending on
+the bus's published behaviour, which is the direction the dependency is allowed
+to point.
+
+### The daemon is an ordinary child, and it is left running
+
+**Started with `Command::spawn` and supervised with `try_wait`, rather than
+detached the way the bus detaches one for a subscriber arriving over ssh.** The
+two want opposite things: that one must survive the process that asked for it,
+because there is nobody on that machine to start another; this one must remain
+askable, because "the daemon we started has exited" is the state this exists to
+notice. A process put beyond this one's reach could not afterwards be asked
+whether it is still there.
+
+It is not stopped when the window closes. The bus is not this application's — a
+person's hooks go on emitting into it, and the next thing to read the stream
+finds the state that accumulated in the meantime rather than an empty daemon.
+
+### Giving up is a state with a reason in it
+
+**Three attempts, doubling the wait between them, and then
+`Presence::Unavailable` carrying why** — with a machine that has no `agentbus` on
+it at all skipping straight to it, because installing one is not going to happen
+because this asked again. The alternative is a loop that costs a process every
+few seconds and tells nobody anything. What the reason is structured for is the
+window: "not installed", "would not run", "stopped without serving" and "never
+served" are four different things for the person reading them, and only the first
+is answered by installing anything.
+
+Starting the bus is the whole of what this application does to it. Hooks are
+never installed, repaired or looked at: that edits files somebody owns, with
+their coding agent's behaviour on the other side of it, and it stays a decision
+they make with the bus's own command.
