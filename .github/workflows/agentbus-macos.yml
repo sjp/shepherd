@@ -1,0 +1,76 @@
+name: agentbus (macOS)
+
+# Asked for by hand, so that somebody whose Mac has no Rust toolchain on it can
+# still get a copy of the bus's command to run. The window next door is built
+# the same way and for the same reason; this is the half of the pair that the
+# window needs on the machine before it has a bus to read at all.
+#
+# It is not a release. Nothing here is signed or notarised, no manifest is
+# written, and the binary is meant to be put on a PATH by whoever asked for it.
+# The release workflow builds these same two targets from a tag, and is the one
+# that makes assets other people are given.
+on:
+  workflow_dispatch:
+    inputs:
+      triple:
+        description: Which Mac to build for
+        type: choice
+        default: aarch64-apple-darwin
+        options:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ inputs.triple }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ inputs.triple }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ inputs.triple }}
+
+      # The same script a release runs, rather than a cargo line of this
+      # workflow's own: the asset is then named, checked and hashed the way a
+      # published one is, and a copy taken from here is indistinguishable from a
+      # copy taken from a release of the same version.
+      - name: Build, verify and name the asset
+        run: scripts/build-release.sh "${{ inputs.triple }}"
+
+      - name: Say how to install it
+        run: |
+          . scripts/release-lib.sh
+          name=agentbus-$(workspace_version)-${{ inputs.triple }}
+          cat >>"$GITHUB_STEP_SUMMARY" <<SUMMARY
+          ## \`$name\`
+
+          Unsigned, and quarantined by the system because it arrived over the
+          network. Give it a name a PATH already holds:
+
+          \`\`\`sh
+          xattr -dr com.apple.quarantine ./$name
+          install -m 755 ./$name /usr/local/bin/agentbus
+          agentbus --version
+          agentbus hooks status      # what is on this machine and what is wired up
+          agentbus install           # wire up whatever was detected
+          \`\`\`
+
+          Anything reading the bus looks the command up on its own \`PATH\`, so a
+          program started before the install finds nothing and has to be started
+          again.
+          SUMMARY
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.triple }}
+          path: dist/*
+          if-no-files-found: error
