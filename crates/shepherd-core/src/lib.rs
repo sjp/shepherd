@@ -60,6 +60,13 @@
 //! is currently running and renames itself when that changes — unless somebody
 //! has named it themselves, which wins for as long as it stands.
 //!
+//! [`Shells`] is where a shell for a workspace is started, and it is the one
+//! place that knows a shell does not always run on this machine: a workspace
+//! set to use its project's development container has its shells started inside
+//! one, with everything a shell needs — the correlation above first among it —
+//! carried across that boundary explicitly, because nothing crosses it by
+//! itself.
+//!
 //! # The half that outlives the process
 //!
 //! [`Config`] is the file a [`Layout`] — every workspace, and everything open in
@@ -73,6 +80,7 @@ pub mod attribution;
 pub mod bus;
 pub mod config;
 pub mod correlation;
+pub mod devcontainer;
 pub mod ids;
 pub mod naming;
 pub mod rollup;
@@ -84,6 +92,9 @@ pub use attribution::{Attribution, ShellStatus, status_source};
 pub use bus::{BusState, Subscriber, SubscriberHandle, Update};
 pub use config::{CONFIG_VAR, Config, ConfigError, TreeError};
 pub use correlation::{CorrelationError, correlation_for, parse_correlation};
+pub use devcontainer::{
+    ContainerError, Containers, Devcontainer, Machine, Outcome, Shells, StartError, described,
+};
 pub use ids::{ShellAddress, ShellId, ShellIds, TabId, TabIds, WorkspaceId, WorkspaceIds};
 pub use naming::{FOREGROUND_INTERVAL, Foreground, ForegroundProcess, Kernel, Pid, ShellName};
 pub use rollup::{RollupStatus, rollup, shell_status};
@@ -92,5 +103,6 @@ pub use split::{
 };
 pub use terminal::{
     CORRELATION_VAR, Device, Program, Shell, ShellOptions, ShellSize, ShellState, SpawnError,
+    TERM_VAR,
 };
 pub use workspace::{Layout, MalformedLayout, Tab, Workspace, WorkspaceSettings};

@@ -47,7 +47,7 @@
 //! Likewise [`Shell::write`] takes bytes: turning a key press into bytes is a
 //! keymap's job and a keymap needs a keyboard.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -84,6 +84,9 @@ mod tests;
 /// application talks to, and the name of an environment variable is the whole
 /// of the contract.
 pub const CORRELATION_VAR: &str = "AGENTBUS_PANE";
+
+/// The variable a terminal describes itself to its process with.
+pub const TERM_VAR: &str = "TERM";
 
 /// What `TERM` is set to for a shell started here.
 ///
@@ -265,7 +268,7 @@ impl Program {
 pub struct ShellOptions {
     program: Option<Program>,
     directory: Option<PathBuf>,
-    env: HashMap<String, String>,
+    env: BTreeMap<String, String>,
     size: ShellSize,
     scrollback: usize,
 }
@@ -276,7 +279,7 @@ impl ShellOptions {
         Self {
             program: None,
             directory: None,
-            env: HashMap::new(),
+            env: BTreeMap::new(),
             size: ShellSize::default(),
             scrollback: DEFAULT_SCROLLBACK,
         }
@@ -329,6 +332,30 @@ impl ShellOptions {
     /// Where it will be run.
     pub fn chosen_directory(&self) -> Option<&Path> {
         self.directory.as_deref()
+    }
+
+    /// Every variable a shell started with these options is given, correlated
+    /// as `correlation`.
+    ///
+    /// Three things go in: what a caller asked for, the terminal's own
+    /// description of itself, and the correlation — the last of which is
+    /// written unconditionally, over whatever a caller put there.
+    ///
+    /// This is answerable without starting anything because a shell does not
+    /// always run on this machine. One that runs somewhere else is started by a
+    /// command that has to be *told* what environment to give it, and a
+    /// container or a remote host that were told only some of this would leave
+    /// a shell that either renders wrongly or cannot be attributed at all.
+    pub fn environment(&self, correlation: &str) -> BTreeMap<String, String> {
+        let mut env = self.env.clone();
+        env.entry(TERM_VAR.to_owned())
+            .or_insert_with(|| DEFAULT_TERM.to_owned());
+        // Last, and unconditionally: a caller that set this was mistaken, and
+        // this application's own environment may well carry a correlation of
+        // its own — the one for the shell somebody started it from — which this
+        // has to overwrite rather than inherit.
+        env.insert(CORRELATION_VAR.to_owned(), correlation.to_owned());
+        env
     }
 }
 
@@ -663,14 +690,7 @@ impl Drop for Shell {
 impl ShellOptions {
     /// This, said the way the terminal device wants to hear it.
     fn tty(&self, correlation: &str) -> TtyOptions {
-        let mut env = self.env.clone();
-        env.entry("TERM".to_owned())
-            .or_insert_with(|| DEFAULT_TERM.to_owned());
-        // Last, and unconditionally: a caller that set this was mistaken, and
-        // this application's own environment may well carry a correlation of
-        // its own — the one for the shell somebody started it from — which this
-        // has to overwrite rather than inherit.
-        env.insert(CORRELATION_VAR.to_owned(), correlation.to_owned());
+        let env = self.environment(correlation).into_iter().collect();
 
         TtyOptions {
             shell: self
