@@ -56,7 +56,8 @@
 //!
 //! There is one code path, wherever this runs. Nothing in this crate asks what
 //! kind of machine, session or container it is in, or what started it; the
-//! socket directory rules in [`paths`] cover those differences by construction.
+//! socket directory rules in [`agentbus_paths`] cover those differences by
+//! construction.
 
 #![warn(missing_docs)]
 
@@ -68,7 +69,6 @@ pub mod foreground;
 pub mod identity;
 pub mod lock;
 pub mod manifests;
-pub mod paths;
 pub mod procfs;
 pub mod remote;
 pub mod subscribe;
@@ -96,8 +96,8 @@ use tracing::{debug, error, info};
 
 pub use bus::Bus;
 pub use emit::EmitListener;
+pub use agentbus_paths::SocketPaths;
 pub use lock::InstanceLock;
-pub use paths::SocketPaths;
 pub use subscribe::SubscribeListener;
 
 /// How often every session's clock is moved forward.

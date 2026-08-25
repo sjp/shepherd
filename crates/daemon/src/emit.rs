@@ -30,7 +30,7 @@ use tracing::{debug, trace, warn};
 
 use crate::ACCEPT_RETRY_DELAY;
 use crate::bus::{Bus, Ingested};
-use crate::paths::SOCKET_MODE;
+use agentbus_paths::SOCKET_MODE;
 
 /// The most of one line the daemon will hold.
 ///

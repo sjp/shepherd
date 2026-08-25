@@ -335,7 +335,7 @@ fn a_directory_with_no_room_for_a_socket_is_left_for_one_that_has() {
     let cramped = Masters::beside(&deep);
 
     assert_eq!(roomy.dir(), Path::new("/run/user/1000/agentbus/ssh"));
-    assert_eq!(cramped.dir(), crate::paths::per_user_dir().join("ssh"));
+    assert_eq!(cramped.dir(), agentbus_paths::per_user_dir().join("ssh"));
     // The point of the budget: whatever ssh expands the template into, the path
     // it builds still fits in the field the kernel keeps it in.
     for masters in [roomy, cramped] {

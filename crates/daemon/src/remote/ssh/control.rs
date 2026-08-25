@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
-use crate::paths::{self, SocketPaths};
+use agentbus_paths::{SocketPaths, per_user_dir};
 
 /// The directory these live in, inside whichever directory holds them.
 pub const DIR_NAME: &str = "ssh";
@@ -146,7 +146,7 @@ impl Masters {
             info!(dir = %preferred.display(), "keeping ssh connections here");
             return Self::under(preferred);
         }
-        let fallback = paths::per_user_dir().join(DIR_NAME);
+        let fallback = per_user_dir().join(DIR_NAME);
         warn!(
             wanted = %preferred.display(),
             using = %fallback.display(),

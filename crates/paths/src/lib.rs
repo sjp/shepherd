@@ -10,6 +10,18 @@
 //! manager and therefore no `XDG_RUNTIME_DIR`; nothing here detects, or needs to
 //! detect, what kind of place it is running in. Every path is per-user so that
 //! two people on one machine never reach for the same socket.
+//!
+//! # Why this is a crate of its own
+//!
+//! A subscriber is not the daemon. Anything that wants to read the stream has to
+//! find `sub.sock` first, and the only honest ways to do that are to apply these
+//! rules or to copy them — so they sit in the smallest crate that can hold them,
+//! depending on nothing but the standard library and `libc`, rather than behind
+//! a daemon's worth of runtime, sockets and state. Copies of a rule that decides
+//! *where* two programs meet do not fail loudly when they drift; they fail as
+//! silence on a socket nobody is listening to.
+
+#![warn(missing_docs)]
 
 use std::ffi::OsString;
 use std::fs;
@@ -34,6 +46,9 @@ pub const SUB_SOCKET: &str = "sub.sock";
 
 /// The file name of the lock that grants a daemon the directory.
 pub const LOCK_FILE: &str = "daemon.lock";
+
+/// The file name a daemon writes what it is attached to in.
+pub const ATTACHMENTS_FILE: &str = "attachments.json";
 
 /// The mode the bus directory is kept at: nobody but its owner has any business
 /// listing it, and its contents are enough to drive someone's coding agent.
@@ -71,7 +86,7 @@ impl SocketPaths {
             emit: dir.join(EMIT_SOCKET),
             sub: dir.join(SUB_SOCKET),
             lock: dir.join(LOCK_FILE),
-            attachments: dir.join(crate::remote::attachments::FILE_NAME),
+            attachments: dir.join(ATTACHMENTS_FILE),
             dir,
         }
     }
@@ -155,7 +170,7 @@ fn resolve_dir(explicit: Option<OsString>, runtime_dir: Option<OsString>, uid: u
 
 /// The directory this program falls back to on a machine that names nowhere
 /// else to put its files.
-pub(crate) fn per_user_dir() -> PathBuf {
+pub fn per_user_dir() -> PathBuf {
     per_user(current_uid())
 }
 
@@ -166,7 +181,7 @@ pub(crate) fn per_user_dir() -> PathBuf {
 /// that belong to the user on this machine rather than to one bus: a caller may
 /// point a daemon's sockets anywhere, and something that has to be the same for
 /// every daemon this user runs cannot follow it there.
-pub(crate) fn runtime_dir() -> PathBuf {
+pub fn runtime_dir() -> PathBuf {
     resolve_dir(None, std::env::var_os(RUNTIME_DIR_VAR), current_uid())
 }
 

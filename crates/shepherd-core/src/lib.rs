@@ -31,15 +31,26 @@
 //! started knowing the string [`correlation_for`] gives it, everything
 //! descending from it inherits that string, and whatever is watching those
 //! processes reports it back without ever being told what is in it.
+//!
+//! # The live half
+//!
+//! [`Subscriber`] is where those reports come back. It reads the event bus's
+//! published stream on a thread of its own and hands over [`Update`]s;
+//! [`BusState`] folds them into what is currently true of every agent session,
+//! which is the other half of what a sidebar needs in order to draw a badge.
+//! Neither of them knows anything about this model — attributing a session to a
+//! shell is a separate step, and the bus itself knows nothing about either.
 
 #![warn(missing_docs)]
 
+pub mod bus;
 pub mod correlation;
 pub mod ids;
 pub mod rollup;
 pub mod split;
 pub mod workspace;
 
+pub use bus::{BusState, Subscriber, SubscriberHandle, Update};
 pub use correlation::{CorrelationError, correlation_for, parse_correlation};
 pub use ids::{ShellId, ShellIds, TabId, TabIds, WorkspaceId, WorkspaceIds};
 pub use rollup::{RollupStatus, rollup, shell_status};

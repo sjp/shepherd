@@ -12,7 +12,7 @@
 //!
 //! The machine, and the user the daemon runs as. Both halves are load-bearing.
 //! The machine alone would merge two daemons that share a host and nothing else:
-//! this program's sockets are per-user ([`crate::paths`]), so logging in as
+//! this program's sockets are per-user ([`agentbus_paths`]), so logging in as
 //! somebody else reaches a different daemon holding a different set of sessions.
 //! The user alone would merge every machine somebody has an account on.
 //!
@@ -71,7 +71,7 @@ const RANDOM_SOURCE: &str = "/dev/urandom";
 pub fn resolve() -> DaemonIdentity {
     of(
         &MACHINE_ID_FILES.map(PathBuf::from),
-        &crate::paths::runtime_dir(),
+        &agentbus_paths::runtime_dir(),
         current_uid(),
     )
 }

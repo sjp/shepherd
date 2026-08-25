@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 agentbus-detect = { workspace = true, features = ["remote-updates"] }
+agentbus-paths = { workspace = true }
 agentbus-protocol = { workspace = true }
 libc = { workspace = true }
 rustls-graviola = { workspace = true }

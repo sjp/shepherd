@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/protocol",
+    "crates/paths",
     "crates/detect",
     "crates/daemon",
     "crates/install",
@@ -17,6 +18,7 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 agentbus-protocol = { path = "crates/protocol" }
+agentbus-paths = { path = "crates/paths" }
 agentbus-detect = { path = "crates/detect" }
 agentbus-daemon = { path = "crates/daemon" }
 agentbus-install = { path = "crates/install" }

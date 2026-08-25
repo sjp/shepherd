@@ -17,6 +17,7 @@ path = "src/main.rs"
 agentbus-daemon = { workspace = true }
 agentbus-detect = { workspace = true, features = ["remote-updates"] }
 agentbus-install = { workspace = true }
+agentbus-paths = { workspace = true }
 agentbus-protocol = { workspace = true }
 clap = { workspace = true }
 libc = { workspace = true }

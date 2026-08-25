@@ -202,7 +202,7 @@ fn config_dir(
     }
     match home.filter(|value| !value.is_empty()) {
         Some(home) => PathBuf::from(home).join(DEFAULT_CONFIG_HOME).join(DIR_NAME),
-        None => crate::paths::per_user_dir(),
+        None => agentbus_paths::per_user_dir(),
     }
 }
 
@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn a_machine_with_no_home_directory_still_has_somewhere() {
-        assert_eq!(resolved(None, None, None), crate::paths::per_user_dir());
+        assert_eq!(resolved(None, None, None), agentbus_paths::per_user_dir());
     }
 
     #[test]

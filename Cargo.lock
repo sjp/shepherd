@@ -27,6 +27,7 @@ dependencies = [
  "agentbus-daemon",
  "agentbus-detect",
  "agentbus-install",
+ "agentbus-paths",
  "agentbus-protocol",
  "clap",
  "libc",
@@ -46,6 +47,7 @@ name = "agentbus-daemon"
 version = "0.1.0"
 dependencies = [
  "agentbus-detect",
+ "agentbus-paths",
  "agentbus-protocol",
  "libc",
  "rustls-graviola",
@@ -89,6 +91,14 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "toml 1.1.4+spec-1.1.0",
+]
+
+[[package]]
+name = "agentbus-paths"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
 ]
 
 [[package]]
@@ -5571,9 +5581,13 @@ name = "shepherd-core"
 version = "0.1.0"
 dependencies = [
  "agentbus-detect",
+ "agentbus-paths",
  "agentbus-protocol",
  "alacritty_terminal",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
+ "tracing",
 ]
 
 [[package]]

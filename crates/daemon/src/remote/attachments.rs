@@ -23,7 +23,10 @@ use serde::{Deserialize, Serialize};
 use super::store::{self, Error};
 
 /// The file the daemon writes its attachments to.
-pub const FILE_NAME: &str = "attachments.json";
+///
+/// Named beside the sockets it sits with, because everything in that directory
+/// has to be known to whoever clears it.
+pub const FILE_NAME: &str = agentbus_paths::ATTACHMENTS_FILE;
 
 /// The shape this build writes and is willing to read.
 pub const SCHEMA: u32 = 1;
