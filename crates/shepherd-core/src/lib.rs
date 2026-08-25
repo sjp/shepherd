@@ -54,6 +54,11 @@
 //! set in the process's environment before it starts, so that everything
 //! descending from it carries the same one — and it is read from continuously,
 //! whether or not anybody is looking at it.
+//!
+//! It also says what is in it. [`ShellName`] asks the shell's own terminal which
+//! process the kernel has in front of it, so a shell is called after whatever it
+//! is currently running and renames itself when that changes — unless somebody
+//! has named it themselves, which wins for as long as it stands.
 
 #![warn(missing_docs)]
 
@@ -61,6 +66,7 @@ pub mod attribution;
 pub mod bus;
 pub mod correlation;
 pub mod ids;
+pub mod naming;
 pub mod rollup;
 pub mod split;
 pub mod terminal;
@@ -70,6 +76,7 @@ pub use attribution::{Attribution, ShellStatus, status_source};
 pub use bus::{BusState, Subscriber, SubscriberHandle, Update};
 pub use correlation::{CorrelationError, correlation_for, parse_correlation};
 pub use ids::{ShellAddress, ShellId, ShellIds, TabId, TabIds, WorkspaceId, WorkspaceIds};
+pub use naming::{FOREGROUND_INTERVAL, Foreground, ForegroundProcess, Kernel, Pid, ShellName};
 pub use rollup::{RollupStatus, rollup, shell_status};
 pub use split::{Axis, Branch, Closed, Direction, PlacedShell, Rect, Split, SplitTree};
 pub use terminal::{

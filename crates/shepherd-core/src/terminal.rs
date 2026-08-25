@@ -32,6 +32,13 @@
 //! miss it, and nothing further is asked of the agent, the shell or the person
 //! using either.
 //!
+//! # It says what is in it
+//!
+//! A shell is called after whatever process is in front of its terminal, which
+//! it finds out by asking — see [`Shell::poll_name`] and the module behind it —
+//! and renames itself when that changes. A name somebody chose with
+//! [`Shell::set_name`] outranks that for as long as it stands.
+//!
 //! # What is not here
 //!
 //! Nothing draws anything. The grid is exposed — [`Shell::term`] for a caller
@@ -61,6 +68,7 @@ use tracing::debug;
 
 use crate::correlation::correlation_for;
 use crate::ids::ShellAddress;
+use crate::naming::{Kernel, ShellName};
 
 pub use alacritty_terminal::index::{Column, Line, Point};
 
@@ -392,6 +400,7 @@ pub enum SpawnError {
 pub struct Shell {
     address: ShellAddress,
     correlation: String,
+    name: ShellName,
     term: Arc<FairMutex<Term<ShellListener>>>,
     listener: ShellListener,
     channel: EventLoopSender,
@@ -452,6 +461,7 @@ impl Shell {
         Ok(Self {
             address,
             correlation,
+            name: ShellName::new(),
             term,
             listener,
             channel,
@@ -489,6 +499,47 @@ impl Shell {
     /// having been handed to the thread that reads it.
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// What to call this shell: what somebody named it, or failing that what is
+    /// running in it as of the last look.
+    ///
+    /// `None` for a shell nobody has named and nothing has looked at yet — see
+    /// [`Shell::poll_name`], which is what does the looking.
+    pub fn name(&self) -> Option<&str> {
+        self.name.name()
+    }
+
+    /// Names the shell, until [`Shell::clear_name`] says otherwise.
+    ///
+    /// Nothing running in it renames it after this, however long it runs and
+    /// whatever it is.
+    pub fn set_name(&mut self, name: impl Into<String>) {
+        self.name.set(name);
+    }
+
+    /// Gives that name up, so the shell goes back to being called after whatever
+    /// is running in it.
+    pub fn clear_name(&mut self) {
+        self.name.clear();
+    }
+
+    /// Looks at what is running in front of this shell's terminal, unless that
+    /// was done within the last [`FOREGROUND_INTERVAL`].
+    ///
+    /// Answers whether what the shell is called changed, so a caller drawing a
+    /// list of shells can call it on every one of them as often as it likes and
+    /// redraw only when there is something different to draw.
+    ///
+    /// [`FOREGROUND_INTERVAL`]: crate::naming::FOREGROUND_INTERVAL
+    pub fn poll_name(&mut self) -> bool {
+        self.name.poll(&self.device, &Kernel)
+    }
+
+    /// Everything known about what this shell is called, including what is
+    /// running in it when that is not what it is called.
+    pub fn naming(&self) -> &ShellName {
+        &self.name
     }
 
     /// How big the grid is.
@@ -589,6 +640,7 @@ impl fmt::Debug for Shell {
         f.debug_struct("Shell")
             .field("address", &self.address)
             .field("correlation", &self.correlation)
+            .field("name", &self.name)
             .field("size", &self.size())
             .field("state", &self.state())
             .finish_non_exhaustive()

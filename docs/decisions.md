@@ -2241,3 +2241,60 @@ would have defaulted to, and it is written down anyway: a scrollback depth is a
 product decision, and one that is silently inherited from a dependency is one
 that could change under this repository without anybody noticing until output
 started disappearing.
+
+## 2026-08-25 — a shell is called after what is running in it
+
+### The foreground process is read from the terminal the application owns
+
+**`shepherd-core` asks its own pseudo-terminal which process group is in front
+of it, rather than asking the bus what it saw in the process table.** The bus
+builds that answer by scanning `/proc/*/environ`, and its own protocol documents
+the array as absent entirely where no daemon can read a process table — which is
+every macOS machine, and macOS is one of the two platforms this has to work on.
+Asking the terminal is portable to both, is one syscall and one small read
+rather than a round trip through another process, and cannot go stale in a way
+the holder of the terminal has no way to notice. It is also a question about a
+terminal this application opened, so there is nobody else to ask it of.
+
+The consequence is a `libc` dependency in `shepherd-core`, for `tcgetpgrp` and —
+on macOS — `proc_pidinfo`. It follows the workspace rule that a dependency is
+justified by what only it can answer: there is no way to ask `std` which process
+group has a terminal.
+
+### One trait, one implementation per platform, and no `cfg` at any call site
+
+**`ForegroundProcess` is "given a terminal, say what is in front of it and what
+to call it"; `Kernel` implements it by asking this machine.** The boundary is
+drawn there rather than lower because the two halves of the answer divide
+differently: the process group is `tcgetpgrp` on every unix and is written once,
+while the name for that group comes from a file on Linux and a system call on
+macOS and is written twice. Windows is a third file, `unimplemented!()`, because
+a pseudo-console has no foreground process group at all and answering the
+question there means walking a process tree instead — a piece of work, not a
+spelling difference, and the trait is the whole of what it has to fill in.
+
+macOS resolves the name through `proc_pidinfo` with `PROC_PIDTBSDINFO` and
+applies `proc_name`'s own rule to the record — prefer the long name field, fall
+back to the short one — rather than calling `proc_name`. The platform bindings
+this workspace already depends on declare the former and not the latter, and a
+hand-written declaration of somebody else's ABI is worth avoiding when the call
+underneath it is already available and says more.
+
+### The name is polled, and a name somebody chose is never overwritten
+
+**`ShellName::poll` looks at most once per `FOREGROUND_INTERVAL` — 750 ms, the
+same cadence the bus's own foreground scanning settled on — and may be called as
+often as a caller likes.** Nothing tells a program that the process in front of
+a terminal changed, so this is asked rather than received; putting the throttle
+inside the call rather than in a timer somewhere means a renderer can ask on
+every frame and a test can ask in a loop, and neither has to know the cadence.
+No thread is started for it: there is already one thread per shell reading the
+terminal, and a second one per shell to read two small files would be a poor
+trade.
+
+A chosen name wins for as long as it stands, and what is running goes on being
+watched underneath it — so giving the chosen name up shows what is running now
+rather than what was running when it was set. A look that finds nothing leaves
+the shell with no name rather than with the last one it had: a terminal with
+nothing in front of it is a real answer, and holding on to the name of something
+that has exited would be the one kind of wrong that never corrects itself.

@@ -10,6 +10,7 @@ agentbus-detect = { workspace = true }
 agentbus-paths = { workspace = true }
 agentbus-protocol = { workspace = true }
 alacritty_terminal = { workspace = true }
+libc = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
