@@ -5570,10 +5570,13 @@ version = "0.1.0"
 dependencies = [
  "agentbus-detect",
  "agentbus-protocol",
+ "anyhow",
  "clap",
  "gpui",
  "gpui-component",
  "shepherd-core",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -12,10 +12,13 @@ path = "src/main.rs"
 [dependencies]
 agentbus-detect = { workspace = true }
 agentbus-protocol = { workspace = true }
+anyhow = { workspace = true }
 shepherd-core = { workspace = true }
 clap = { workspace = true }
 gpui = { workspace = true }
 gpui-component = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

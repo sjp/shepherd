@@ -53,10 +53,19 @@ done
 # degrade, it exits non-zero on startup, so these are as required as the link
 # libraries are. Xvfb supplies the display a window needs to open at all.
 #
+# The last two are for driving that display rather than for having one. xauth is
+# what xvfb-run needs in order to start a server at all — without it, it refuses
+# rather than falling back. xrefresh is stranger and worth the sentence: the
+# toolkit's X11 backend begins a window's refresh loop when it processes the
+# notification that the window was mapped, and on a virtual display where nothing
+# else ever happens, no further X traffic arrives to make it read that event. The
+# window therefore draws its first frame and then nothing. Any traffic at all
+# starts it, and one xrefresh is the cheapest way to produce some.
+#
 # A failure here is reported and left alone for the same reason the agent
 # installs above are: the crates in this repository that exist today build and
 # test without any of it.
-GUI_PACKAGES="libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libvulkan1 mesa-vulkan-drivers xvfb"
+GUI_PACKAGES="libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libvulkan1 mesa-vulkan-drivers xvfb xauth x11-xserver-utils"
 if ! sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq \
 	|| ! sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $GUI_PACKAGES; then
 	printf '\n!! The GUI system libraries did not install. Install them by hand with\n'

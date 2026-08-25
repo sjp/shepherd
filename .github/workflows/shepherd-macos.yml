@@ -1,0 +1,110 @@
+name: Shepherd (macOS)
+
+# Asked for by hand, and never run on a push. A Mac is the only machine that can
+# build the GUI at all: the toolkit generates its dispatch bindings and compiles
+# its Metal shaders with Xcode's own tools, on the machine doing the building,
+# and both are behind a check on that machine's operating system rather than on
+# the target's. So there is no cross-build of this from anywhere else, and this
+# workflow is how somebody whose Mac has no Rust toolchain on it gets a copy of
+# the window to run.
+#
+# It is not a release. Nothing here is signed, notarised or put in an
+# application bundle, and the binary it produces is meant to be run from a
+# terminal by whoever asked for it. The bus's own release workflow is next door
+# and is the one that makes assets other people are given.
+on:
+  workflow_dispatch:
+    inputs:
+      triple:
+        description: Which Mac to build for
+        type: choice
+        default: aarch64-apple-darwin
+        options:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ inputs.triple }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ inputs.triple }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ inputs.triple }}
+
+      # The toolkit's build script compiles its shaders by calling Xcode's Metal
+      # compiler by name, and that compiler is a component of Xcode rather than
+      # a part of it — an image without it fails the build with a message about
+      # a tool nobody asked for. Where the image has it this does nothing.
+      - name: The Metal compiler is on this machine
+        run: |
+          if ! xcrun --sdk macosx --find metal >/dev/null 2>&1; then
+            sudo xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun --sdk macosx --find metal
+
+      # --locked for the same reason a release is built that way: from the
+      # dependency graph this repository recorded, rather than from whatever
+      # resolves on the day.
+      - name: cargo build
+        run: cargo build --release --locked --target "${{ inputs.triple }}" --package shepherd
+
+      # The one thing a runner with no display can check about a window: that it
+      # links, starts, and answers the flag it answers before anything is
+      # opened. Only for the build that matches the runner's own architecture —
+      # the other one would be asking Rosetta, which is not this workflow's
+      # business to depend on.
+      - name: The binary links and runs
+        if: inputs.triple == 'aarch64-apple-darwin'
+        run: ./target/${{ inputs.triple }}/release/shepherd --version
+
+      # Named the way the bus's assets are named, from the same one version
+      # number, so a downloaded copy says what it is without being asked.
+      - name: Name the binary
+        id: asset
+        run: |
+          . scripts/release-lib.sh
+          name=shepherd-$(workspace_version)-${{ inputs.triple }}
+          mkdir -p dist
+          cp -- "target/${{ inputs.triple }}/release/shepherd" "dist/$name"
+          chmod +x -- "dist/$name"
+          printf 'name=%s\n' "$name" >>"$GITHUB_OUTPUT"
+
+      # What to do with it, written where the person who asked for the build
+      # will see it: an unsigned binary that arrived over the network is
+      # quarantined by the system, and the first thing it does otherwise is
+      # refuse to run for a reason that sounds much worse than it is.
+      - name: Say how to run it
+        run: |
+          cat >>"$GITHUB_STEP_SUMMARY" <<'SUMMARY'
+          ## `${{ steps.asset.outputs.name }}`
+
+          Unsigned, unbundled, and meant to be run from a terminal:
+
+          ```sh
+          xattr -dr com.apple.quarantine ./${{ steps.asset.outputs.name }}
+          chmod +x ./${{ steps.asset.outputs.name }}
+          ./${{ steps.asset.outputs.name }}                 # your login shell
+          ./${{ steps.asset.outputs.name }} yes hello       # something to look at
+          ```
+
+          It opens a window on the directory it was started in. Diagnostics go to
+          the terminal it was started from; `SHEPHERD_LOG=shepherd=debug` asks for
+          more of them.
+          SUMMARY
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.asset.outputs.name }}
+          path: dist/*
+          if-no-files-found: error

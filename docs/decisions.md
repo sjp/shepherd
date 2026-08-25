@@ -2464,3 +2464,196 @@ Starting the bus is the whole of what this application does to it. Hooks are
 never installed, repaired or looked at: that edits files somebody owns, with
 their coding agent's behaviour on the other side of it, and it stays a decision
 they make with the bus's own command.
+
+## 2026-08-25 — a window with a shell in it
+
+### The binary is one shell, and the command line says what runs in it
+
+**`shepherd` now opens a window holding exactly one shell, and takes an optional
+trailing command saying what that shell runs.** No tabs, no splits, no sidebar
+and no keyboard: this is the seam between the two halves of this repository — a
+live process feeding a terminal grid, that grid reaching pixels, and an agent
+started in that shell being recognised as having been started there — with as
+little else in the way as it can be built with.
+
+The trailing command exists because of what is missing rather than what is
+wanted. A keymap is what turns a key press into bytes, there is not one yet, and
+until there is, a shell nobody can type into has nothing to do. `shepherd yes` or
+`shepherd sh -c '…'` is how a shell is given work, and with no argument it runs
+the person's login shell as it always will. `--version` keeps working exactly as
+it did when that was the whole program.
+
+Diagnostics go to stderr under `SHEPHERD_LOG`, at `info` by default, the same
+shape the bus's own command uses for the same reason: this is a program somebody
+starts from a terminal and then wants an account of.
+
+### A frame is asked for on a timer and drawn only when something changed
+
+**One 16 ms timer looks at the grid's revision counter, what the shell is called
+and the bus, and asks for a redraw only where one of them moved.** The three
+things that change underneath a window change at wildly different rates — a
+process can print faster than any display can show — so nothing here is driven by
+what arrives. The grid counts its own changes, the view remembers the number it
+last drew, and a difference is the whole redraw condition. A process printing a
+million lines a second therefore costs sixty redraws a second, and a window
+showing a shell that is doing nothing costs none at all, which was confirmed by
+running an idle shell for twelve seconds and watching no frame be drawn after the
+first one.
+
+That also puts a ceiling on every rate measured below: nothing is ever drawn more
+than sixty times a second, so a measured rate at the ceiling means the window kept
+up with everything it was given rather than that it could not go faster.
+
+### The grid is measured by the element that holds it
+
+**How many rows and columns a shell has is taken from the bounds of the element
+the grid is drawn into, and the shell is resized when that works out to a
+different number of cells.** The alternative — the window's size, less an
+allowance for everything drawn around the grid — is an estimate that goes wrong
+the first time anything is added to the chrome, and the number wanted here is a
+count of whole cells rather than a size in pixels. Nothing happens when the count
+is unchanged, so dragging a window edge across one pixel at a time resizes the
+shell only as each row or column appears.
+
+### A row is one run of text, in the first monospaced family the machine has
+
+**The renderer is deliberately the naive one: each row of the viewport as a
+single run of text, one colour, no cursor, no attributes.** Wide characters,
+combining marks, colours and inverse video are what a terminal has to get right,
+and none of them is here — this exists to find out whether the path from a live
+process to pixels is fast enough before the work of drawing it properly is built
+on top of it.
+
+The font is chosen by asking the machine which families it has and taking the
+first monospaced one of a short list, rather than naming one family and hoping.
+A terminal in a proportional font is not a terminal, and which families exist is
+a fact about the machine rather than a choice this can make.
+
+### What a frame costs is measured while it is being drawn
+
+**Every frame is timed from the moment the view begins building its elements to
+just after the frame has been rendered, and the time spent building is timed
+separately within that.** A judgement about whether a terminal is fast enough
+should not be an impression formed while watching one, so the numbers are
+rolled up once a second, written to the log, and put in the window's own header
+where somebody looking at the terminal is looking at them too.
+
+The two numbers answer different questions. The whole-frame time is what a person
+sees. The building time is this application's own share of it — reading the grid
+and turning it into elements — and the difference between the two is layout,
+paint and presentation, which is the toolkit's. When a frame is expensive, that
+split is what says which of the two to go and look at.
+
+### What it costs here, which is a floor rather than a measurement
+
+**On this container — aarch64, eight cores, no GPU, drawing through the
+`lavapipe` software rasteriser under Xvfb at 1024×700, a 130×39 grid, release
+build — a full-screen scroll draws at 26–45 frames a second, and 90% or more of
+every frame is the toolkit's paint rather than this application's work.**
+
+| what the shell was running | frames per second | mean frame | of which building | worst frame |
+| --- | --- | --- | --- | --- |
+| `yes` | 38–45 | 21–25 ms | 1.8–3.0 ms | 33–68 ms |
+| `find /usr` on a loop | 26–31 | 32–38 ms | 0.7–1.5 ms | 48–80 ms |
+| an idle shell | none after the first | — | — | — |
+
+The second row is the harder one and is the one to read: full-width varied text
+is more glyphs to shape and more pixels to fill than the same five characters
+repeated.
+
+What this does not say is whether the toolkit is fast enough, and it is worth
+being exact about why. Every one of these frames was painted by a CPU
+rasteriser, which is the part a real graphics device does not do; the share
+measured as this application's own is one to two milliseconds, and it is the
+share that would remain. A machine with a GPU should therefore be far faster
+than this, and if it is not, the thing to look at is the toolkit rather than the
+element-building above it. That measurement needs real hardware and remains
+somebody's to take.
+
+The numbers above are also worth keeping for a duller reason: they are what this
+container produced on this date, so a later change that halves them will show up
+as a regression in a place that can be run without a graphics device.
+
+### A virtual display with nothing happening on it does not ask for frames
+
+**Under Xvfb the window opens and draws its first frame, and then draws nothing
+further until some X traffic arrives — after which frames flow normally.** This
+is worth writing down because it looks exactly like a redraw bug and is not one.
+The toolkit's X11 backend starts its per-window refresh timer when it processes
+the notification that the window was mapped; on a display where nothing else ever
+happens, no further traffic arrives, and that queued notification is not read.
+Anything at all on the display starts it: `xrefresh` is enough, and running a
+window here means running one.
+
+Two packages join the six that entry lists, for driving a display rather than
+having one: `x11-xserver-utils` for `xrefresh` above, and `xauth`, without which
+`xvfb-run` refuses to start a server rather than falling back — which is why the
+convenience wrapper that entry assumed could not be used here until now. Both are
+in `.devcontainer/post-create.sh` with the reason beside them.
+
+So the standing note from the toolkit's own entry above holds, with a second half
+added to it. This container can say that the program builds, that a window opens,
+that a frame is drawn, and — given that nudge — how expensive frames are relative
+to each other. It cannot say how the result looks, and it cannot be trusted about
+absolute speed.
+
+### Nothing was added to the bus, which was the point
+
+**No file under `crates/protocol`, `crates/daemon`, `crates/install` or
+`crates/cli` was touched to make an agent started in this window's shell show up
+as running in it.** The whole mechanism was already there and already
+general: a shell puts a string of the GUI's own devising into the environment
+variable the bus documents, anything started in that shell inherits it, the bus
+copies it onto what it reports without ever looking inside it, and the join back
+to a shell happens in the GUI where the shells are. A shell script exporting the
+same variable would be reported the same way and would mean something entirely
+different to whoever wrote it, which is the test of whether the boundary is in
+the right place.
+
+That was exercised rather than reasoned about: with a real daemon — started by
+the window itself, because none was running — and the real `agentbus emit`
+carrying a coding agent's hook payloads, a session correlated to this window's
+shell was reported as starting, then working, then blocked, then done, and one
+correlated to a shell that is not open was left unattributed rather than given
+to the shell that is. No part of that needed a build of the bus with anything
+added to it.
+
+## 2026-08-25 — where a macOS build of the GUI comes from
+
+### The GUI cannot be built anywhere but a Mac
+
+**There is no cross-build of `shepherd` for macOS from Linux, and the reason is
+in the toolkit's build script rather than in anything this repository does.**
+That script gates all of its macOS work on the *build machine's* operating
+system, not on the target's: cross-compiling from anywhere else, the block that
+generates its dispatch bindings and compiles its Metal shaders is compiled out
+altogether, and the crate then fails while compiling itself, because the sources
+that include those generated files are not conditional in the same way. A
+`cargo check --target aarch64-apple-darwin` fails at the same place, so this is
+not a question of linking or of an SDK.
+
+Behind that are two more walls, recorded so nobody spends the day getting past
+the first one. The shader step invokes Xcode's own Metal compiler by name, which
+runs on macOS and nowhere else. And the link wants the platform frameworks —
+Cocoa, Metal, CoreText, CoreVideo — from an SDK that cannot be redistributed,
+so it could never be baked into this repository's container either.
+
+The bus is a different matter and always was: it has no GUI dependency, and its
+release workflow already builds both Darwin targets.
+
+### A Mac binary is asked for by hand, and is not a release
+
+**`.github/workflows/shepherd-macos.yml` builds `shepherd` on a macOS runner on
+`workflow_dispatch`, and uploads the binary as an artifact named the way the
+bus's assets are named.** It exists for the case the paragraphs above create: a
+person whose own machine is a Mac, who wants to run the window there, and who
+does not want a Rust toolchain installed on it. Asked for by hand rather than
+run on every push, because a macOS runner is the most expensive minute this
+repository can spend and nothing depends on the artifact existing.
+
+What it produces is deliberately not a release. It is unsigned, unnotarised and
+not in an application bundle, so the system quarantines it on arrival and the
+run's summary says how to clear that. Assets other people are given come from
+the release workflow next door, which is the one that names, checksums and
+publishes them — and Shepherd is not in it, because a GUI that has to be
+signed to be given away is a decision to make when there is something to give.

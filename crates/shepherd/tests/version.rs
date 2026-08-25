@@ -1,6 +1,11 @@
 //! `shepherd --version` is compared byte-for-byte by anything that provisions
 //! this binary onto another machine, so its output is pinned here, matching
 //! the contract `agentbus --version` already holds itself to.
+//!
+//! Everything asserted here is what the command line does *before* anything is
+//! started. What a bare invocation does — start a shell and open a window on it
+//! — is not: it needs a display, it does not end on its own, and a test that ran
+//! it would be a test of the machine it ran on.
 
 use std::process::Command;
 
@@ -20,14 +25,19 @@ fn version_prints_exactly_the_contract_line() {
 }
 
 #[test]
-fn bare_invocation_does_nothing_and_exits_zero() {
+fn a_verbosity_nothing_understands_is_refused_before_anything_starts() {
     let output = Command::new(env!("CARGO_BIN_EXE_shepherd"))
+        .arg("--log-level")
+        .arg("=nonsense=")
         .output()
         .expect("failed to run shepherd");
 
+    // Usage, on stderr, with the status a command line that does not make sense
+    // is answered with — and nothing started, which is the point of validating
+    // it here rather than when the log filter is built.
     assert_eq!(output.stdout, b"");
-    assert_eq!(output.stderr, b"");
-    assert_eq!(output.status.code(), Some(0));
+    assert!(!output.stderr.is_empty());
+    assert_eq!(output.status.code(), Some(2));
 }
 
 /// The version `[workspace.package]` declares, read out of the manifest that
