@@ -5573,6 +5573,7 @@ dependencies = [
  "agentbus-detect",
  "agentbus-protocol",
  "alacritty_terminal",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

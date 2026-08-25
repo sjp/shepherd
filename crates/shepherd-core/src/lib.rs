@@ -18,5 +18,28 @@
 //! model, a fold, a subscriber and a parser either behave correctly given
 //! known inputs or they do not, and that question should never need a window
 //! to open in order to be answered.
+//!
+//! # The model
+//!
+//! A [`Workspace`] is a folder somebody opened. It holds [`Tab`]s, each of
+//! which holds a [`SplitTree`] — an arrangement of shells, where a shell is one
+//! terminal running one process and a leaf of the tree is where one sits. That
+//! is the whole shape, and everything else here is either a fact about
+//! something in it or a way of getting from one part of it to another.
+//!
+//! Shells are how this crate meets the world outside the process. Each is
+//! started knowing the string [`correlation_for`] gives it, everything
+//! descending from it inherits that string, and whatever is watching those
+//! processes reports it back without ever being told what is in it.
 
 #![warn(missing_docs)]
+
+pub mod correlation;
+pub mod ids;
+pub mod split;
+pub mod workspace;
+
+pub use correlation::{CorrelationError, correlation_for, parse_correlation};
+pub use ids::{ShellId, ShellIds, TabId, TabIds, WorkspaceId, WorkspaceIds};
+pub use split::{Axis, Branch, Closed, Direction, PlacedShell, Rect, Split, SplitTree};
+pub use workspace::{Tab, Workspace, WorkspaceSettings};

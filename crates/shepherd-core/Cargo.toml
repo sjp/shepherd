@@ -9,6 +9,7 @@ publish = false
 agentbus-detect = { workspace = true }
 agentbus-protocol = { workspace = true }
 alacritty_terminal = { workspace = true }
+thiserror = { workspace = true }
 
 [lints]
 workspace = true
