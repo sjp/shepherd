@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use crate::correlation::correlation_for;
 use crate::ids::{ShellId, ShellIds, TabId, TabIds, WorkspaceId};
+use crate::rollup::{RollupStatus, rollup};
 use crate::split::{Closed, Direction, SplitTree};
 
 /// What a person has chosen about how work in one workspace is run.
@@ -80,6 +81,17 @@ impl Tab {
     /// Every shell in this tab, in arrangement order.
     pub fn shells(&self) -> Vec<ShellId> {
         self.tree.shells()
+    }
+
+    /// What this tab rolls up to, given a way to ask what each of its shells is
+    /// doing.
+    ///
+    /// The statuses are asked for rather than held, because this model is shape
+    /// and what is running in it is somebody else's to keep. The fold is
+    /// [`rollup`], the same one a shell folds its sessions with and a workspace
+    /// folds its tabs with.
+    pub fn status(&self, shell_status: impl FnMut(ShellId) -> RollupStatus) -> RollupStatus {
+        rollup(self.shells().into_iter().map(shell_status))
     }
 
     /// The shell in `direction` from the focused one, or `None` at the edge of
@@ -257,6 +269,17 @@ impl Workspace {
         self.tabs.iter().flat_map(Tab::shells).collect()
     }
 
+    /// What this workspace rolls up to, given a way to ask what each of its
+    /// shells is doing.
+    ///
+    /// The same shell lookup a tab takes, applied to every tab: a workspace's
+    /// badge is the fold over its tabs' badges, and its tabs' badges are the
+    /// fold over their shells'. A workspace with nothing open rolls up to
+    /// [`RollupStatus::None`], which is what it should show.
+    pub fn status(&self, mut shell_status: impl FnMut(ShellId) -> RollupStatus) -> RollupStatus {
+        rollup(self.tabs.iter().map(|tab| tab.status(&mut shell_status)))
+    }
+
     /// Which tab holds `shell`.
     pub fn tab_of(&self, shell: ShellId) -> Option<TabId> {
         self.tabs
@@ -283,8 +306,27 @@ fn default_name(path: &Path) -> String {
 mod tests {
     use super::*;
 
+    use agentbus_protocol::SessionStatus::{self, Blocked, Done, Idle, Working};
+
+    use crate::rollup::shell_status;
+
     fn workspace() -> Workspace {
         Workspace::new(WorkspaceId::from_raw(9), "/home/someone/projects/thing")
+    }
+
+    /// A lookup over a list of `(shell, the sessions attributed to it)`. A
+    /// shell that is not named hosts nothing, which is how most of them are.
+    fn attributed<'a>(
+        sessions: &'a [(ShellId, &'a [SessionStatus])],
+    ) -> impl FnMut(ShellId) -> RollupStatus + 'a {
+        move |shell| {
+            sessions
+                .iter()
+                .find(|(id, _)| *id == shell)
+                .map_or(RollupStatus::None, |(_, statuses)| {
+                    shell_status(statuses.iter().copied())
+                })
+        }
     }
 
     #[test]
@@ -408,6 +450,88 @@ mod tests {
         assert!(!workspace.settings().devcontainer);
         workspace.settings_mut().devcontainer = true;
         assert!(workspace.settings().devcontainer);
+    }
+
+    #[test]
+    fn a_tab_shows_the_most_urgent_thing_happening_in_any_of_its_shells() {
+        let mut workspace = workspace();
+        let tab = workspace.open_tab("one");
+        let first = workspace.tab(tab).unwrap().focused();
+        let second = workspace.split(tab, first, Direction::Right).unwrap();
+        let third = workspace.split(tab, second, Direction::Down).unwrap();
+        let tab = workspace.tab(tab).unwrap();
+
+        // The blocked session is not in the focused shell, is not first in the
+        // arrangement, and shares its shell with a finished one.
+        assert_eq!(
+            tab.status(attributed(&[
+                (first, &[Working]),
+                (second, &[Done, Blocked]),
+                (third, &[]),
+            ])),
+            RollupStatus::from(Blocked)
+        );
+    }
+
+    #[test]
+    fn a_tab_whose_shells_are_all_finished_is_finished_and_one_with_nothing_in_it_is_none() {
+        let mut workspace = workspace();
+        let tab = workspace.open_tab("one");
+        let first = workspace.tab(tab).unwrap().focused();
+        let second = workspace.split(tab, first, Direction::Right).unwrap();
+        let tab = workspace.tab(tab).unwrap();
+
+        assert_eq!(
+            tab.status(attributed(&[(first, &[Done]), (second, &[Done])])),
+            RollupStatus::from(Done)
+        );
+        assert_eq!(tab.status(attributed(&[])), RollupStatus::None);
+    }
+
+    #[test]
+    fn a_workspace_rolls_up_through_its_tabs_and_their_shells() {
+        let mut workspace = workspace();
+        let quiet = workspace.open_tab("quiet");
+        let waiting = workspace.open_tab("waiting");
+        let busy = workspace.open_tab("busy");
+        let editing = workspace.tab(quiet).unwrap().focused();
+        let finished = workspace.tab(waiting).unwrap().focused();
+        let first = workspace.tab(busy).unwrap().focused();
+        let second = workspace.split(busy, first, Direction::Right).unwrap();
+
+        let sessions: [(ShellId, &[SessionStatus]); 4] = [
+            (editing, &[]),
+            (finished, &[Idle]),
+            (first, &[Working]),
+            (second, &[Done, Blocked]),
+        ];
+
+        assert_eq!(
+            workspace.tab(quiet).unwrap().status(attributed(&sessions)),
+            RollupStatus::None
+        );
+        assert_eq!(
+            workspace
+                .tab(waiting)
+                .unwrap()
+                .status(attributed(&sessions)),
+            RollupStatus::from(Idle)
+        );
+        assert_eq!(
+            workspace.tab(busy).unwrap().status(attributed(&sessions)),
+            RollupStatus::from(Blocked)
+        );
+        // One tab blocked, one idle and one hosting nothing at all: the
+        // workspace is blocked, three levels up from the session that is.
+        assert_eq!(
+            workspace.status(attributed(&sessions)),
+            RollupStatus::from(Blocked)
+        );
+    }
+
+    #[test]
+    fn a_workspace_with_nothing_open_is_none() {
+        assert_eq!(workspace().status(attributed(&[])), RollupStatus::None);
     }
 
     #[test]

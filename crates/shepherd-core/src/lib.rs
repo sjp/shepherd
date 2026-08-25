@@ -36,10 +36,12 @@
 
 pub mod correlation;
 pub mod ids;
+pub mod rollup;
 pub mod split;
 pub mod workspace;
 
 pub use correlation::{CorrelationError, correlation_for, parse_correlation};
 pub use ids::{ShellId, ShellIds, TabId, TabIds, WorkspaceId, WorkspaceIds};
+pub use rollup::{RollupStatus, rollup, shell_status};
 pub use split::{Axis, Branch, Closed, Direction, PlacedShell, Rect, Split, SplitTree};
 pub use workspace::{Tab, Workspace, WorkspaceSettings};
