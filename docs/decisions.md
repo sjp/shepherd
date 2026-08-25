@@ -2298,3 +2298,100 @@ rather than what was running when it was set. A look that finds nothing leaves
 the shell with no name rather than with the last one it had: a terminal with
 nothing in front of it is a real answer, and holding on to the name of something
 that has exited would be the one kind of wrong that never corrects itself.
+
+## 2026-08-25 — what survives closing the window
+
+### The configuration file follows each platform's own convention, resolved without a crate
+
+**`~/Library/Application Support/Shepherd/config.toml` on macOS,
+`%APPDATA%\Shepherd\config.toml` on Windows, and
+`$XDG_CONFIG_HOME/shepherd/config.toml` — falling back to `~/.config` —
+everywhere else; `SHEPHERD_CONFIG` names the file outright and wins.** The bus's
+own files are XDG on every platform, and that is right for the bus: it is a
+command-line program provisioned onto servers, where the people who go looking
+for its files expect them under `~/.config` whatever the machine is. Shepherd is
+a desktop application, and the person who goes looking for *its* file on a Mac
+opens Finder's *Go to Folder*. Following each platform is what makes the file
+findable by whoever wants to look, which is the only reason its location matters
+at all.
+
+Which of the three applies is a value, not a `cfg` at the point a path is built,
+so all three rules can be read in one place and all three are asserted from
+tests that run on any host. That is also the answer to Windows here: a directory
+name is data, and there is nothing about it to leave unimplemented.
+
+No dependency. The rules are twenty lines, they are already written down twice in
+this workspace for the bus's own directories, and a crate that answers this
+question answers a dozen others as well. What the crate is worth avoiding for is
+not its size: it decides, on this repository's behalf and revisably, what these
+conventions are.
+
+The environment is read through a closure the caller supplies rather than
+directly, which is what lets a test hold a machine's variables still without
+setting any — a process-wide thing to set, in a test binary that runs its tests
+on threads of one process.
+
+### What is saved is shape, in types that could not hold anything else
+
+**The serialized form is four `struct`s of this module's own, and the model's own
+types carry no `serde` derive at all.** The rule the whole design rests on is
+that a restored shell is a fresh process — the layout comes back, the terminals
+do not — and a rule like that is worth making structural rather than
+remembering. Deriving on the model would mean every field ever added to a
+`Workspace`, a `Tab` or a shell is saved by default and has to be opted *out* of;
+as it stands a field reaches the file only by somebody writing it into a type
+whose entire purpose is to be the file. The cost is one conversion each way, and
+the conversion is where the checking has to happen anyway.
+
+The checking is the other half. Something arriving whole from a file somebody may
+have edited cannot be assumed to satisfy invariants that splitting and closing
+maintain step by step, so the model grew constructors that rebuild and verify at
+the same time — `SplitTree::split_of`, `Tab::restore`, `Workspace::restore`,
+`Layout::restore` — and each reports what is untrue rather than correcting it.
+Two rules are deliberately forgiving instead, because for them there is a right
+answer and no ambiguity about it: a tab that does not say what is focused focuses
+its first shell, and shares that do not sum to one are rescaled so that they do.
+Shares that *do* already sum to one are left untouched to the bit, which is what
+makes saving and loading a layout nobody has touched a fixed point.
+
+Restored runs of ids continue after the highest id still in use rather than after
+the highest ever used. The numbers a previous run handed out and closed are free
+again because nothing outside this process remembers them across a restart —
+every shell in a restored workspace has yet to be started, and will be given a
+correlation made from the id it ends up with.
+
+### A tab's arrangement is one line, in a grammar of its own
+
+**`h(0.5:s0, 0.5:v(0.25:s1, 0.75:s2))`, parsed and written by about a hundred
+lines beside the file's own format.** The arrangement is the one recursive thing
+being saved and TOML is not a recursive format to read: three splits deep spells
+out as `[[workspace.tab.layout.children.children]]`, which no amount of
+formatting rescues and which would swallow the tab's other fields entirely.
+
+The deciding argument is what comes back when it is wrong, though. A file's
+general-purpose reader, offered a choice between the two shapes an arrangement
+can take, can say only that neither matched. This says which character it stopped
+at and what would have been valid there, and hands the arrangement's own rules
+— at least two children, no split nested on its own axis, no shell in two places
+— back as the sentences that module already writes. That is the difference
+between a person fixing their file and a person deleting it.
+
+### A save is the whole file, on every change, and never over one that was not understood
+
+**Written as a complete file renamed over the old one, after anything that
+changes the arrangement, and skipped entirely when it would write what is already
+there.** The alternatives lose work in the case that matters: on-quit loses
+everything to a process that is killed rather than asked to stop, and a debounce
+is a timer to drive that still loses its last interval. What a person does to a
+layout — open a workspace, open a tab, split a shell — happens a few times a
+minute, so there is nothing here worth batching, and comparing against what was
+last written means a caller may call it after anything without thinking about
+whether that anything changed something.
+
+**A file that could not be read is held, and `save` refuses until something says
+otherwise.** Reporting a corrupt file and then carrying on from an empty model is
+the sequence where a user is told about the problem and then has the file
+describing their nine workspaces replaced the moment they open a tab. Holding it
+makes that impossible without a deliberate second act; the version is read before
+the shape for the same reason, so that a file a later build wrote is recognised
+as one rather than parsed into whatever this build can make of it.

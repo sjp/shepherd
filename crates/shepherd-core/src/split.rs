@@ -35,6 +35,11 @@
 //! at a larger scale. Getting that wrong is invisible until there is a window
 //! open, and awkward to correct once one is.
 
+use std::collections::BTreeSet;
+use std::fmt;
+
+use thiserror::Error;
+
 use crate::ids::ShellId;
 
 #[cfg(test)]
@@ -46,6 +51,17 @@ mod tests;
 /// halved and rescaled, so shared edges agree to within rounding error rather
 /// than exactly.
 const ADJACENCY: f32 = 1e-4;
+
+/// How far a split's shares may be from summing to one before
+/// [`SplitTree::split_of`] rescales them.
+///
+/// Shares that already sum to one are left exactly as they are, so that a tree
+/// taken apart and put back together is the tree it was — dividing every share
+/// by a total of `0.99999994` would not be. What the tolerance is for is the
+/// arrangement somebody wrote by hand, where `1` and `1` plainly means half
+/// each; a difference this small cannot move an edge by a whole pixel on any
+/// window anybody has.
+const SHARES_TOLERANCE: f32 = 1e-3;
 
 /// The axis a split arranges its children along.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -63,6 +79,15 @@ impl Axis {
             Self::Horizontal => Self::Vertical,
             Self::Vertical => Self::Horizontal,
         }
+    }
+}
+
+impl fmt::Display for Axis {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Horizontal => "horizontal",
+            Self::Vertical => "vertical",
+        })
     }
 }
 
@@ -189,6 +214,15 @@ pub struct Branch {
 }
 
 impl Branch {
+    /// A child taking `size` of its split's space.
+    ///
+    /// Nothing is checked here, because a share only means anything alongside
+    /// its siblings: whether it is one this module would build is decided by
+    /// [`SplitTree::split_of`], which can see all of them.
+    pub fn new(size: f32, tree: SplitTree) -> Self {
+        Self { size, tree }
+    }
+
     /// This child's share of its split's space, as a fraction. The shares of
     /// one split's children sum to one.
     pub fn size(&self) -> f32 {
@@ -328,6 +362,26 @@ impl Split {
     }
 }
 
+/// Why an arrangement is not one this module will build. See
+/// [`SplitTree::split_of`].
+#[derive(Debug, Clone, Copy, PartialEq, Error)]
+pub enum MalformedSplit {
+    /// A split dividing its space between fewer than two children, which is
+    /// the child rather than a split.
+    #[error("a split divides its space between at least two children, and this one has {0}")]
+    TooFewChildren(usize),
+    /// A split holding another split on its own axis: the same picture written
+    /// two ways, which is the one thing the tree's shape rules out.
+    #[error("a {0} split holds another one, which is the same arrangement written twice")]
+    NestedAxis(Axis),
+    /// A share that is not a fraction of anything.
+    #[error("a child's share of a split is {0}, and a share is a positive fraction")]
+    Share(f32),
+    /// One shell in two places at once.
+    #[error("shell {0} is in the arrangement more than once")]
+    DuplicateShell(ShellId),
+}
+
 /// What closing a shell did to the tree it was in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Closed {
@@ -358,6 +412,49 @@ impl SplitTree {
     /// A tree of one shell, which is what a new tab starts as.
     pub fn leaf(shell: ShellId) -> Self {
         Self::Leaf(shell)
+    }
+
+    /// `children` divided along `axis`, for an arrangement being rebuilt from
+    /// somewhere else rather than grown by splitting.
+    ///
+    /// Splitting and closing maintain this module's invariants step by step;
+    /// something arriving whole — a layout read back off disk, which is the
+    /// only way to get here — has to be checked against them instead, because
+    /// nothing about the file it came out of stops it describing an
+    /// arrangement that could never have been built. What is checked is
+    /// exactly what the invariants say: at least two children, no child split
+    /// on this same axis, a positive share each, and no shell appearing twice.
+    ///
+    /// Shares that do not sum to one are rescaled so that they do; shares that
+    /// already do are untouched. See [`SHARES_TOLERANCE`].
+    pub fn split_of(axis: Axis, children: Vec<Branch>) -> Result<Self, MalformedSplit> {
+        if children.len() < 2 {
+            return Err(MalformedSplit::TooFewChildren(children.len()));
+        }
+
+        let mut seen = BTreeSet::new();
+        for branch in &children {
+            if !branch.size.is_finite() || branch.size <= 0.0 {
+                return Err(MalformedSplit::Share(branch.size));
+            }
+            if let Self::Split(inner) = &branch.tree
+                && inner.axis == axis
+            {
+                return Err(MalformedSplit::NestedAxis(axis));
+            }
+            for shell in branch.tree.shells() {
+                if !seen.insert(shell) {
+                    return Err(MalformedSplit::DuplicateShell(shell));
+                }
+            }
+        }
+
+        let mut split = Split { axis, children };
+        let total: f32 = split.children.iter().map(Branch::size).sum();
+        if (total - 1.0).abs() > SHARES_TOLERANCE {
+            split.rescale();
+        }
+        Ok(Self::Split(split))
     }
 
     /// The shell here, if this is a leaf rather than a split.

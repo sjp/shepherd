@@ -475,3 +475,126 @@ fn a_direction_knows_its_axis_and_which_way_along_it_points() {
     assert_eq!(Axis::Horizontal.perpendicular(), Axis::Vertical);
     assert_eq!(Axis::Vertical.perpendicular(), Axis::Horizontal);
 }
+
+#[test]
+fn an_arrangement_built_whole_is_the_one_splitting_would_have_produced() {
+    let mut grown = SplitTree::leaf(shell(0));
+    grown.split(shell(0), Direction::Right, shell(1));
+    grown.split(shell(1), Direction::Down, shell(2));
+
+    let built = SplitTree::split_of(
+        Axis::Horizontal,
+        vec![
+            Branch::new(0.5, SplitTree::leaf(shell(0))),
+            Branch::new(
+                0.5,
+                SplitTree::split_of(
+                    Axis::Vertical,
+                    vec![
+                        Branch::new(0.5, SplitTree::leaf(shell(1))),
+                        Branch::new(0.5, SplitTree::leaf(shell(2))),
+                    ],
+                )
+                .expect("a column of two"),
+            ),
+        ],
+    )
+    .expect("a row of two, the second a column");
+
+    assert_eq!(built, grown);
+}
+
+#[test]
+fn an_arrangement_that_breaks_an_invariant_is_refused_rather_than_built() {
+    let column = || {
+        SplitTree::split_of(
+            Axis::Vertical,
+            vec![
+                Branch::new(0.5, SplitTree::leaf(shell(1))),
+                Branch::new(0.5, SplitTree::leaf(shell(2))),
+            ],
+        )
+        .expect("a column of two")
+    };
+
+    assert_eq!(
+        SplitTree::split_of(
+            Axis::Vertical,
+            vec![Branch::new(1.0, SplitTree::leaf(shell(0)))]
+        ),
+        Err(MalformedSplit::TooFewChildren(1))
+    );
+    assert_eq!(
+        SplitTree::split_of(Axis::Vertical, Vec::new()),
+        Err(MalformedSplit::TooFewChildren(0))
+    );
+    assert_eq!(
+        SplitTree::split_of(
+            Axis::Vertical,
+            vec![
+                Branch::new(0.5, SplitTree::leaf(shell(0))),
+                Branch::new(0.5, column()),
+            ]
+        ),
+        Err(MalformedSplit::NestedAxis(Axis::Vertical)),
+        "a column inside a column is a column"
+    );
+    assert_eq!(
+        SplitTree::split_of(
+            Axis::Horizontal,
+            vec![
+                Branch::new(0.5, SplitTree::leaf(shell(1))),
+                Branch::new(0.5, column()),
+            ]
+        ),
+        Err(MalformedSplit::DuplicateShell(shell(1))),
+        "a shell cannot be in two places at once"
+    );
+    for share in [0.0, -0.5, f32::NAN, f32::INFINITY] {
+        assert!(
+            matches!(
+                SplitTree::split_of(
+                    Axis::Horizontal,
+                    vec![
+                        Branch::new(share, SplitTree::leaf(shell(0))),
+                        Branch::new(0.5, SplitTree::leaf(shell(1))),
+                    ]
+                ),
+                Err(MalformedSplit::Share(_))
+            ),
+            "{share} was taken as a share of a split"
+        );
+    }
+}
+
+#[test]
+fn shares_are_rescaled_only_when_they_do_not_already_divide_the_space() {
+    let built = SplitTree::split_of(
+        Axis::Horizontal,
+        vec![
+            Branch::new(3.0, SplitTree::leaf(shell(0))),
+            Branch::new(1.0, SplitTree::leaf(shell(1))),
+        ],
+    )
+    .expect("a row of two");
+    assert_eq!(
+        placed(&built),
+        vec![
+            (0, Rect::new(0.0, 0.0, 0.75, 1.0)),
+            (1, Rect::new(0.75, 0.0, 0.25, 1.0)),
+        ]
+    );
+
+    // A tree that has been closed down to size has shares that sum to one to
+    // within rounding, and rebuilding it must not disturb them.
+    let mut grown = SplitTree::leaf(shell(0));
+    for added in 1..5 {
+        grown.split(shell(added - 1), Direction::Right, shell(added));
+    }
+    grown.close(shell(2));
+    let SplitTree::Split(row) = &grown else {
+        panic!("a row of four");
+    };
+    let rebuilt = SplitTree::split_of(row.axis(), row.children().to_vec()).expect("the same row");
+    assert_eq!(rebuilt, grown);
+}

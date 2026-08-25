@@ -59,11 +59,19 @@
 //! process the kernel has in front of it, so a shell is called after whatever it
 //! is currently running and renames itself when that changes — unless somebody
 //! has named it themselves, which wins for as long as it stands.
+//!
+//! # The half that outlives the process
+//!
+//! [`Config`] is the file a [`Layout`] — every workspace, and everything open in
+//! each of them — is kept in between runs. What is saved is the arrangement and
+//! nothing else: a restored shell is a fresh process started where the last one
+//! was, because nothing here holds a terminal open across a restart.
 
 #![warn(missing_docs)]
 
 pub mod attribution;
 pub mod bus;
+pub mod config;
 pub mod correlation;
 pub mod ids;
 pub mod naming;
@@ -74,12 +82,15 @@ pub mod workspace;
 
 pub use attribution::{Attribution, ShellStatus, status_source};
 pub use bus::{BusState, Subscriber, SubscriberHandle, Update};
+pub use config::{CONFIG_VAR, Config, ConfigError, TreeError};
 pub use correlation::{CorrelationError, correlation_for, parse_correlation};
 pub use ids::{ShellAddress, ShellId, ShellIds, TabId, TabIds, WorkspaceId, WorkspaceIds};
 pub use naming::{FOREGROUND_INTERVAL, Foreground, ForegroundProcess, Kernel, Pid, ShellName};
 pub use rollup::{RollupStatus, rollup, shell_status};
-pub use split::{Axis, Branch, Closed, Direction, PlacedShell, Rect, Split, SplitTree};
+pub use split::{
+    Axis, Branch, Closed, Direction, MalformedSplit, PlacedShell, Rect, Split, SplitTree,
+};
 pub use terminal::{
     CORRELATION_VAR, Device, Program, Shell, ShellOptions, ShellSize, ShellState, SpawnError,
 };
-pub use workspace::{Tab, Workspace, WorkspaceSettings};
+pub use workspace::{Layout, MalformedLayout, Tab, Workspace, WorkspaceSettings};

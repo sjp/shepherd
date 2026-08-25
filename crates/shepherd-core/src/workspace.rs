@@ -13,12 +13,38 @@
 //! that being disturbed, and it means the questions asked of the arrangement
 //! can be answered by tests that start no processes.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use thiserror::Error;
+
 use crate::correlation::correlation_for;
-use crate::ids::{ShellId, ShellIds, TabId, TabIds, WorkspaceId};
+use crate::ids::{ShellId, ShellIds, TabId, TabIds, WorkspaceId, WorkspaceIds};
 use crate::rollup::{RollupStatus, rollup};
 use crate::split::{Closed, Direction, SplitTree};
+
+/// Why an arrangement restored from somewhere else is not one this model would
+/// have produced.
+///
+/// Everything here is a uniqueness or a membership rule that the model
+/// maintains as it goes — ids are handed out once, focus is only ever set to a
+/// shell the tab holds — and that therefore has to be checked at the one place
+/// something arrives already assembled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum MalformedLayout {
+    /// A tab focused on a shell that is somewhere else, or nowhere.
+    #[error("the tab is focused on shell {0}, which is not in it")]
+    FocusElsewhere(ShellId),
+    /// Two tabs of one workspace with the same id.
+    #[error("two tabs are both tab {0}")]
+    DuplicateTab(TabId),
+    /// One shell in two of a workspace's tabs.
+    #[error("shell {0} is in more than one tab")]
+    DuplicateShell(ShellId),
+    /// Two workspaces with the same id.
+    #[error("two workspaces are both workspace {0}")]
+    DuplicateWorkspace(WorkspaceId),
+}
 
 /// What a person has chosen about how work in one workspace is run.
 ///
@@ -44,6 +70,35 @@ pub struct Tab {
 }
 
 impl Tab {
+    /// A tab put back together from a description of one.
+    ///
+    /// `focused` is where keystrokes should go; a description that does not say
+    /// gets the first shell in the arrangement, which is the one somebody
+    /// opening a tab would have been typing in anyway. One that names a shell
+    /// this tab does not hold is refused rather than corrected: it says
+    /// something about the arrangement that is not true, and quietly focusing
+    /// something else would hide that.
+    pub fn restore(
+        id: TabId,
+        name: impl Into<String>,
+        tree: SplitTree,
+        focused: Option<ShellId>,
+    ) -> Result<Self, MalformedLayout> {
+        let focused = match focused {
+            Some(shell) if !tree.contains(shell) => {
+                return Err(MalformedLayout::FocusElsewhere(shell));
+            }
+            Some(shell) => shell,
+            None => tree.first_shell(),
+        };
+        Ok(Self {
+            id,
+            name: name.into(),
+            tree,
+            focused,
+        })
+    }
+
     /// This tab's id, unique within its workspace.
     pub fn id(&self) -> TabId {
         self.id
@@ -146,6 +201,52 @@ impl Workspace {
             tab_ids: TabIds::new(),
             shell_ids: ShellIds::new(),
         }
+    }
+
+    /// A workspace put back together from a description of one.
+    ///
+    /// Both runs of ids continue after the highest one still in use, so nothing
+    /// handed out from here on collides with a tab or a shell that was
+    /// restored. They do not continue after the highest one *ever* used: the
+    /// numbers a previous run handed out and then closed are free again,
+    /// because nothing outside this process remembers them across a restart —
+    /// every shell in a restored workspace is a process that has yet to be
+    /// started.
+    pub fn restore(
+        id: WorkspaceId,
+        path: impl Into<PathBuf>,
+        name: impl Into<String>,
+        settings: WorkspaceSettings,
+        tabs: Vec<Tab>,
+    ) -> Result<Self, MalformedLayout> {
+        let mut seen_tabs = BTreeSet::new();
+        let mut seen_shells = BTreeSet::new();
+        for tab in &tabs {
+            if !seen_tabs.insert(tab.id) {
+                return Err(MalformedLayout::DuplicateTab(tab.id));
+            }
+            for shell in tab.shells() {
+                if !seen_shells.insert(shell) {
+                    return Err(MalformedLayout::DuplicateShell(shell));
+                }
+            }
+        }
+
+        Ok(Self {
+            id,
+            path: path.into(),
+            name: name.into(),
+            settings,
+            tabs,
+            tab_ids: match seen_tabs.last() {
+                Some(&last) => TabIds::resuming_after(last),
+                None => TabIds::new(),
+            },
+            shell_ids: match seen_shells.last() {
+                Some(&last) => ShellIds::resuming_after(last),
+                None => ShellIds::new(),
+            },
+        })
     }
 
     /// This workspace's id.
@@ -295,8 +396,89 @@ impl Workspace {
     }
 }
 
+/// Everything open: the workspaces, and the run of ids the next one will be
+/// named from.
+///
+/// This is the whole of the application's shape, and it is the whole of what is
+/// saved between runs. It exists as a type rather than as a bare list because
+/// the run of ids is part of the answer: a list restored from a description
+/// says which workspaces there are, and something has to know which number the
+/// next one somebody opens may safely have.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Layout {
+    workspaces: Vec<Workspace>,
+    ids: WorkspaceIds,
+}
+
+impl Layout {
+    /// Nothing open, which is what a first run has.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A layout put back together from a description of one.
+    ///
+    /// The run of ids continues after the highest workspace restored, for the
+    /// same reason [`Workspace::restore`] gives.
+    pub fn restore(workspaces: Vec<Workspace>) -> Result<Self, MalformedLayout> {
+        let mut seen = BTreeSet::new();
+        for workspace in &workspaces {
+            if !seen.insert(workspace.id) {
+                return Err(MalformedLayout::DuplicateWorkspace(workspace.id));
+            }
+        }
+        Ok(Self {
+            workspaces,
+            ids: match seen.last() {
+                Some(&last) => WorkspaceIds::resuming_after(last),
+                None => WorkspaceIds::new(),
+            },
+        })
+    }
+
+    /// The open workspaces, in the order they were added.
+    pub fn workspaces(&self) -> &[Workspace] {
+        &self.workspaces
+    }
+
+    /// Whether nothing is open at all.
+    pub fn is_empty(&self) -> bool {
+        self.workspaces.is_empty()
+    }
+
+    /// One workspace by id.
+    pub fn workspace(&self, id: WorkspaceId) -> Option<&Workspace> {
+        self.workspaces.iter().find(|workspace| workspace.id == id)
+    }
+
+    /// One workspace by id, to change.
+    pub fn workspace_mut(&mut self, id: WorkspaceId) -> Option<&mut Workspace> {
+        self.workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == id)
+    }
+
+    /// Adds a workspace for `path`, with no tabs open in it yet.
+    ///
+    /// The same folder may be opened twice: they are two workspaces with two
+    /// sets of tabs, and nothing about one folder makes that a mistake.
+    pub fn open(&mut self, path: impl Into<PathBuf>) -> WorkspaceId {
+        let id = self.ids.allocate();
+        self.workspaces.push(Workspace::new(id, path));
+        id
+    }
+
+    /// Closes a workspace and everything in it. Answers whether there was such
+    /// a workspace.
+    pub fn close(&mut self, id: WorkspaceId) -> bool {
+        let before = self.workspaces.len();
+        self.workspaces.retain(|workspace| workspace.id != id);
+        self.workspaces.len() != before
+    }
+}
+
 /// What a workspace on `path` is called before anybody renames it.
-fn default_name(path: &Path) -> String {
+pub(crate) fn default_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
@@ -532,6 +714,151 @@ mod tests {
     #[test]
     fn a_workspace_with_nothing_open_is_none() {
         assert_eq!(workspace().status(attributed(&[])), RollupStatus::None);
+    }
+
+    /// The arrangement `shells` are in, side by side.
+    fn row(shells: &[u32]) -> SplitTree {
+        let mut tree = SplitTree::leaf(ShellId::from_raw(shells[0]));
+        for pair in shells.windows(2) {
+            tree.split(
+                ShellId::from_raw(pair[0]),
+                Direction::Right,
+                ShellId::from_raw(pair[1]),
+            );
+        }
+        tree
+    }
+
+    fn tab(id: u32, shells: &[u32]) -> Tab {
+        Tab::restore(TabId::from_raw(id), "", row(shells), None).expect("nothing is focused")
+    }
+
+    #[test]
+    fn a_restored_tab_is_focused_where_it_was_told_or_on_its_first_shell() {
+        let shell = ShellId::from_raw(2);
+        assert_eq!(
+            Tab::restore(TabId::FIRST, "one", row(&[1, 2, 3]), Some(shell))
+                .expect("the tab holds that shell")
+                .focused(),
+            shell
+        );
+        assert_eq!(
+            tab(0, &[1, 2, 3]).focused(),
+            ShellId::from_raw(1),
+            "the arrangement's first shell takes focus"
+        );
+        assert_eq!(
+            Tab::restore(
+                TabId::FIRST,
+                "one",
+                row(&[1, 2]),
+                Some(ShellId::from_raw(9))
+            ),
+            Err(MalformedLayout::FocusElsewhere(ShellId::from_raw(9)))
+        );
+    }
+
+    #[test]
+    fn a_restored_workspace_carries_on_after_the_ids_it_holds() {
+        let mut restored = Workspace::restore(
+            WorkspaceId::from_raw(1),
+            "/home/someone/projects/thing",
+            "thing",
+            WorkspaceSettings::default(),
+            vec![tab(0, &[0, 1]), tab(4, &[7])],
+        )
+        .expect("nothing is in two places");
+
+        let opened = restored.open_tab("next");
+        assert_eq!(opened, TabId::from_raw(5), "after the highest tab restored");
+        let fresh = restored
+            .split(
+                opened,
+                restored.tab(opened).unwrap().focused(),
+                Direction::Down,
+            )
+            .expect("the tab was just opened");
+        assert_eq!(
+            fresh,
+            ShellId::from_raw(9),
+            "after the highest shell restored, and the one the new tab took"
+        );
+    }
+
+    #[test]
+    fn a_workspace_that_holds_one_thing_twice_is_refused() {
+        let restore = |tabs| {
+            Workspace::restore(
+                WorkspaceId::FIRST,
+                "/home/someone/projects/thing",
+                "thing",
+                WorkspaceSettings::default(),
+                tabs,
+            )
+        };
+
+        assert_eq!(
+            restore(vec![tab(0, &[0, 1]), tab(0, &[2])]),
+            Err(MalformedLayout::DuplicateTab(TabId::FIRST))
+        );
+        assert_eq!(
+            restore(vec![tab(0, &[0, 1]), tab(1, &[1])]),
+            Err(MalformedLayout::DuplicateShell(ShellId::from_raw(1)))
+        );
+    }
+
+    #[test]
+    fn a_layout_hands_out_a_workspace_id_per_folder_and_gives_them_back_on_closing() {
+        let mut layout = Layout::new();
+        assert!(layout.is_empty());
+
+        let first = layout.open("/home/someone/projects/thing");
+        let second = layout.open("/home/someone/projects/thing");
+        assert_ne!(first, second, "one folder opened twice is two workspaces");
+        assert_eq!(layout.workspaces().len(), 2);
+        assert_eq!(layout.workspace(first).map(Workspace::name), Some("thing"));
+
+        layout.workspace_mut(first).unwrap().set_name("renamed");
+        assert_eq!(
+            layout.workspace(first).map(Workspace::name),
+            Some("renamed")
+        );
+        assert_eq!(
+            layout.workspace(second).map(Workspace::name),
+            Some("thing"),
+            "the other workspace on the same folder is untouched"
+        );
+
+        assert!(layout.close(first));
+        assert!(!layout.close(first));
+        assert_eq!(layout.workspaces().len(), 1);
+        assert!(layout.close(second));
+        assert!(layout.is_empty());
+    }
+
+    #[test]
+    fn a_restored_layout_carries_on_after_the_workspaces_it_holds() {
+        let workspace = |id| Workspace::new(WorkspaceId::from_raw(id), "/home/someone/thing");
+
+        let mut restored =
+            Layout::restore(vec![workspace(0), workspace(3)]).expect("two workspaces");
+        assert_eq!(
+            restored.open("/home/someone/other"),
+            WorkspaceId::from_raw(4)
+        );
+
+        assert_eq!(
+            Layout::restore(vec![workspace(3), workspace(3)]),
+            Err(MalformedLayout::DuplicateWorkspace(WorkspaceId::from_raw(
+                3
+            )))
+        );
+        assert_eq!(
+            Layout::restore(Vec::new())
+                .expect("nothing open")
+                .open("/x"),
+            WorkspaceId::FIRST
+        );
     }
 
     #[test]
