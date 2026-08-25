@@ -45,6 +45,15 @@
 //! takes the workspaces as they are and the sessions as the bus reports them and
 //! says which shell each is running in. What it cannot place it says so about,
 //! rather than guessing.
+//!
+//! # The running half
+//!
+//! [`Shell`] is a slot in that model with a process actually in it: a terminal
+//! device, whatever is attached to it, and the grid of everything it has
+//! printed. It is where [`correlation_for`]'s string is put into the world —
+//! set in the process's environment before it starts, so that everything
+//! descending from it carries the same one — and it is read from continuously,
+//! whether or not anybody is looking at it.
 
 #![warn(missing_docs)]
 
@@ -54,6 +63,7 @@ pub mod correlation;
 pub mod ids;
 pub mod rollup;
 pub mod split;
+pub mod terminal;
 pub mod workspace;
 
 pub use attribution::{Attribution, ShellStatus, status_source};
@@ -62,4 +72,7 @@ pub use correlation::{CorrelationError, correlation_for, parse_correlation};
 pub use ids::{ShellAddress, ShellId, ShellIds, TabId, TabIds, WorkspaceId, WorkspaceIds};
 pub use rollup::{RollupStatus, rollup, shell_status};
 pub use split::{Axis, Branch, Closed, Direction, PlacedShell, Rect, Split, SplitTree};
+pub use terminal::{
+    CORRELATION_VAR, Device, Program, Shell, ShellOptions, ShellSize, ShellState, SpawnError,
+};
 pub use workspace::{Tab, Workspace, WorkspaceSettings};

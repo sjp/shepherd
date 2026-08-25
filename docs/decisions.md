@@ -2141,3 +2141,103 @@ line look like a gap — which would put every older subscriber into a
 reconnection loop against a daemon that had merely learned to say something
 new. `seq` belongs to the envelope rather than to any one kind, so it is read
 from a line whose kind cannot be.
+
+## 2026-08-25 — a real terminal behind every shell
+
+### One thread and one grid per shell, running whether or not anyone is looking
+
+**Every shell gets its own pseudo-terminal, its own `alacritty_terminal`
+`Term`, and its own reader thread, and there is no mechanism anywhere in
+`shepherd-core` for pausing any of them.** The library's own event loop is
+what does the reading, so this costs one thread per shell and nothing else is
+written; what the decision buys is that "the grid is live for every shell"
+becomes a property of the code's shape rather than a discipline the GUI has to
+keep. There is no `paused` flag to forget to clear and no visibility argument
+to thread through, because a later GUI cannot switch off something that was
+never built.
+
+The alternative — reading only the visible shell, or only the focused one —
+was rejected for a reason that outlives any performance argument: a status
+that is correct only for the shell being looked at is worse than no status,
+because nothing on screen distinguishes the two. If the cost ever matters, the
+answer is to make reading cheaper, not to stop.
+
+### The environment variable's name is written out, not imported
+
+**`shepherd-core` declares `AGENTBUS_PANE` as its own constant rather than
+depending on the crate that also declares it.** The two crates that define the
+same string today are the daemon and the CLI, and both are bus crates the GUI
+must not depend on. Writing the name out is what keeps the dependency arrow
+pointing one way: the bus is something this application talks to, and the whole
+of the contract between them is that a variable of that name carries a string
+the bus never looks inside.
+
+It is set last when a shell's environment is assembled, overwriting anything a
+caller asked for and anything the application itself inherited — a Shepherd
+started from inside somebody's correlated shell would otherwise hand its own
+parent's correlation to every shell it opened.
+
+### `TERM` is `xterm-256color`, and the process is told its cell size
+
+**A shell is started with `TERM=xterm-256color` unless its caller says
+otherwise.** The emulator implements a good deal more than that entry
+describes, but a terminfo name is only worth claiming if the machine running
+the shell has the entry installed — and shells here will run in fresh
+containers and on other people's servers. Claiming a name that is not there
+degrades every full-screen program far more than under-describing the terminal
+does.
+
+`ShellSize` carries a cell's pixel size alongside the column and row counts
+because the process is told all four: a program drawing at pixel resolution
+inside a terminal has no other way to know. Nothing in this crate draws, so it
+defaults to a plausible pair rather than measuring anything, and a GUI that has
+measured a font supplies the real one.
+
+### What the emulator asks back gets answered, except what needs a renderer
+
+**Sequences the process expects a reply to — device attributes, cursor
+position, the text area's size — are answered from the listener the emulator
+calls, and nothing else is.** The listener is called while the terminal's own
+lock is held, so it cannot read the grid; what it holds is a counter, an exit
+state and a way of writing back, which is exactly enough for those. A program
+that asks and is not answered waits out its own timeout, so leaving them
+unanswered would have been a visible stall rather than a missing feature.
+
+Colour queries and clipboard requests are deliberately not answered: the first
+wants the palette a renderer would have chosen and the second wants a
+clipboard, and neither exists yet. Answering either with a guess would be worse
+than the silence a program that asks already has to handle.
+
+### A revision counter rather than a change notification
+
+**`Shell::revision` counts how many times the grid's contents have changed, and
+nothing is pushed anywhere.** A renderer that has drawn a shell remembers the
+number and compares it, which tells it whether drawing again would produce a
+different picture without taking the terminal's lock to find out. A callback or
+a channel would have had to be designed against a renderer that does not exist,
+and a channel nobody drains is a queue that grows for as long as a shell is
+producing output.
+
+### The terminal device is duplicated at the one moment it can be
+
+**The controlling handle on a shell's pseudo-terminal is duplicated during
+spawn and kept for the shell's lifetime, behind a `Device` type that exists on
+every platform.** The terminal itself is given to the reader thread and is not
+shared, so spawn is the only moment anything else can hold on to it — and the
+questions worth asking through it (which process group has the terminal in
+front of it, and therefore what is actually running in a shell) are ones the
+grid cannot answer. Nothing asks yet.
+
+`Device` is a type rather than a raw descriptor so that the platform difference
+stays inside it: unix has a file descriptor, Windows' pseudo-console is a
+different kind of object answering a differently-shaped question, and the
+Windows arm is left `unimplemented!()` rather than compiled away so that adding
+it later does not mean unpicking `#[cfg]`s from every signature around it.
+
+### Ten thousand lines of scrollback, stated rather than inherited
+
+**`DEFAULT_SCROLLBACK` is 10,000 lines.** That happens to be what the emulator
+would have defaulted to, and it is written down anyway: a scrollback depth is a
+product decision, and one that is silently inherited from a dependency is one
+that could change under this repository without anybody noticing until output
+started disappearing.
