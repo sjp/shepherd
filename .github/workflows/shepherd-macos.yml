@@ -77,7 +77,10 @@ jobs:
           name=shepherd-$(workspace_version)-${{ inputs.triple }}
           mkdir -p dist
           cp -- "target/${{ inputs.triple }}/release/shepherd" "dist/$name"
-          chmod +x -- "dist/$name"
+          # No end-of-options marker after the mode: this machine's chmod stops
+          # reading options at the first operand, so the marker would be taken
+          # for a file and the step would fail on a name it invented itself.
+          chmod +x "dist/$name"
           printf 'name=%s\n' "$name" >>"$GITHUB_OUTPUT"
 
       # What to do with it, written where the person who asked for the build

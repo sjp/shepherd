@@ -9,6 +9,13 @@ updates:
       cargo:
         patterns:
           - "*"
+    ignore:
+      # Transitive only, and unreachable: gpui pins taffy to an exact version
+      # whose grid requirement is ^0.18, so no update can be applied here, and
+      # taffy never calls the affected expand_rows/expand_cols API. Drop this
+      # entry once gpui releases against taffy 0.13 or newer, which has no
+      # grid dependency at all.
+      - dependency-name: grid
 
   - package-ecosystem: github-actions
     directory: /

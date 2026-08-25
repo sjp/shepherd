@@ -91,7 +91,12 @@ built=target/$triple/release/agentbus
 asset=$outdir/agentbus-$version-$triple
 mkdir -p -- "$outdir"
 cp -- "$built" "$asset"
-chmod +x -- "$asset"
+# No end-of-options marker after the mode, unlike everywhere else here: two of
+# the four targets are built on a Mac, whose chmod stops reading options at the
+# first operand and would take the marker for a file that does not exist. There
+# is nothing for it to protect against anyway — the name is this script's own
+# and begins with a letter.
+chmod +x "$asset"
 
 # Statically linked means two absences: no PT_INTERP, so no dynamic loader is
 # named, and no DT_NEEDED, so no shared library is wanted. A static PIE keeps a
