@@ -39,16 +39,12 @@ pub struct Live {
     host: Host,
     state: BusState,
     attribution: Attribution,
-    /// The shell this window is showing, so that a session arriving in it can be
-    /// said out loud. With no sidebar to draw a badge on, saying it is how it is
-    /// seen.
-    watching: ShellAddress,
 }
 
 impl Live {
     /// Starts reading whichever bus this environment names, and starts a daemon
     /// for it if nobody else has.
-    pub fn watching(shell: ShellAddress) -> Self {
+    pub fn new() -> Self {
         let paths = SocketPaths::resolve();
         info!(dir = %paths.dir().display(), "reading the bus");
         Self {
@@ -57,7 +53,6 @@ impl Live {
             host: Host::from_env(),
             state: BusState::new(),
             attribution: Attribution::default(),
-            watching: shell,
         }
     }
 
@@ -89,16 +84,8 @@ impl Live {
         let attribution = Attribution::derive(workspaces, self.state.sessions());
         let moved = attribution != self.attribution;
         if moved {
-            // Said only when it is *this* shell that changed. A session
-            // appearing somewhere else moves the attribution and is nothing to
-            // do with the shell being watched, and saying so again every time
-            // one did would bury the line that matters.
-            let said = self.attribution.sessions_at(self.watching)
-                != attribution.sessions_at(self.watching);
-            self.attribution = attribution;
-            if said {
-                self.report();
-            }
+            let before = std::mem::replace(&mut self.attribution, attribution);
+            self.report(&before);
         }
         let presence = was != *self.lifecycle.presence();
         if presence {
@@ -122,28 +109,50 @@ impl Live {
         self.attribution.elsewhere().len()
     }
 
-    /// Says what is now running in the shell being watched.
+    /// Says what is now running in each shell that changed.
     ///
-    /// Written out in full — which agent, which session, what it is doing and on
-    /// whose word — because this is the record that says the join worked, and a
-    /// count would not be.
-    fn report(&self) {
-        let sessions = self.attribution.sessions_at(self.watching);
-        if sessions.is_empty() {
-            info!(shell = %self.watching.shell, "nothing is running in this shell");
-            return;
+    /// Only the shells that changed: a session appearing in one moves the whole
+    /// attribution, and saying every shell over again each time one did would
+    /// bury the line that matters. Each is written out in full — which agent,
+    /// which session, what it is doing and on whose word — because this is the
+    /// record that says the join worked, and a count would not be.
+    fn report(&self, before: &Attribution) {
+        for shell in self.changed(before) {
+            let sessions = self.attribution.sessions_at(shell);
+            if sessions.is_empty() {
+                info!(shell = %shell.shell, "nothing is running in this shell");
+                continue;
+            }
+            for session in sessions {
+                info!(
+                    shell = %shell.shell,
+                    agent = %session.agent,
+                    session = %session.session,
+                    status = %session.status,
+                    source = %status_source(session),
+                    correlation = session.correlation.as_deref().unwrap_or("none"),
+                    "an agent session is attributed to this shell"
+                );
+            }
         }
-        for session in sessions {
-            info!(
-                shell = %self.watching.shell,
-                agent = %session.agent,
-                session = %session.session,
-                status = %session.status,
-                source = %status_source(session),
-                correlation = session.correlation.as_deref().unwrap_or("none"),
-                "an agent session is attributed to this shell"
-            );
-        }
+    }
+
+    /// The shells whose sessions are not what they were.
+    ///
+    /// Both sides are walked, because a shell that has just had its last
+    /// session taken away is absent from one of them and is exactly the change
+    /// worth reporting.
+    fn changed(&self, before: &Attribution) -> Vec<ShellAddress> {
+        let mut changed: Vec<ShellAddress> = self
+            .attribution
+            .shells()
+            .chain(before.shells())
+            .map(|(shell, _)| shell)
+            .filter(|shell| before.sessions_at(*shell) != self.attribution.sessions_at(*shell))
+            .collect();
+        changed.sort_unstable();
+        changed.dedup();
+        changed
     }
 
     /// Says what became of the bus, when that changes.

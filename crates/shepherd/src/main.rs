@@ -1,16 +1,16 @@
 //! The Shepherd binary.
 //!
-//! One window with one shell in it, and the event bus read behind it. That is
-//! deliberately less than a terminal multiplexer: what it is for is the seam
-//! between the two halves this repository builds — a live process feeding a
-//! terminal grid, that grid reaching pixels, and an agent started in that shell
-//! being recognised as having been started *there* — with as little else in the
-//! way as possible.
+//! One window on one folder, with shells in it, and the event bus read behind
+//! them. That is deliberately less than a terminal multiplexer: what it is for
+//! is the seam between the two halves this repository builds — live processes
+//! feeding terminal grids, those grids reaching pixels and a keyboard, and an
+//! agent started in one of those shells being recognised as having been started
+//! *there* — with as little else in the way as possible.
 //!
 //! # How an agent gets found
 //!
-//! The shell is started with the event bus's environment variable set to a
-//! string naming this shell. An agent started in it inherits the variable; the
+//! Each shell is started with the event bus's environment variable set to a
+//! string naming that shell. An agent started in it inherits the variable; the
 //! agent's hooks report it to the bus; the bus copies it onto everything it says
 //! about that agent, never looking inside it; and this reads the bus's stream
 //! and joins the string back to the shell it named. Nothing was added to the bus
@@ -18,12 +18,15 @@
 //!
 //! # What it does not have
 //!
-//! No tabs, no splits, no sidebar, no keyboard. Which is why what runs in the
-//! shell can be given on the command line: with no keymap yet, that is the only
-//! way to give the shell something to do.
+//! No tab bar, no dividers, no sidebar and no mouse. Tabs and splits can be
+//! opened from the keyboard and are drawn from the model's own layout, which is
+//! the least that makes them visible rather than the arrangement anybody would
+//! want to look at.
 
 mod frames;
 mod grid;
+mod keymap;
+mod keys;
 mod live;
 mod palette;
 mod screen;
@@ -80,7 +83,7 @@ struct Cli {
     )]
     log_level: String,
 
-    /// What to run in the shell; without it, your login shell
+    /// What to run in the first shell; without it, your login shell
     #[arg(
         trailing_var_arg = true,
         allow_hyphen_values = true,
@@ -122,11 +125,15 @@ fn open(command: &[String]) -> Result<()> {
         ShellAddress::new(workspace, shell)
     };
 
-    let mut options = ShellOptions::new().directory(&directory);
+    // Shells opened later run the login shell in the same folder: what was
+    // asked for on the command line was asked for once, the way it is of a
+    // terminal started to run one thing.
+    let options = ShellOptions::new().directory(&directory);
+    let mut first = options.clone();
     if let Some((program, arguments)) = command.split_first() {
-        options = options.program(Program::new(program).with_args(arguments.to_vec()));
+        first = first.program(Program::new(program).with_args(arguments.to_vec()));
     }
-    let shell = Shell::spawn(address, &options).context("cannot start a shell")?;
+    let shell = Shell::spawn(address, &first).context("cannot start a shell")?;
     info!(
         correlation = shell.correlation(),
         directory = %directory.display(),
@@ -142,8 +149,9 @@ fn open(command: &[String]) -> Result<()> {
         let refused = Rc::clone(&refused);
         move |cx: &mut App| {
             gpui_component::init(cx);
+            keymap::install(cx);
             let opened = cx.open_window(window(cx), |window, cx| {
-                let view = cx.new(|cx| TerminalView::new(shell, layout, window, cx));
+                let view = cx.new(|cx| TerminalView::new(shell, layout, options, window, cx));
                 // The first layer in the window is the widget layer's own root,
                 // which is where anything drawn over the window — a dialog, a
                 // notification — is put.

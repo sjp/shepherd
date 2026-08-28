@@ -2798,3 +2798,64 @@ and whether a wide character overlaps its neighbour, are things somebody sees
 rather than things a program asserts — so what is automated is the reading of the
 grid, and what is kept for a person is one command that puts every hard case in
 front of them at once.
+
+## 2026-08-28 — the keyboard
+
+### The toolkit's own actions and keymap, confirmed rather than assumed
+
+**`gpui`'s action system covers everything the window binds keys to, and its
+keymap resolves a chord to an action before any low-level key listener sees the
+press.** That ordering is what makes the two halves of keyboard input separable:
+a press is matched against the keymap first, and only a press that matched
+nothing reaches the key listener that turns it into bytes for a terminal. So the
+bound half and the typed half are two code paths rather than one table with a
+fallback arm, and neither has to know the other's rules.
+
+`gpui-component` adds nothing on top of this and does not need to. It defines
+actions of its own for its widgets, in its own namespaces, and that is all.
+
+The one thing the toolkit does not offer is an encoding from a key press to the
+bytes a terminal expects — reasonably, since that is a terminal's problem rather
+than a window toolkit's. That table is written here, against
+`alacritty_terminal`'s modes, and is the only part of input that had to be.
+
+### A window's tests run on the toolkit's own headless platform
+
+**`gpui`'s `test-support` feature resolves from crates.io, builds in this
+container, and gives a test a real window, a real element tree, real focus and
+synthesised key presses with no display anywhere.** This narrows an earlier
+entry in this log: the split into `shepherd-core` and `shepherd` was made on the
+understanding that the crate linking the toolkit is out of reach of `cargo test`
+on a machine without a display. That was true of *opening a window on the
+machine's own display*, which is still out of reach; it is not true of the
+element tree, the keymap and focus, which are now asserted here directly. The
+split stays — it is the right shape for other reasons, and the library half
+still needs no toolkit at all — but the binary half is no longer untestable.
+
+It costs one dev-dependency and one recompile when switching between
+`cargo build` and `cargo test`: the feature is on the test build's dependency
+graph only, so the two builds resolve different copies of the toolkit. Measured
+at about twenty seconds on this container, which is the price of the tests
+existing. Whichever of the two ran last is what is left in `target/debug`, so a
+binary launched straight after a test run says `GPUI was compiled in test mode`
+on startup and one launched after a build does not. Nothing that ships is built
+that way: a release build has no dev-dependencies in it at all.
+
+The window it opens is not active until it is told to be, and the toolkit only
+reports focus moving *within* a window while that window is the active one. A
+test that opens a window and then asserts about focus has to activate it first
+or the notification never arrives — which is the sort of thing worth writing
+down once, having spent an afternoon on it.
+
+### Which tab is on screen is not read off where focus is
+
+**The view keeps its own record of the tab being shown, rather than deriving it
+from the shell that has focus.** The two look interchangeable and are not: the
+toolkit will only put focus in something it has drawn, so a tab that showed
+itself *because* focus arrived in it is a tab focus can never arrive in. Opening
+a tab therefore says which tab is on screen first and asks for focus second.
+
+This is not a second notion of focus, which the window deliberately does not
+have: which shell has focus is the toolkit's answer and is copied into the model
+from the toolkit's own notification, in one place, never written from anywhere
+else. Which tab is drawn is a question the toolkit has no opinion about at all.
