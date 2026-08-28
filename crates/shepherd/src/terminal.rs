@@ -1,11 +1,19 @@
 //! The shells, on screen.
 //!
-//! A window over one workspace: the tab whose shell has focus, every shell in
-//! that tab drawn as a grid of cells in its own rectangle, and a line above them
-//! saying which shell is being typed in and what the bus thinks is running in
-//! it. There is no tab bar and there are no dividers — the arrangement is drawn
-//! from the model's own layout and nothing more, because drawing it properly is
-//! a piece of work of its own.
+//! A window over one workspace: a bar of the tabs open in it, the arrangement
+//! of shells belonging to whichever of them is showing, each drawn as a grid of
+//! cells in its own rectangle with a divider on every edge two of them share,
+//! and a line above all of it saying which shell is being typed in and what the
+//! bus thinks is running in it.
+//!
+//! # The arrangement is the model's, at the window's scale
+//!
+//! Where a shell sits and where a divider sits are both asked of the tab's own
+//! arrangement, laid out in the rectangle this window gave it. Dragging a
+//! divider tells that arrangement where its edge is now, and the next frame
+//! asks again — so there is no second copy of where the edges are for the two
+//! to disagree about, and the shares a drag leaves behind are the ones that get
+//! saved.
 //!
 //! # Drawn from the grid, not from the bytes
 //!
@@ -36,11 +44,19 @@
 //! the toolkit's own notification — it is never asked, and nothing else writes
 //! it.
 //!
+//! # What the mouse does
+//!
+//! Two things. Pressing in a shell puts focus there, which is the toolkit's own
+//! doing rather than anything arranged here: an element that tracks a focus
+//! handle takes focus when it is pressed, and the notification that follows is
+//! the same one an action moving focus produces. Pressing on a divider takes
+//! hold of it instead, and suppresses that — dragging an edge is not a way of
+//! choosing which shell to type in.
+//!
 //! # What this does not do
 //!
 //! It shows the part of the buffer each shell is scrolled to and offers no way
-//! to scroll it, it has no notion of selecting anything, and it does not take
-//! the mouse.
+//! to scroll it, and it has no notion of selecting anything.
 
 #[cfg(test)]
 mod tests;
@@ -48,21 +64,24 @@ mod tests;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
-    ParentElement, Pixels, Render, SharedString, Size, Styled, Subscription, Task, Window, canvas,
-    div, px, relative,
+    AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, FocusHandle, InteractiveElement,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Pixels, Render, SharedString, Size, StatefulInteractiveElement as _, Styled,
+    Subscription, Task, Window, canvas, div, prelude::FluentBuilder as _, px, relative,
 };
 use gpui_component::ActiveTheme;
+use gpui_component::tab::{Tab as TabButton, TabBar};
 use shepherd_core::{
-    Closed, Direction, Layout, PlacedShell, Shell, ShellAddress, ShellId, ShellOptions, ShellSize,
-    SplitTree, TabId, Workspace, WorkspaceId,
+    Axis, Closed, Direction, Divider, Layout, PlacedDivider, PlacedShell, Rect, Shell,
+    ShellAddress, ShellId, ShellOptions, ShellSize, SplitTree, TabId, Workspace, WorkspaceId,
 };
 use tracing::{debug, info, warn};
 
 use crate::frames::Frames;
 use crate::grid::{Metrics, painting};
 use crate::keymap::{
-    self, Close, FocusDown, FocusLeft, FocusRight, FocusUp, NewTab, SplitDown, SplitRight,
+    self, Close, FocusDown, FocusLeft, FocusRight, FocusUp, NewTab, NextTab, PreviousTab,
+    SplitDown, SplitRight,
 };
 use crate::keys;
 use crate::live::{Live, badged, described};
@@ -83,6 +102,21 @@ const FONT_SIZE: Pixels = px(13.0);
 
 /// What a tab opened from the keyboard is called.
 const TAB: &str = "shell";
+
+/// How wide a divider is to take hold of.
+///
+/// Wider than the line it sits on, and centred over it, because an edge is a
+/// thing a person aims a pointer at rather than a thing they hit exactly. The
+/// edge itself is what the shells either side of it draw, so nothing is covered
+/// up by this being generous: it overlaps the padding around two grids and
+/// nothing that has been printed.
+const GRIP: Pixels = px(8.0);
+
+/// What closes a tab, in the corner of the tab.
+const CLOSE: &str = "\u{00d7}";
+
+/// What opens another one, at the end of the bar.
+const NEW: &str = "+";
 
 /// The families a monospaced font is looked for under, in order.
 ///
@@ -123,8 +157,8 @@ struct Held {
 
 /// The window's view: one workspace, and every shell open in it.
 pub struct TerminalView {
-    /// The model the bus's sessions are placed against, and the shape a tab
-    /// bar and a sidebar would eventually be drawn from.
+    /// The model the bus's sessions are placed against, the tab bar is drawn
+    /// from, and a sidebar would eventually be drawn from too.
     layout: Layout,
     /// The workspace this window is open on. There is one.
     workspace: WorkspaceId,
@@ -143,6 +177,14 @@ pub struct TerminalView {
     /// Which shell the toolkit last said has focus. Written in one place only,
     /// from the toolkit's own notification. See [`TerminalView::took_focus`].
     focused: ShellId,
+    /// Where the arrangement of shells is in the window, as of the last frame.
+    ///
+    /// The tab bar and the line above it take what room they take, so this is
+    /// measured rather than worked out: it is what turns the place a pointer is
+    /// into a place in the arrangement.
+    area: Bounds<Pixels>,
+    /// The divider being dragged, while one is.
+    dragging: Option<Divider>,
     live: Live,
     family: SharedString,
     metrics: Metrics,
@@ -187,6 +229,8 @@ impl TerminalView {
             shells: Vec::new(),
             active,
             focused: address.shell,
+            area: Bounds::default(),
+            dragging: None,
             live: Live::new(),
             family,
             metrics,
@@ -250,6 +294,77 @@ impl TerminalView {
             return;
         };
         self.started(tab, shell, window, cx);
+    }
+
+    /// Shows the tab at `index` in the bar.
+    fn show_tab_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let tab = self.open().tabs().get(index).map(shepherd_core::Tab::id);
+        if let Some(tab) = tab {
+            self.show(tab, window, cx);
+        }
+    }
+
+    /// Shows the tab one along from the one on screen, or one back.
+    ///
+    /// This comes back round at either end, which moving focus between shells
+    /// deliberately does not. Tabs are a list somebody steps along and the ends
+    /// of it are a few keystrokes apart; an arrangement of shells is a picture,
+    /// and leaving the right-hand one by pressing right would be a picture that
+    /// moved.
+    fn step(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let next = {
+            let tabs = self.open().tabs();
+            let at = tabs.iter().position(|tab| tab.id() == self.active);
+            at.map(|at| {
+                let step = if forward { 1 } else { tabs.len() - 1 };
+                tabs[(at + step) % tabs.len()].id()
+            })
+        };
+        if let Some(tab) = next {
+            self.show(tab, window, cx);
+        }
+    }
+
+    /// Shows `tab`, and puts focus back in whichever of its shells was last
+    /// being typed in.
+    ///
+    /// Which tab is showing is set before focus is asked for, because the
+    /// toolkit will not put focus in something it has not drawn — and it is set
+    /// again, from the toolkit's own notification, once it has.
+    fn show(&mut self, tab: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(shell) = self.open().tab(tab).map(shepherd_core::Tab::focused) else {
+            return;
+        };
+        self.active = tab;
+        self.focus(shell, window);
+        cx.notify();
+    }
+
+    /// Closes a tab and every shell in it.
+    ///
+    /// A tab nobody is looking at is taken away without focus being disturbed:
+    /// the shell being typed in is in another tab, and closing something out of
+    /// sight must not move the cursor out of it. The tab on screen goes shell by
+    /// shell instead, so that what is left — the next tab along, or nothing and
+    /// the window with it — is settled by the same code that answers closing a
+    /// shell from the keyboard.
+    fn close_tab(&mut self, tab: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        let closing = self
+            .open()
+            .tab(tab)
+            .map(shepherd_core::Tab::shells)
+            .unwrap_or_default();
+        if tab == self.active {
+            for shell in closing {
+                self.close(shell, window, cx);
+            }
+            return;
+        }
+        self.open_mut().close_tab(tab);
+        // Dropping them is what ends the processes and waits for them.
+        self.shells
+            .retain(|held| !closing.contains(&held.shell.address().shell));
+        cx.notify();
     }
 
     /// Puts a new shell beside `from` on the given side, and focuses it.
@@ -347,6 +462,70 @@ impl TerminalView {
             return;
         };
         self.focus(neighbour, window);
+    }
+
+    /// Takes hold of a divider, which is what dragging one begins as.
+    fn take(&mut self, divider: Divider, window: &mut Window, cx: &mut Context<Self>) {
+        self.dragging = Some(divider);
+        // Both of these are about what a press on a divider is not. It is not a
+        // press on the shell underneath it, so the toolkit is told not to move
+        // focus there; and it is not a press on the window either, so nothing
+        // further is offered it.
+        window.prevent_default();
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// The pointer has moved while a divider is being held.
+    ///
+    /// Where the divider now is gets told to the arrangement, and the next
+    /// frame lays the shells out from the arrangement as it then is. Nothing
+    /// here remembers where the edge was: the model is the only place it is
+    /// written down, and it is the place the saved file is written from.
+    fn dragged(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(divider) = self.dragging.clone() else {
+            return;
+        };
+        if event.pressed_button != Some(MouseButton::Left) {
+            // Let go of somewhere this window was never told about, which is
+            // what happens when a drag ends outside it. The button coming back
+            // up is the news, however late it arrives.
+            self.dropped(cx);
+            return;
+        }
+        let dividers = self
+            .tree()
+            .map(|tree| tree.dividers_in(area(self.area)))
+            .unwrap_or_default();
+        let Some(placed) = dividers
+            .into_iter()
+            .find(|placed| placed.divider == divider)
+        else {
+            // The arrangement changed underneath the drag, so there is no
+            // longer an edge being held.
+            self.dragging = None;
+            return;
+        };
+        let split = placed.within.extent(placed.axis);
+        if split <= 0.0 {
+            return;
+        }
+        let along = match placed.axis {
+            Axis::Horizontal => f32::from(event.position.x),
+            Axis::Vertical => f32::from(event.position.y),
+        };
+        let position = (along - placed.within.start(placed.axis)) / split;
+        let tab = self.active;
+        if self.open_mut().resize(tab, &divider, position) {
+            cx.notify();
+        }
+    }
+
+    /// The pointer has been let go of, wherever it happens to be.
+    fn dropped(&mut self, cx: &mut Context<Self>) {
+        if self.dragging.take().is_some() {
+            cx.notify();
+        }
     }
 
     /// A key press with no action bound to it, while `shell` has focus.
@@ -476,46 +655,174 @@ impl TerminalView {
             .children(said.into_iter().flatten().map(SharedString::from))
     }
 
-    /// Where in the arrangement the shell being typed in sits.
+    /// What the tab bar says: the tabs open in the workspace, in the order they
+    /// are drawn, and which of them is the one on screen.
     ///
-    /// Which is what stands in for a tab bar: with no chrome drawn around the
-    /// grids, this line is how a tab opening or a shell closing is seen to have
-    /// happened at all.
-    fn placement(&self) -> String {
-        let tabs = self.open().tabs();
-        let tab = tabs
+    /// Kept apart from the element it becomes because it is the whole of what
+    /// the bar shows and none of how it looks, and so can be asked without a
+    /// window being open to ask it of.
+    fn bar(&self) -> (Vec<(TabId, SharedString)>, usize) {
+        let open = self.open();
+        let showing = open
+            .tabs()
             .iter()
             .position(|tab| tab.id() == self.active)
-            .map_or(0, |index| index + 1);
+            .unwrap_or(0);
+        let tabs = open
+            .tabs()
+            .iter()
+            .map(|tab| (tab.id(), SharedString::from(tab.name().to_owned())))
+            .collect();
+        (tabs, showing)
+    }
+
+    /// The tab bar: every tab open in the workspace, the one on screen marked,
+    /// each of them closable, and a control that opens another.
+    fn tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (tabs, showing) = self.bar();
+        let view = cx.entity();
+
+        TabBar::new("tabs")
+            .selected_index(showing)
+            .children(
+                tabs.into_iter()
+                    .map(|(tab, name)| TabButton::new().label(name).suffix(self.closer(tab, cx))),
+            )
+            // The bar answers a press on a tab, rather than each tab answering
+            // for itself, so which one was pressed is a position in the bar —
+            // and the tab at that position is the one this window has.
+            .on_click(move |index, window, cx| {
+                let index = *index;
+                view.update(cx, |view, cx| view.show_tab_at(index, window, cx));
+            })
+            .suffix(self.opener(cx))
+    }
+
+    /// The control on a tab that closes it.
+    fn closer(&self, tab: TabId, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id(("close-tab", tab.raw()))
+            .px_1()
+            .text_color(cx.theme().muted_foreground)
+            .hover(|style| style.text_color(cx.theme().foreground))
+            .child(CLOSE)
+            .on_click(cx.listener(move |view, _: &ClickEvent, window, cx| {
+                // Without this the press would go on to the tab this is drawn
+                // in, and showing a tab on its way out is the one thing a
+                // control for closing it must not do.
+                cx.stop_propagation();
+                view.close_tab(tab, window, cx);
+            }))
+    }
+
+    /// The control at the end of the bar that opens another tab.
+    fn opener(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("new-tab")
+            .px_2()
+            .text_color(cx.theme().muted_foreground)
+            .hover(|style| style.text_color(cx.theme().foreground))
+            .child(NEW)
+            .on_click(cx.listener(|view, _: &ClickEvent, window, cx| view.new_tab(window, cx)))
+    }
+
+    /// Where in the arrangement the shell being typed in sits.
+    ///
+    /// Which tab that is in is the bar's to say; what this adds is where in
+    /// that tab's arrangement the shell sits, which nothing else on screen puts
+    /// into words.
+    fn placement(&self) -> String {
         let showing = self.showing();
         let shell = showing
             .iter()
             .position(|shell| *shell == self.focused)
             .map_or(0, |index| index + 1);
-        format!(
-            "tab {tab} of {}, shell {shell} of {}",
-            tabs.len(),
-            showing.len()
-        )
+        format!("shell {shell} of {}", showing.len())
     }
 
-    /// The shells of the tab on screen, each in its own rectangle.
+    /// The shells of the tab on screen, each in its own rectangle, with a
+    /// divider on every edge two of them share.
     ///
     /// The rectangles are the model's own layout of that tab's arrangement in a
-    /// unit square, put on screen as fractions of the room the window has. That
-    /// is the whole of the arrangement: no dividers, nothing to drag, and no
-    /// tab bar above it. This is the least that makes more than one shell
-    /// visible, and it is meant to be replaced by something that draws the
-    /// arrangement properly.
+    /// unit square, put on screen as fractions of the room this element was
+    /// given — so an arrangement of any shape lands where the model says it
+    /// does, however irregular, without this having to know what shape it is.
+    /// How much room that was is measured at the same time, because it is what
+    /// a pointer's position has to be read against.
     fn arranged(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let placed = self
+        let framed = self
             .tree()
             .map(SplitTree::layout)
             .unwrap_or_default()
             .into_iter()
             .map(|placed| self.framed(placed, window, cx))
             .collect::<Vec<_>>();
-        div().relative().flex_1().overflow_hidden().children(placed)
+        let handles = self
+            .tree()
+            .map(SplitTree::dividers)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|placed| self.handle(&placed, cx))
+            .collect::<Vec<_>>();
+        let measuring = cx.entity();
+
+        div()
+            .relative()
+            .flex_1()
+            .overflow_hidden()
+            .child(
+                canvas(
+                    move |bounds, _, cx| {
+                        measuring.update(cx, |view, _| view.area = bounds);
+                    },
+                    |_, (), _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .children(framed)
+            // After the shells, so that a press on an edge two of them share is
+            // a press on the edge.
+            .children(handles)
+    }
+
+    /// One divider, as something to take hold of.
+    ///
+    /// It is drawn as nothing at all until it is being held: the shells either
+    /// side of it already draw their own edges, and a second line over the top
+    /// of those would be the arrangement saying the same thing twice. What it
+    /// has instead is width to aim at and a pointer that says which way it
+    /// moves.
+    fn handle(&self, placed: &PlacedDivider, cx: &mut Context<Self>) -> AnyElement {
+        let held = self.dragging.as_ref() == Some(&placed.divider);
+        let divider = placed.divider.clone();
+        let bounds = placed.bounds;
+        let along = placed.axis;
+
+        div()
+            .absolute()
+            .left(relative(bounds.x))
+            .top(relative(bounds.y))
+            .map(|handle| match along {
+                Axis::Horizontal => handle
+                    .w(GRIP)
+                    .h(relative(bounds.height))
+                    .ml(-(GRIP / 2.0))
+                    .cursor(CursorStyle::ResizeLeftRight),
+                Axis::Vertical => handle
+                    .h(GRIP)
+                    .w(relative(bounds.width))
+                    .mt(-(GRIP / 2.0))
+                    .cursor(CursorStyle::ResizeUpDown),
+            })
+            .when(held, |handle| handle.bg(cx.theme().ring))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |view, _: &MouseDownEvent, window, cx| {
+                    view.take(divider.clone(), window, cx);
+                }),
+            )
+            .into_any_element()
     }
 
     /// One shell, in the rectangle the arrangement gives it.
@@ -552,6 +859,12 @@ impl TerminalView {
                 view.typed(shell, event, cx);
             }))
             .on_action(cx.listener(move |view, _: &NewTab, window, cx| view.new_tab(window, cx)))
+            .on_action(cx.listener(move |view, _: &NextTab, window, cx| {
+                view.step(true, window, cx);
+            }))
+            .on_action(cx.listener(move |view, _: &PreviousTab, window, cx| {
+                view.step(false, window, cx);
+            }))
             .on_action(cx.listener(move |view, _: &SplitRight, window, cx| {
                 view.split(shell, Direction::Right, window, cx);
             }))
@@ -652,7 +965,17 @@ impl Render for TerminalView {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            // A divider is dragged by the whole window rather than by the
+            // divider: the pointer leaves an eight-pixel strip on the first
+            // frame it moves, and a drag that stopped there would be a drag
+            // nobody could do.
+            .on_mouse_move(cx.listener(Self::dragged))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|view, _: &MouseUpEvent, _, cx| view.dropped(cx)),
+            )
             .child(self.header(cx))
+            .child(self.tabs(cx))
             .child(self.arranged(window, cx));
         self.frames.built(began.elapsed());
         screen
@@ -669,6 +992,18 @@ fn monospace(window: &Window) -> SharedString {
     }
     warn!("this machine has none of the monospaced fonts asked for; the grid will not line up");
     SharedString::from(FALLBACK)
+}
+
+/// The room the arrangement was given, as the arrangement's own kind of
+/// rectangle, so that a tab's shells and dividers can be laid out at the scale
+/// a pointer is reported in.
+fn area(bounds: Bounds<Pixels>) -> Rect {
+    Rect::new(
+        f32::from(bounds.origin.x),
+        f32::from(bounds.origin.y),
+        f32::from(bounds.size.width),
+        f32::from(bounds.size.height),
+    )
 }
 
 /// How many whole cells of `cell` fit in `room`.

@@ -21,7 +21,7 @@ use thiserror::Error;
 use crate::correlation::correlation_for;
 use crate::ids::{ShellId, ShellIds, TabId, TabIds, WorkspaceId, WorkspaceIds};
 use crate::rollup::{RollupStatus, rollup};
-use crate::split::{Closed, Direction, SplitTree};
+use crate::split::{Closed, Direction, Divider, SplitTree};
 
 /// Why an arrangement restored from somewhere else is not one this model would
 /// have produced.
@@ -136,6 +136,17 @@ impl Tab {
     /// Every shell in this tab, in arrangement order.
     pub fn shells(&self) -> Vec<ShellId> {
         self.tree.shells()
+    }
+
+    /// Moves one of the arrangement's dividers, answering whether that changed
+    /// anything. See [`SplitTree::resize`].
+    ///
+    /// The tree is handed out to be read and never to be changed, so that the
+    /// invariants it maintains cannot be got round from outside; this is the
+    /// one thing about the arrangement a window can move, and the shares it
+    /// writes are the ones that get saved.
+    pub fn resize(&mut self, divider: &Divider, position: f32) -> bool {
+        self.tree.resize(divider, position)
     }
 
     /// What this tab rolls up to, given a way to ask what each of its shells is
@@ -334,6 +345,15 @@ impl Workspace {
         debug_assert!(placed, "the tab was chosen for holding the shell");
         tab.focused = fresh;
         Some(fresh)
+    }
+
+    /// Moves a divider in one tab's arrangement, answering whether that changed
+    /// anything. See [`SplitTree::resize`].
+    pub fn resize(&mut self, tab: TabId, divider: &Divider, position: f32) -> bool {
+        match self.tab_mut(tab) {
+            Some(tab) => tab.resize(divider, position),
+            None => false,
+        }
     }
 
     /// Closes one shell.

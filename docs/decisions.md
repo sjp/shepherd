@@ -2859,3 +2859,69 @@ This is not a second notion of focus, which the window deliberately does not
 have: which shell has focus is the toolkit's answer and is copied into the model
 from the toolkit's own notification, in one place, never written from anywhere
 else. Which tab is drawn is a question the toolkit has no opinion about at all.
+
+## 2026-08-28 — the arrangement, drawn and dragged
+
+### A divider is named by where it is, not by an identity of its own
+
+**The arrangement hands out dividers as a path through the tree and a boundary
+number, and takes one back to say where that boundary now is.** The alternative
+was giving every split an id and keeping a table of them. Nothing would have
+kept that table in step: splits appear when a shell is split, disappear when one
+is closed, and are absorbed into their parent when a collapse leaves them on the
+same axis as it. A name that is only a description of where something sits needs
+no keeping in step, because there is nothing to keep — and it is wrong exactly
+when it should be, which is when the arrangement it described has changed. A
+drag lasts a fraction of a second, and nothing else holds one.
+
+### There is one copy of where the edges are, and the model has it
+
+**Dragging a divider writes the new shares into the tab's own arrangement, and
+the next frame lays the shells out from that arrangement.** The window remembers
+which divider is being held and nothing else — not where it is, not where it
+started, not what the shares were before. A view that kept its own copy of the
+edges would have to reconcile it with the model on every split, close and
+restore; and the copy that got saved would be the model's, so the two
+disagreeing would mean a window that looked right until it was reopened.
+
+The tolerance for that is what the minimum share is about: a shell dragged to
+nothing has no edge left to take hold of and drag back, so a divider stops
+before it gets there — at a share of the split rather than a number of pixels,
+since the arrangement knows nothing about the window it will be drawn in.
+
+### The window follows the drag, not the divider
+
+**Mouse moves while a divider is held are answered by the whole window.** A
+divider is eight pixels wide and a pointer leaves it on the first frame of any
+drag worth doing, so a handler on the divider itself would answer once and never
+again. The handler is registered whether or not anything is being dragged and
+returns immediately when nothing is, which costs a comparison per mouse move and
+avoids the frame of latency between taking hold of something and the window
+being redrawn with a handler on it.
+
+### Taking hold of an edge is not choosing a shell to type in
+
+**Pressing a divider suppresses the focus the toolkit would otherwise move.**
+`gpui` gives focus to any element tracking a focus handle when it is pressed,
+which is exactly what makes pressing in a shell put the cursor there — and it is
+what would make dragging the edge between two shells silently change which one
+is being typed in. The divider is drawn over both of them, presses first, and
+says the default is not wanted.
+
+### Stepping between tabs is bound, and comes back round
+
+**There are chords for the next tab and the previous one, and they wrap at
+either end.** A tab bar with three tabs in it that can only be reached with the
+mouse is a bar that has undone half of what the keyboard was for. Wrapping is
+the difference from moving focus between shells, which deliberately does not:
+tabs are a list somebody steps along, and an arrangement of shells is a picture
+whose right-hand edge is a place, not a point to come round from.
+
+### The bar is the toolkit's, and its controls are characters
+
+**The tab bar is `gpui-component`'s, and the controls drawn in it are text.**
+The component library's icons are SVG files an application is expected to supply
+through an asset source, and this application has none — so an icon would be a
+missing image where a control should be. A multiplication sign and a plus are
+two characters in a font the machine certainly has, and are what those two
+controls have looked like for thirty years.

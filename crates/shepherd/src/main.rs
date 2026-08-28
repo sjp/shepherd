@@ -18,10 +18,9 @@
 //!
 //! # What it does not have
 //!
-//! No tab bar, no dividers, no sidebar and no mouse. Tabs and splits can be
-//! opened from the keyboard and are drawn from the model's own layout, which is
-//! the least that makes them visible rather than the arrangement anybody would
-//! want to look at.
+//! No sidebar. Tabs, splits and the dividers between them are all there, from
+//! the keyboard and from the mouse, but what the bus knows is said in a line of
+//! text above them rather than shown beside a list of the shells it is about.
 
 mod frames;
 mod grid;

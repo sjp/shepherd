@@ -67,6 +67,39 @@ fn a_layout_survives_being_saved_and_loaded() {
 }
 
 #[test]
+fn where_a_divider_has_been_dragged_to_is_what_gets_saved() {
+    let (_dir, mut config) = config();
+    let mut layout = Layout::new();
+    let id = layout.open("/home/someone/projects/thing");
+    let workspace = layout.workspace_mut(id).unwrap();
+    let tab = workspace.open_tab("build");
+    let first = workspace.tab(tab).unwrap().focused();
+    workspace.split(tab, first, Direction::Right).unwrap();
+
+    // The arrangement is where the shares live, so moving a divider is the
+    // whole of what saving them takes: there is no second copy of the split
+    // sizes anywhere for a window to keep instead.
+    let divider = workspace.tab(tab).unwrap().tree().dividers()[0]
+        .divider
+        .clone();
+    assert!(workspace.resize(tab, &divider, 0.7));
+
+    config.save(&layout).expect("cannot save");
+
+    assert!(
+        fs::read_to_string(config.path())
+            .unwrap()
+            .contains(r#"layout = "h(0.7:s0, 0.3:s1)""#),
+        "the saved file has the shares the drag left behind"
+    );
+    assert_eq!(
+        Config::at(config.path()).load().expect("cannot load"),
+        layout,
+        "and reading it back gives the arrangement that was dragged"
+    );
+}
+
+#[test]
 fn the_file_written_is_the_documented_shape() {
     let (_dir, mut config) = config();
     let mut layout = Layout::new();

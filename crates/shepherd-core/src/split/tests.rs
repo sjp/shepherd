@@ -598,3 +598,181 @@ fn shares_are_rescaled_only_when_they_do_not_already_divide_the_space() {
     let rebuilt = SplitTree::split_of(row.axis(), row.children().to_vec()).expect("the same row");
     assert_eq!(rebuilt, grown);
 }
+
+/// The divider between two of a split's children, found by where it lies rather
+/// than by counting: a test that said "the second one" would still pass if the
+/// walk changed its mind about the order, and would then be asserting something
+/// else.
+fn divider_at(tree: &SplitTree, axis: Axis, along: f32) -> PlacedDivider {
+    let dividers = tree.dividers();
+    let found: Vec<_> = dividers
+        .iter()
+        .filter(|placed| placed.axis == axis && (placed.bounds.start(axis) - along).abs() < 1e-5)
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "one divider on {axis} at {along}, and this arrangement has {dividers:#?}"
+    );
+    found[0].clone()
+}
+
+#[test]
+fn a_tree_of_one_shell_has_nothing_between_anything() {
+    assert!(SplitTree::leaf(shell(0)).dividers().is_empty());
+}
+
+#[test]
+fn a_divider_lies_on_the_edge_it_separates_and_spans_its_split() {
+    let tree = one_beside_two();
+    let dividers = tree.dividers();
+    assert_eq!(
+        dividers.len(),
+        2,
+        "a row of two, one of them a column of two"
+    );
+
+    let between_columns = divider_at(&tree, Axis::Horizontal, 0.5);
+    assert_eq!(
+        between_columns.bounds,
+        Rect::new(0.5, 0.0, 0.0, 1.0),
+        "the divider between the columns runs the whole height of the tab"
+    );
+    assert_eq!(
+        between_columns.within,
+        Rect::UNIT,
+        "and a position for it is a fraction of the tab"
+    );
+
+    let between_rows = divider_at(&tree, Axis::Vertical, 0.5);
+    assert_eq!(
+        between_rows.bounds,
+        Rect::new(0.5, 0.5, 0.5, 0.0),
+        "the one between the rows crosses only the column holding them"
+    );
+    assert_eq!(
+        between_rows.within,
+        Rect::new(0.5, 0.0, 0.5, 1.0),
+        "and a position for it is a fraction of that column"
+    );
+}
+
+#[test]
+fn a_divider_is_laid_out_at_the_scale_it_was_asked_for() {
+    let tree = one_beside_two();
+    let within = Rect::new(0.0, 0.0, 800.0, 600.0);
+    let dividers = tree.dividers_in(within);
+
+    let columns = dividers
+        .iter()
+        .find(|placed| placed.axis == Axis::Horizontal)
+        .expect("the divider between the columns");
+    assert_eq!(columns.bounds, Rect::new(400.0, 0.0, 0.0, 600.0));
+    assert_eq!(columns.within, within);
+}
+
+#[test]
+fn dragging_a_divider_moves_the_edge_it_was_taken_from() {
+    let mut tree = one_beside_two();
+    let between_columns = divider_at(&tree, Axis::Horizontal, 0.5);
+
+    assert!(tree.resize(&between_columns.divider, 0.75));
+
+    assert_eq!(
+        placed(&tree),
+        vec![
+            (0, Rect::new(0.0, 0.0, 0.75, 1.0)),
+            (1, Rect::new(0.75, 0.0, 0.25, 0.5)),
+            (2, Rect::new(0.75, 0.5, 0.25, 0.5)),
+        ],
+        "the left column grew and the column of two shrank to fit"
+    );
+    assert!(
+        !tree.resize(&between_columns.divider, 0.75),
+        "putting it back where it already is changes nothing"
+    );
+}
+
+#[test]
+fn a_divider_inside_a_split_is_a_fraction_of_that_split() {
+    let mut tree = one_beside_two();
+    let between_rows = divider_at(&tree, Axis::Vertical, 0.5);
+
+    // A quarter of the way down the tab, which is a quarter of the way down the
+    // column too, because that column is the full height of the tab.
+    assert!(tree.resize(&between_rows.divider, 0.25));
+
+    assert_eq!(
+        placed(&tree),
+        vec![
+            (0, Rect::new(0.0, 0.0, 0.5, 1.0)),
+            (1, Rect::new(0.5, 0.0, 0.5, 0.25)),
+            (2, Rect::new(0.5, 0.25, 0.5, 0.75)),
+        ],
+        "only the two rows sharing that edge moved"
+    );
+}
+
+#[test]
+fn a_divider_moves_the_two_shells_it_separates_and_nothing_else() {
+    // A row of three, each a third of it.
+    let mut tree = SplitTree::leaf(shell(0));
+    assert!(tree.split(shell(0), Direction::Right, shell(1)));
+    assert!(tree.split(shell(1), Direction::Right, shell(2)));
+    let third = placed(&tree)[2].1;
+
+    let first = divider_at(&tree, Axis::Horizontal, 0.5);
+    assert!(tree.resize(&first.divider, 0.1));
+
+    let after = placed(&tree);
+    assert_close(after[0].1.width, 0.1, "the first shell");
+    assert_close(after[1].1.width, 0.65, "the second shell");
+    assert_eq!(after[2].1, third, "the third shell did not move");
+}
+
+#[test]
+fn a_divider_stops_where_its_neighbours_have_nothing_left_to_give() {
+    let mut tree = SplitTree::leaf(shell(0));
+    assert!(tree.split(shell(0), Direction::Right, shell(1)));
+    let between = divider_at(&tree, Axis::Horizontal, 0.5);
+
+    assert!(tree.resize(&between.divider, -3.0));
+    let squeezed = placed(&tree);
+    assert_close(squeezed[0].1.width, MINIMUM_SHARE, "the shell dragged over");
+    assert!(
+        squeezed[0].1.width > 0.0,
+        "a shell dragged to nothing could never be dragged back"
+    );
+
+    assert!(tree.resize(&between.divider, 40.0));
+    let squeezed = placed(&tree);
+    assert_close(
+        squeezed[1].1.width,
+        MINIMUM_SHARE,
+        "the shell dragged the other way",
+    );
+
+    assert!(
+        !tree.resize(&between.divider, f32::NAN),
+        "a position that is not a number is not a position"
+    );
+}
+
+#[test]
+fn a_divider_the_arrangement_does_not_have_moves_nothing() {
+    let mut tree = one_beside_two();
+    let before = tree.clone();
+    let inside = divider_at(&tree, Axis::Vertical, 0.5).divider;
+
+    // The arrangement the divider was taken from is gone: closing the shell
+    // below collapsed the column it was a boundary of.
+    assert!(matches!(tree.close(shell(2)), Closed::Removed { .. }));
+    assert!(!tree.resize(&inside, 0.25));
+
+    let mut alone = SplitTree::leaf(shell(0));
+    assert!(
+        !alone.resize(&inside, 0.25),
+        "a tree with no dividers at all"
+    );
+    assert_ne!(tree, before, "the closing did happen");
+}

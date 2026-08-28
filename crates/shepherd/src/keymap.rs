@@ -33,6 +33,10 @@ actions!(
     [
         /// Opens a tab, with a shell in it.
         NewTab,
+        /// Shows the next tab along, coming back round at the last.
+        NextTab,
+        /// Shows the previous one, the same way.
+        PreviousTab,
         /// Puts a new shell to the right of this one.
         SplitRight,
         /// Puts a new shell below this one.
@@ -62,6 +66,8 @@ pub const CONTEXT: &str = "Shell";
 #[derive(Debug, Clone, Copy)]
 pub struct Keys {
     pub new_tab: &'static str,
+    pub next_tab: &'static str,
+    pub previous_tab: &'static str,
     pub split_right: &'static str,
     pub split_down: &'static str,
     pub close: &'static str,
@@ -76,9 +82,12 @@ pub struct Keys {
 /// Command is free — no terminal sends anything for it — so everything sits
 /// there, and splitting keeps the shape a Mac terminal user already has in
 /// their hands: one chord for a shell beside this one, the same chord with
-/// shift for a shell below it.
+/// shift for a shell below it. Stepping between tabs is the bracket pair every
+/// application on the platform steps between things with.
 const MAC: Keys = Keys {
     new_tab: "cmd-t",
+    next_tab: "cmd-shift-]",
+    previous_tab: "cmd-shift-[",
     split_right: "cmd-d",
     split_down: "cmd-shift-d",
     close: "cmd-w",
@@ -92,12 +101,17 @@ const MAC: Keys = Keys {
 ///
 /// Control and shift together, because control alone belongs to the terminal:
 /// a keyboard cannot distinguish control-shift-E from control-E on the wire, so
-/// nothing is taken from a shell by binding it. Moving focus is the exception
-/// and uses alt on its own — it is the action reached for most often, and a
-/// three-finger chord for it is the difference between a keyboard people
-/// navigate by and one they reach for the mouse instead of.
+/// nothing is taken from a shell by binding it. That is also why stepping
+/// between tabs takes the shift the terminals here manage without: control and
+/// a page key on their own are a sequence an application running in a shell is
+/// entitled to be sent. Moving focus is the exception and uses alt on its own —
+/// it is the action reached for most often, and a three-finger chord for it is
+/// the difference between a keyboard people navigate by and one they reach for
+/// the mouse instead of.
 const ELSEWHERE: Keys = Keys {
     new_tab: "ctrl-shift-t",
+    next_tab: "ctrl-shift-pagedown",
+    previous_tab: "ctrl-shift-pageup",
     split_right: "ctrl-shift-e",
     split_down: "ctrl-shift-o",
     close: "ctrl-shift-w",
@@ -126,6 +140,8 @@ pub fn bindings() -> Vec<KeyBinding> {
     let keys = table();
     vec![
         KeyBinding::new(keys.new_tab, NewTab, Some(CONTEXT)),
+        KeyBinding::new(keys.next_tab, NextTab, Some(CONTEXT)),
+        KeyBinding::new(keys.previous_tab, PreviousTab, Some(CONTEXT)),
         KeyBinding::new(keys.split_right, SplitRight, Some(CONTEXT)),
         KeyBinding::new(keys.split_down, SplitDown, Some(CONTEXT)),
         KeyBinding::new(keys.close, Close, Some(CONTEXT)),
@@ -150,9 +166,11 @@ mod tests {
     impl Keys {
         /// Every key in this table, so a test can say something about all of
         /// them without listing them again.
-        fn all(self) -> [&'static str; 8] {
+        fn all(self) -> [&'static str; 10] {
             [
                 self.new_tab,
+                self.next_tab,
+                self.previous_tab,
                 self.split_right,
                 self.split_down,
                 self.close,

@@ -63,6 +63,17 @@ const ADJACENCY: f32 = 1e-4;
 /// window anybody has.
 const SHARES_TOLERANCE: f32 = 1e-3;
 
+/// How little of its split one of its children may be left with when a divider
+/// between them is dragged.
+///
+/// A shell squeezed to nothing is a shell nobody can get back: there would be
+/// no edge left to take hold of and drag the other way. This is a share of the
+/// split rather than a number of pixels because a tree knows nothing about the
+/// window it will be drawn in, and it is capped at half of what the two
+/// children being resized have between them, so that a split whose children are
+/// already thinner than this cannot be turned inside out by dragging it.
+const MINIMUM_SHARE: f32 = 0.02;
+
 /// The axis a split arranges its children along.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Axis {
@@ -206,6 +217,40 @@ pub struct PlacedShell {
     pub bounds: Rect,
 }
 
+/// Which of a split's boundaries a divider is.
+///
+/// A divider is named by where it is rather than by an identity of its own: the
+/// child to descend into at each step from the root of the tree, and then which
+/// of that split's boundaries — the one after the child at `after`. Nothing has
+/// to be kept in step as a tab is split or a shell closed, because there is
+/// nothing to keep. The price is that one of these means what it says only
+/// against the arrangement it was taken from, which is as long as a drag lasts
+/// and no longer.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Divider {
+    path: Vec<usize>,
+    after: usize,
+}
+
+/// One divider and where it sits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlacedDivider {
+    /// Which boundary it is, for [`SplitTree::resize`].
+    pub divider: Divider,
+    /// The axis its split arranges its children along, which is the one this
+    /// divider moves along.
+    pub axis: Axis,
+    /// The line it lies on: nothing wide along `axis`, and the full extent of
+    /// its split across it. What a person takes hold of is that line with some
+    /// thickness given to it, which is the drawing's business rather than the
+    /// arrangement's.
+    pub bounds: Rect,
+    /// The whole of the space its split divides. A new position for the divider
+    /// is a fraction of this, measured from its near edge along `axis`, which is
+    /// what [`SplitTree::resize`] takes.
+    pub within: Rect,
+}
+
 /// One child of a split, and how much of the split's space it takes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Branch {
@@ -251,6 +296,53 @@ impl Split {
     /// The children, in the order they appear along the axis.
     pub fn children(&self) -> &[Branch] {
         &self.children
+    }
+
+    /// The part of `bounds` each child is given, in order.
+    ///
+    /// The one place a share becomes a rectangle, so that everything laid out
+    /// against this split — the shells, and the dividers between them — agrees
+    /// about where its edges are.
+    fn slices(&self, bounds: Rect) -> Vec<Rect> {
+        let total = bounds.extent(self.axis);
+        let last = self.children.len() - 1;
+        let mut offset = 0.0;
+        let mut slices = Vec::with_capacity(self.children.len());
+        for (index, branch) in self.children.iter().enumerate() {
+            // The final child takes what is left rather than its own share, so
+            // that rounding cannot leave a sliver of the tab belonging to
+            // nothing.
+            let extent = if index == last {
+                total - offset
+            } else {
+                branch.size * total
+            };
+            slices.push(bounds.slice(self.axis, offset, extent));
+            offset += extent;
+        }
+        slices
+    }
+
+    /// Moves the boundary after the child at `after` to `position`, a fraction
+    /// of this split measured from its near edge. Answers whether that moved it.
+    ///
+    /// Only the two children the boundary separates change: everything else in
+    /// the split keeps the space it had, which is what makes dragging one
+    /// divider a local act rather than a rearrangement of the whole tab.
+    fn resize(&mut self, after: usize, position: f32) -> bool {
+        if !position.is_finite() || after + 1 >= self.children.len() {
+            return false;
+        }
+        let before: f32 = self.children[..after].iter().map(Branch::size).sum();
+        let pair = self.children[after].size + self.children[after + 1].size;
+        let floor = MINIMUM_SHARE.min(pair / 2.0);
+        let size = (position - before).clamp(floor, pair - floor);
+        if size == self.children[after].size {
+            return false;
+        }
+        self.children[after].size = size;
+        self.children[after + 1].size = pair - size;
+        true
     }
 
     /// Splits a leaf somewhere beneath this split. See [`SplitTree::split`].
@@ -641,6 +733,78 @@ impl SplitTree {
         placed
     }
 
+    /// Every divider in the tree, in a unit square.
+    pub fn dividers(&self) -> Vec<PlacedDivider> {
+        self.dividers_in(Rect::UNIT)
+    }
+
+    /// Every divider in the tree, laid out within `bounds`.
+    ///
+    /// A tree of one shell has none: there is nothing between anything. Each
+    /// one is the boundary between two of a split's children, and is what
+    /// [`SplitTree::resize`] moves.
+    pub fn dividers_in(&self, bounds: Rect) -> Vec<PlacedDivider> {
+        let mut found = Vec::new();
+        self.gather(bounds, &mut Vec::new(), &mut found);
+        found
+    }
+
+    fn gather(&self, bounds: Rect, path: &mut Vec<usize>, found: &mut Vec<PlacedDivider>) {
+        let Self::Split(split) = self else {
+            return;
+        };
+        let slices = split.slices(bounds);
+        let last = split.children.len() - 1;
+        for (index, (branch, slice)) in split.children.iter().zip(&slices).enumerate() {
+            if index < last {
+                found.push(PlacedDivider {
+                    divider: Divider {
+                        path: path.clone(),
+                        after: index,
+                    },
+                    axis: split.axis,
+                    bounds: bounds.slice(
+                        split.axis,
+                        slice.end(split.axis) - bounds.start(split.axis),
+                        0.0,
+                    ),
+                    within: bounds,
+                });
+            }
+            path.push(index);
+            branch.tree.gather(*slice, path, found);
+            path.pop();
+        }
+    }
+
+    /// Moves `divider` to `position` — a fraction of the split it belongs to,
+    /// measured from that split's near edge along its axis, which is what
+    /// [`PlacedDivider::within`] is there to work out. Answers whether the
+    /// arrangement changed.
+    ///
+    /// The two children the divider separates share what they had between them
+    /// differently; nothing else moves, and neither does anything if the
+    /// divider is not one this tree has. A position past what its neighbours
+    /// can give up is brought back to what they can, so dragging past the end
+    /// of a split stops there rather than doing something else.
+    pub fn resize(&mut self, divider: &Divider, position: f32) -> bool {
+        match self.split_at_mut(&divider.path) {
+            Some(split) => split.resize(divider.after, position),
+            None => false,
+        }
+    }
+
+    /// The split `path` names, if the tree still has one there.
+    fn split_at_mut(&mut self, path: &[usize]) -> Option<&mut Split> {
+        let Self::Split(split) = self else {
+            return None;
+        };
+        match path.split_first() {
+            None => Some(split),
+            Some((index, rest)) => split.children.get_mut(*index)?.tree.split_at_mut(rest),
+        }
+    }
+
     fn place(&self, bounds: Rect, placed: &mut Vec<PlacedShell>) {
         match self {
             Self::Leaf(shell) => placed.push(PlacedShell {
@@ -648,22 +812,8 @@ impl SplitTree {
                 bounds,
             }),
             Self::Split(split) => {
-                let total = bounds.extent(split.axis);
-                let last = split.children.len() - 1;
-                let mut offset = 0.0;
-                for (index, branch) in split.children.iter().enumerate() {
-                    // The final child takes what is left rather than its own
-                    // share, so that rounding cannot leave a sliver of the tab
-                    // belonging to nothing.
-                    let extent = if index == last {
-                        total - offset
-                    } else {
-                        branch.size * total
-                    };
-                    branch
-                        .tree
-                        .place(bounds.slice(split.axis, offset, extent), placed);
-                    offset += extent;
+                for (branch, slice) in split.children.iter().zip(split.slices(bounds)) {
+                    branch.tree.place(slice, placed);
                 }
             }
         }

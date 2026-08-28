@@ -8,7 +8,7 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use gpui::{Entity, TestAppContext, VisualTestContext};
+use gpui::{Entity, Modifiers, Point, TestAppContext, VisualTestContext, point};
 use shepherd_core::{Program, ShellAddress};
 
 use super::*;
@@ -122,6 +122,60 @@ fn screen_of(view: &TerminalView, shell: ShellId) -> Vec<String> {
     view.held(shell)
         .map(|held| held.shell.screen())
         .unwrap_or_default()
+}
+
+/// The middle of where one shell is drawn, in the window's own coordinates.
+///
+/// Worked out from the same two things the frame was drawn from — the tab's
+/// arrangement, and the room the window measured for it — so a test presses
+/// where the shell actually is rather than where the arithmetic in the test
+/// says it should be.
+fn middle_of(view: &TerminalView, shell: ShellId) -> Point<Pixels> {
+    let bounds = view
+        .tree()
+        .expect("a tab on screen")
+        .layout_in(area(view.area))
+        .into_iter()
+        .find(|placed| placed.shell == shell)
+        .expect("the shell is in the tab on screen")
+        .bounds;
+    point(
+        px(bounds.x + bounds.width / 2.0),
+        px(bounds.y + bounds.height / 2.0),
+    )
+}
+
+/// The middle of the one divider in the tab on screen.
+fn the_divider(view: &TerminalView) -> (PlacedDivider, Point<Pixels>) {
+    let dividers = view
+        .tree()
+        .expect("a tab on screen")
+        .dividers_in(area(view.area));
+    assert_eq!(dividers.len(), 1, "one divider in this arrangement");
+    let placed = dividers[0].clone();
+    let at = point(
+        px(placed.bounds.x + placed.bounds.width / 2.0),
+        px(placed.bounds.y + placed.bounds.height / 2.0),
+    );
+    (placed, at)
+}
+
+/// Moves the pointer to `at` and presses, the way a person takes hold of
+/// something.
+fn press(cx: &mut VisualTestContext, at: Point<Pixels>) {
+    cx.simulate_mouse_move(at, None, Modifiers::none());
+    cx.simulate_mouse_down(at, gpui::MouseButton::Left, Modifiers::none());
+}
+
+/// Where one shell sits in the tab on screen, as a fraction of it.
+fn share_of(view: &TerminalView, shell: ShellId) -> shepherd_core::Rect {
+    view.tree()
+        .expect("a tab on screen")
+        .layout()
+        .into_iter()
+        .find(|placed| placed.shell == shell)
+        .expect("the shell is in the tab on screen")
+        .bounds
 }
 
 /// Types `text` one key at a time, the way a person would.
@@ -377,4 +431,257 @@ fn a_key_the_keymap_binds_is_not_also_typed(cx: &mut TestAppContext) {
             .all(String::is_empty)),
         "a bound chord became an action and stopped there"
     );
+}
+
+#[gpui::test]
+fn the_bar_holds_every_tab_and_marks_the_one_on_screen(cx: &mut TestAppContext) {
+    let (view, cx) = opened(cx);
+
+    cx.simulate_keystrokes(keys().new_tab);
+    cx.simulate_keystrokes(keys().new_tab);
+
+    let (tabs, showing) = view.read_with(cx, |view, _| view.bar());
+    assert_eq!(
+        tabs.len(),
+        3,
+        "three tabs are open and the bar holds all three"
+    );
+    assert_eq!(
+        tabs[showing].0,
+        view.read_with(cx, |view, _| view.active),
+        "and the one marked is the one on screen"
+    );
+    assert_eq!(showing, 2, "which is the one just opened");
+}
+
+#[gpui::test]
+fn stepping_between_tabs_shows_the_one_stepped_to(cx: &mut TestAppContext) {
+    let (view, cx) = opened(cx);
+    let first = view.read_with(cx, |view, _| view.active);
+
+    cx.simulate_keystrokes(keys().new_tab);
+    cx.simulate_keystrokes(keys().new_tab);
+    let third = view.read_with(cx, |view, _| view.active);
+
+    cx.simulate_keystrokes(keys().next_tab);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.active),
+        first,
+        "stepping on from the last tab comes back round to the first"
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| (view.bar().1, view.showing().len())),
+        (0, 1),
+        "and what is on screen is that tab and its shell"
+    );
+
+    cx.simulate_keystrokes(keys().previous_tab);
+    assert_eq!(view.read_with(cx, |view, _| view.active), third);
+
+    // Typing goes to the tab that is showing, which is what makes the switch a
+    // switch rather than a change of highlight.
+    let shell = view.read_with(cx, |view, _| view.focused);
+    type_out(cx, "echo third");
+    cx.simulate_keystrokes("enter");
+    wait_for(&view, cx, "the shell in the tab stepped to", |view| {
+        screen_of(view, shell).iter().any(|row| row == "third")
+    });
+}
+
+#[gpui::test]
+fn a_tab_nobody_is_looking_at_keeps_running(cx: &mut TestAppContext) {
+    let (view, cx) = opened(cx);
+    let hidden = view.read_with(cx, |view, _| view.focused);
+
+    // Started here, finished somewhere else: by the time this prints, the tab
+    // it printed in is not the one on screen.
+    type_out(cx, "sleep 1; echo carried on");
+    cx.simulate_keystrokes("enter");
+    cx.simulate_keystrokes(keys().new_tab);
+    let showing = view.read_with(cx, |view, _| view.active);
+
+    wait_for(&view, cx, "the hidden shell to answer", |view| {
+        screen_of(view, hidden)
+            .iter()
+            .any(|row| row == "carried on")
+    });
+    assert_eq!(
+        view.read_with(cx, |view, _| view.active),
+        showing,
+        "and nothing about that brought its tab back to the front"
+    );
+}
+
+#[gpui::test]
+fn pressing_in_a_shell_is_where_typing_goes(cx: &mut TestAppContext) {
+    let (view, cx) = opened(cx);
+    let left = view.read_with(cx, |view, _| view.focused);
+
+    cx.simulate_keystrokes(keys().split_right);
+    let right = view.read_with(cx, |view, _| view.focused);
+    assert_ne!(left, right, "the split left focus in the new shell");
+
+    let at = view.read_with(cx, |view, _| middle_of(view, left));
+    cx.simulate_click(at, Modifiers::none());
+
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.focused, left, "the shell pressed in has focus");
+        let tab = view.open().tab_of(left).expect("the tab holding it");
+        assert_eq!(
+            view.open().tab(tab).expect("that tab").focused(),
+            left,
+            "and the model was told the same thing the keyboard tells it"
+        );
+    });
+
+    type_out(cx, "echo pressed");
+    cx.simulate_keystrokes("enter");
+    wait_for(&view, cx, "the shell pressed in to answer", |view| {
+        screen_of(view, left).iter().any(|row| row == "pressed")
+    });
+    assert!(
+        view.read_with(cx, |view, _| screen_of(view, right)
+            .iter()
+            .all(|row| row != "pressed")),
+        "and nothing was typed into the other one"
+    );
+}
+
+#[gpui::test]
+fn dragging_a_divider_moves_the_edge_and_leaves_the_arrangement_holding_it(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = opened(cx);
+    let left = view.read_with(cx, |view, _| view.focused);
+
+    cx.simulate_keystrokes(keys().split_right);
+    let right = view.read_with(cx, |view, _| view.focused);
+    assert_eq!(
+        view.read_with(cx, |view, _| share_of(view, left).width),
+        0.5,
+        "a split starts even"
+    );
+
+    let (placed, at) = view.read_with(cx, |view, _| the_divider(view));
+    let quarter = px(placed.within.x + placed.within.width / 4.0);
+    press(cx, at);
+    cx.simulate_mouse_move(
+        point(quarter, at.y),
+        gpui::MouseButton::Left,
+        Modifiers::none(),
+    );
+
+    view.read_with(cx, |view, _| {
+        let narrowed = share_of(view, left).width;
+        assert!(
+            (narrowed - 0.25).abs() < 0.01,
+            "the left shell is a quarter of the tab, and is {narrowed}"
+        );
+        assert!(
+            (share_of(view, right).width - 0.75).abs() < 0.01,
+            "and the right one has the rest"
+        );
+        assert_eq!(
+            view.focused, right,
+            "taking hold of an edge is not a way of choosing a shell to type in"
+        );
+    });
+
+    cx.simulate_mouse_up(
+        point(quarter, at.y),
+        gpui::MouseButton::Left,
+        Modifiers::none(),
+    );
+    let settled = view.read_with(cx, |view, _| share_of(view, left).width);
+
+    // Let go of, and then moved past: what the arrangement holds is where the
+    // divider was left, not wherever the pointer went afterwards.
+    cx.simulate_mouse_move(
+        point(px(placed.within.x + placed.within.width * 0.9), at.y),
+        None,
+        Modifiers::none(),
+    );
+    assert_eq!(
+        view.read_with(cx, |view, _| share_of(view, left).width),
+        settled
+    );
+}
+
+#[gpui::test]
+fn closing_a_tab_takes_its_shells_with_it_and_leaves_focus_alone(cx: &mut TestAppContext) {
+    let (view, cx) = opened(cx);
+    let first = view.read_with(cx, |view, _| view.active);
+
+    cx.simulate_keystrokes(keys().new_tab);
+    cx.simulate_keystrokes(keys().split_right);
+    let typing_in = view.read_with(cx, |view, _| view.focused);
+    let showing = view.read_with(cx, |view, _| view.active);
+
+    // The tab closed is the one out of sight, which must not disturb where
+    // somebody is typing.
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.close_tab(first, window, cx));
+    });
+
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.open().tabs().len(), 1, "the tab is gone");
+        assert_eq!(view.shells.len(), 2, "and so is the shell that was in it");
+        assert_eq!(view.focused, typing_in, "and focus stayed where it was");
+        assert_eq!(view.bar().0.len(), 1, "the bar says so too");
+    });
+
+    // And now the one on screen, which has to hand both over to what is left.
+    cx.simulate_keystrokes(keys().new_tab);
+    let opened = view.read_with(cx, |view, _| view.active);
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.close_tab(opened, window, cx));
+    });
+
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.active, showing, "the tab that is left came forward");
+        assert_eq!(
+            view.focused, typing_in,
+            "and with it the shell it was last being typed in"
+        );
+        assert_eq!(view.shells.len(), 2);
+    });
+}
+
+#[gpui::test]
+fn an_irregular_arrangement_puts_every_shell_where_the_model_says(cx: &mut TestAppContext) {
+    let (view, cx) = opened(cx);
+    let tall = view.read_with(cx, |view, _| view.focused);
+
+    // One tall shell on the left, two stacked on the right: the arrangement a
+    // grid of a fixed shape cannot hold.
+    cx.simulate_keystrokes(keys().split_right);
+    let upper = view.read_with(cx, |view, _| view.focused);
+    cx.simulate_keystrokes(keys().split_down);
+    let lower = view.read_with(cx, |view, _| view.focused);
+
+    let (left, top, bottom) = view.read_with(cx, |view, _| {
+        (
+            share_of(view, tall),
+            share_of(view, upper),
+            share_of(view, lower),
+        )
+    });
+    assert_eq!(left.height, 1.0, "the left shell is the height of the tab");
+    assert_eq!(top.height, 0.5, "and the other two share the right of it");
+    assert!(
+        top.y + top.height <= bottom.y + f32::EPSILON,
+        "with nothing of one over the other"
+    );
+
+    // Pressing in each of the three lands in that one, which is the whole of
+    // what "drawn in the right place" means from outside.
+    for shell in [tall, upper, lower] {
+        let at = view.read_with(cx, |view, _| middle_of(view, shell));
+        cx.simulate_click(at, Modifiers::none());
+        assert_eq!(
+            view.read_with(cx, |view, _| view.focused),
+            shell,
+            "pressing at {at:?} should land in the shell drawn there"
+        );
+    }
 }

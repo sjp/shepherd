@@ -109,7 +109,8 @@ pub use ids::{ShellAddress, ShellId, ShellIds, TabId, TabIds, WorkspaceId, Works
 pub use naming::{FOREGROUND_INTERVAL, Foreground, ForegroundProcess, Kernel, Pid, ShellName};
 pub use rollup::{RollupStatus, rollup, shell_status};
 pub use split::{
-    Axis, Branch, Closed, Direction, MalformedSplit, PlacedShell, Rect, Split, SplitTree,
+    Axis, Branch, Closed, Direction, Divider, MalformedSplit, PlacedDivider, PlacedShell, Rect,
+    Split, SplitTree,
 };
 pub use terminal::{
     CORRELATION_VAR, Device, Program, Shell, ShellOptions, ShellSize, ShellState, SpawnError,
