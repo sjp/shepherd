@@ -5570,6 +5570,7 @@ version = "0.1.0"
 dependencies = [
  "agentbus-detect",
  "agentbus-protocol",
+ "alacritty_terminal",
  "anyhow",
  "clap",
  "gpui",

@@ -1,46 +1,50 @@
 //! One shell, on screen.
 //!
-//! A window with a single terminal in it: the grid a shell has printed, drawn as
-//! monospaced text, above a line saying which shell this is and what the bus
-//! thinks is running in it. There is one of these and there is no way to make
-//! another — tabs, splits and a sidebar are the arrangement around this, and
-//! none of it exists yet.
+//! A window with a single terminal in it: the grid a shell has printed, drawn
+//! as a monospaced grid of cells, above a line saying which shell this is and
+//! what the bus thinks is running in it. There is one of these and there is no
+//! way to make another — tabs, splits and a sidebar are the arrangement around
+//! this, and none of it exists yet.
 //!
 //! # Drawn from the grid, not from the bytes
 //!
 //! Nothing here reads the terminal device. A shell parses what its process
 //! prints on a thread of its own, into a grid it keeps; this asks that grid what
-//! it currently says and turns the answer into elements. The two are joined by a
-//! number: the grid counts how many times it has changed, this remembers the
+//! it currently says and turns the answer into a picture. The two are joined by
+//! a number: the grid counts how many times it has changed, this remembers the
 //! number it last drew, and a redraw happens when they differ. So a process
 //! printing a million lines a second costs one redraw per look rather than a
 //! million, and a still screen costs nothing at all.
 //!
-//! # What this deliberately does not do
+//! # Three steps, in that order, for a reason
 //!
-//! It draws each row as one run of text, in one colour, in whatever font the
-//! machine has under a monospaced name. Colours, bold, inverse video, the cursor,
-//! wide characters and combining marks are all things a terminal has to get
-//! right and none of them is here: this is the path from a live process to
-//! pixels, built to find out whether that path is fast enough before the work of
-//! drawing it properly is done on top.
+//! Reading the grid, working out the picture and drawing it are three separate
+//! things here, and the separation is what keeps a shell producing output at
+//! full speed while it is being watched. The grid is behind a lock the shell's
+//! reading thread needs; so it is read once, quickly, into an owned description
+//! of the screen, and the lock is gone before a single glyph has been shaped.
 //!
-//! Nor does it take input. A keyboard has to be turned into bytes through a
+//! # What this does not do
+//!
+//! It does not take input. A keyboard has to be turned into bytes through a
 //! keymap, and until there is one, what a shell runs is decided when it is
-//! started.
+//! started. It shows the part of the buffer the shell is scrolled to and offers
+//! no way to scroll it, and it has no notion of selecting anything.
 
 use std::time::{Duration, Instant};
 
 use gpui::{
     App, Context, IntoElement, ParentElement, Pixels, Render, SharedString, Size, Styled, Task,
-    Window, canvas, div, font, px,
+    Window, canvas, div, px,
 };
 use gpui_component::ActiveTheme;
 use shepherd_core::{Layout, Shell, ShellAddress, ShellSize};
 use tracing::{debug, warn};
 
 use crate::frames::Frames;
+use crate::grid::{Metrics, painting};
 use crate::live::{Live, badged, described};
+use crate::screen::Screen;
 
 /// How often the window looks at everything that changes underneath it.
 ///
@@ -54,9 +58,6 @@ const TICK: Duration = Duration::from_millis(16);
 
 /// How big the text in the grid is.
 const FONT_SIZE: Pixels = px(13.0);
-
-/// How tall a row is, as a multiple of the font's size.
-const LINE_SPACING: f32 = 1.3;
 
 /// The families a monospaced font is looked for under, in order.
 ///
@@ -165,13 +166,31 @@ impl TerminalView {
         }
     }
 
+    /// What the shell's screen currently says.
+    ///
+    /// The terminal's lock is held for exactly this, and the window's own
+    /// colours go in because the two ends of a terminal's palette — the default
+    /// foreground and the default background — are the window's rather than the
+    /// process's.
+    fn screen(&self, cx: &App) -> Screen {
+        let foreground = cx.theme().foreground;
+        let background = cx.theme().background;
+        let term = self.shell.term().lock();
+        Screen::of(&term, foreground, background)
+    }
+
     /// The line above the grid: which shell this is, what is running in it, and
     /// how fast it is being drawn.
     fn header(&self, cx: &App) -> impl IntoElement {
         let elsewhere = self.live.elsewhere();
+        let state = self.shell.state();
         let said = [
             Some(self.shell.correlation().to_owned()),
             self.shell.name().map(ToOwned::to_owned),
+            (!state.is_running()).then(|| match state.code() {
+                Some(code) => format!("exited with status {code}"),
+                None => "exited".to_owned(),
+            }),
             Some(described(self.live.presence())),
             Some(badged(self.live.status_at(self.address))),
             (elsewhere > 0).then(|| format!("{elsewhere} elsewhere")),
@@ -194,57 +213,23 @@ impl TerminalView {
     /// The grid itself.
     fn grid(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let metrics = self.metrics;
+        let family = self.family.clone();
+        let screen = self.screen(cx);
         let measuring = cx.entity();
-        let rows = self.shell.screen();
-        let state = self.shell.state();
-        let ended = (!state.is_running()).then(|| match state.code() {
-            Some(code) => format!("[the shell exited with status {code}]"),
-            None => "[the shell exited]".to_owned(),
-        });
 
-        div()
-            .flex_1()
-            .relative()
-            .overflow_hidden()
-            .px_2()
-            .py_1()
-            // What the grid was actually given, once the window has worked it
-            // out. It is asked for as an element rather than guessed at from the
-            // window's size, because everything else on screen is between the
-            // two and this is a count of rows and columns, not an estimate.
-            .child(
-                canvas(
-                    move |bounds, _, cx| {
-                        measuring.update(cx, |view, cx| view.fitted(bounds.size, cx));
-                    },
-                    |_, (), _, _| {},
-                )
-                .absolute()
-                .size_full(),
+        div().flex_1().overflow_hidden().px_2().py_1().child(
+            canvas(
+                move |bounds, window, cx| {
+                    // How many rows and columns the shell gets is the room this
+                    // element was actually given, rather than the window's size
+                    // less a guess at everything drawn around it.
+                    measuring.update(cx, |view, cx| view.fitted(bounds.size, cx));
+                    painting(screen, metrics, &family, bounds, window)
+                },
+                |_, painting, window, cx| painting.paint(window, cx),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .font_family(self.family.clone())
-                    .text_size(metrics.font_size)
-                    .line_height(metrics.line_height)
-                    .children(rows.into_iter().map(move |row| {
-                        // A blank row is still a row: given nothing to lay out,
-                        // it would take no height and every row under it would
-                        // sit one line too high.
-                        div()
-                            .h(metrics.line_height)
-                            .whitespace_nowrap()
-                            .child(SharedString::from(row))
-                    }))
-                    .children(ended.map(|ended| {
-                        div()
-                            .h(metrics.line_height)
-                            .text_color(cx.theme().muted_foreground)
-                            .child(SharedString::from(ended))
-                    })),
-            )
+            .size_full(),
+        )
     }
 }
 
@@ -268,33 +253,6 @@ impl Render for TerminalView {
             .child(self.grid(cx));
         self.frames.built(began.elapsed());
         screen
-    }
-}
-
-/// How big one cell is, in the font the grid is drawn in.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Metrics {
-    font_size: Pixels,
-    line_height: Pixels,
-    /// How far one character advances the next, which for a monospaced font is
-    /// how wide a column is.
-    cell: Pixels,
-}
-
-impl Metrics {
-    fn of(family: &SharedString, font_size: Pixels, window: &Window) -> Self {
-        let text = window.text_system();
-        let resolved = text.resolve_font(&font(family.clone()));
-        Self {
-            font_size,
-            line_height: (font_size * LINE_SPACING).round(),
-            // A font whose advance cannot be measured is one the grid cannot be
-            // laid out in either, so the guess only has to be close enough that
-            // a window opens and says so.
-            cell: text
-                .em_advance(resolved, font_size)
-                .unwrap_or(font_size * 0.6),
-        }
     }
 }
 

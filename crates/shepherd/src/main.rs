@@ -23,7 +23,10 @@
 //! way to give the shell something to do.
 
 mod frames;
+mod grid;
 mod live;
+mod palette;
+mod screen;
 mod terminal;
 
 use std::cell::RefCell;

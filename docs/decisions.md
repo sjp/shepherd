@@ -2657,3 +2657,144 @@ run's summary says how to clear that. Assets other people are given come from
 the release workflow next door, which is the one that names, checksums and
 publishes them — and Shepherd is not in it, because a GUI that has to be
 signed to be given away is a decision to make when there is something to give.
+
+## 2026-08-28 — drawing the grid properly
+
+### The screen is copied out under the lock, and drawn afterwards
+
+**Reading the grid, working out the picture and painting it are three separate
+steps, and only the first holds the terminal's lock.** The lock is the one the
+thread parsing a shell's output has to take to parse into, so a window that held
+it while choosing fonts and shaping glyphs would be a window that slows down
+every shell it is showing. So the viewport is copied once, quickly, into an owned
+description — rows of runs, the stretches of colour behind them, and where the
+cursor is — and everything after that happens with the lock long since released.
+
+That description is also the seam the whole renderer is tested through. What a
+row of cells becomes, and what a real terminal's output is read back as, are both
+answerable without a display, which is most of what there is to get wrong here.
+
+### Glyphs are put in their columns rather than advanced into them
+
+**A run of one-character-per-column cells is laid out on the grid's own spacing
+rather than the font's, and ligatures are turned off.** A terminal is a grid, and
+a grid is a promise: column forty of one row is directly above column forty of
+the next, whatever either of them holds. Text laid out the ordinary way — each
+glyph advanced by whatever the one before it was worth — keeps that promise only
+while every character is in the one monospaced font. The first character that is
+not, a box-drawing character or a symbol the machine had to go and find
+elsewhere, is a fraction of a pixel out, and every column after it on that row is
+wrong. Ligatures break it outright: two characters drawn as one glyph is one
+column too few, and a terminal's columns are not the font's to combine.
+
+The toolkit's text system takes a forced width for exactly this, and that is what
+it is given. The one thing to know about it: a glyph *narrower* than the column
+it is pinned into pushes the ones after it past the width the line was measured
+at, and the line is clipped there. It has not been seen — a fallback glyph in
+practice is as wide or wider — and it is written down here because the symptom, a
+row that loses its last few characters, would otherwise look like anything but
+what it is.
+
+The cell width is deliberately not rounded to whole pixels for the same reason:
+a column wider than the font's own advance is drift, one column at a time,
+between where the font shaped a glyph and where the grid wants it.
+
+### The exceptions are the emulator's, not this application's
+
+**Which characters are two columns wide and which are marks that belong on the
+character before them is read out of the emulator, not worked out again here.**
+It has already had to decide: it is a terminal emulator, it placed the character
+when the process printed it, and a renderer that disagrees with that decision
+draws something the process did not mean. So a wide character is one the grid
+flagged as wide, with a spacer cell after it that is never drawn; a character
+with marks over it is a cell the grid put more than one character in. Each is
+drawn on its own, at its own column, and shaped by the font within it — which is
+the whole point of them: a mark has to land on the letter it belongs to rather
+than beside it.
+
+### The process owns the palette; the window owns its two ends
+
+**Everything a program asks for by number or by name is drawn in the colour that
+number means on any other terminal, and the only two colours the window's theme
+supplies are the default foreground and the default background.** A program
+asking for red means red, whatever the window around it looks like; those two,
+on the other hand, are the colours a terminal shares with the application it sits
+in, and a window whose text is black on white while the rest of it is white on
+black is not a window, it is two windows. A program that has redefined a slot
+itself — an editor with a theme — gets what it asked for, ahead of both.
+
+The table of what a slot means when nobody has said is `xterm`'s, which is the
+terminfo entry these shells are told they are talking to. Its oddities are the
+point rather than an approximation of it.
+
+### The cursor is drawn over the text, and puts back what it covers
+
+**Backgrounds, then text, then the cursor, then the one character the cursor
+covers, drawn again in the colour behind it.** A block cursor that is painted
+before the text is invisible; one painted after it hides the character it is on,
+which is the character somebody is about to type over. Painting that character a
+second time, on top, is the cheapest way to have both. The shapes that do not
+cover anything — the bar and the underline — skip it, and a cursor the process
+has hidden, or that is scrolled out of the viewport, is not drawn at all rather
+than drawn somewhere else.
+
+What a process asks for and does not get is blinking. The emulator reports it,
+and a cursor that blinks needs a redraw on a clock of its own, unrelated to
+anything changing — which is the one thing the window's redraw condition is built
+to avoid. It is worth having and it is worth costing out; it is not worth
+smuggling in under a renderer.
+
+### The blanks at the end of a row are not drawn
+
+**Every row is as wide as the screen and most of them end in a long stretch of
+nothing, so that stretch is dropped before anything is shaped.** It is the
+difference between shaping what a row says and shaping the screen. Cells carrying
+a line under them or through them are not blank however empty they look, so the
+trimming stops at one; and a stretch of colour at the end of a row is still
+filled, because the colour behind a row is worked out separately from the text
+on it.
+
+### What it costs here, now that it draws everything
+
+**On the same container as the measurement below it — aarch64, eight cores, no
+GPU, `lavapipe` under Xvfb at 1024×700, a 128×39 grid, release build — a
+full-screen scroll now draws at 51–56 frames a second in every case tried, where
+the naive renderer managed 26–45.** It got faster by drawing more correctly: the
+blanks that make up most of a screen are no longer shaped at all.
+
+| what the shell was running | frames per second | mean frame | of which building | worst frame |
+| --- | --- | --- | --- | --- |
+| `yes hello` | 49–56 | 16–17 ms | 0.7–1.1 ms | 19–49 ms |
+| `find /usr` on a loop | 51–54 | 16–17 ms | 0.19–0.39 ms | 30–46 ms |
+| `ls --color -R /usr` on a loop | 52–55 | 16–17 ms | 0.10–0.13 ms | 19–48 ms |
+
+For comparison, the same two commands under the previous renderer measured 38–45
+and 26–31 frames a second, at 21–25 ms and 32–38 ms a frame. The third row is new:
+it is the case this renderer added work for, a screen of coloured output with a
+filled rectangle behind every coloured stretch, and it is the fastest of the
+three.
+
+Two things in that table are worth reading carefully. The rate is against a
+ceiling of about sixty — nothing is drawn more often than the window looks — so
+these are runs that nearly kept up with everything they were given rather than
+runs that could not go faster. And the building column, this application's own
+share, is now a tenth of a frame to a millisecond of a sixteen-millisecond frame:
+whatever is left to make faster here is the toolkit's paint, which on this
+container is a CPU rasteriser and on a real machine is not.
+
+The caveat from the earlier measurement stands unchanged and is the reason these
+numbers are a floor rather than an answer: every frame above was painted in
+software, which is the part a real graphics device does not do. What this
+container can now say is that the renderer that draws colours, attributes, wide
+characters, marks and a cursor is *faster* than the one that drew none of them,
+which is the comparison it is fit to make.
+
+### A screenful of everything, for the parts only a person can check
+
+**`scripts/sample-screen.sh` prints one screen containing wide characters,
+combining marks against a column ruler, the whole palette, every attribute and
+each cursor shape in turn.** Whether a mark landed on its letter or beside it,
+and whether a wide character overlaps its neighbour, are things somebody sees
+rather than things a program asserts — so what is automated is the reading of the
+grid, and what is kept for a person is one command that puts every hard case in
+front of them at once.
