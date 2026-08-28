@@ -22,5 +22,8 @@
 		"source=claude-code-config,target=/home/vscode/.claude,type=volume"
 	],
 	"remoteUser": "vscode",
+	"containerEnv": {
+		"CLAUDE_CONFIG_DIR": "/home/vscode/.claude"
+	},
 	"postCreateCommand": "${containerWorkspaceFolder}/.devcontainer/post-create.sh"
 }

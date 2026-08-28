@@ -8,31 +8,33 @@
 
 set -eu
 
-# Each agent's configuration directory is a named volume, so it arrives owned by
-# root. Every one of these agents writes its own credentials into its directory
-# on first login and none of them will do it as somebody else.
-sudo chown -R "$(id -u):$(id -g)" "$HOME/.claude" "$HOME/.codex" "$HOME/.config"
+claude_dir=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+claude_json=${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json
 
-# Claude Code asks its onboarding questions the first time it runs, which is
-# every time this container is rebuilt. This answers them once so a rebuild does
-# not cost an interactive session before any work can start.
-printf '%s\n' '{"hasCompletedOnboarding":true,"numStartups":1,"installMethod":"npm"}' \
-	>"$HOME/.claude.json"
+# The volume is root-owned on first creation, update to the container user.
+mkdir -p "$claude_dir"
+if [ "$(stat -c %u "$claude_dir")" != "$(id -u)" ]; then
+    sudo chown -R "$(id -u):$(id -g)" "$claude_dir"
+fi
 
-# Codex CLI and OpenCode have no devcontainer feature. Both publish an npm
-# package, which needs nothing this container does not already have.
-#
-# A failure here is reported and then left alone rather than allowed to fail the
-# create: an agent that did not install costs the two commands below, while a
-# container that refuses to come up costs everything else in the workspace too.
-# Whether they are really there is the first thing the verification checklist
-# asks, and `<agent> --version` is a better answer than this script's exit code.
-for package in "@openai/codex" "opencode-ai"; do
-	if ! npm install --global "$package"; then
-		printf '\n!! %s did not install. Install it by hand before verifying the\n' "$package"
-		printf '!! agents; the rest of this container is usable as it is.\n\n'
-	fi
-done
+# Skip onboarding and the per-folder trust dialog. Merge rather than overwrite.
+claude_config=$(jq -n --arg dir "$PWD" '{
+    hasCompletedOnboarding: true,
+    projects: { ($dir): { hasTrustDialogAccepted: true } }
+}')
+if [ -f "$claude_json" ]; then
+    jq --argjson add "$claude_config" '. * $add' "$claude_json" > "$claude_json.tmp"
+else
+    printf '%s\n' "$claude_config" > "$claude_json.tmp"
+fi
+mv "$claude_json.tmp" "$claude_json"
+
+# The claude-code feature installs the package as root-owned, so
+# in-place auto-updates fail with "no_permissions". Hand it to the container user.
+npm_root=$(npm root -g)
+if [ -d "$npm_root/@anthropic-ai" ]; then
+    sudo chown -R "$(id -u):$(id -g)" "$npm_root/@anthropic-ai"
+fi
 
 # What the GUI needs from the system, and nothing else. Every entry below was
 # arrived at by building and running with it absent and reading the failure, so
