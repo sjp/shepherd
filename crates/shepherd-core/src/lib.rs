@@ -80,6 +80,15 @@
 //! each of them — is kept in between runs. What is saved is the arrangement and
 //! nothing else: a restored shell is a fresh process started where the last one
 //! was, because nothing here holds a terminal open across a restart.
+//!
+//! # What the folder itself says
+//!
+//! A workspace is somebody's project folder, and two things about that folder
+//! are worth knowing without asking them: whether it describes a development
+//! container, which [`described`] answers, and what it is checked out on, which
+//! [`current_branch`] reads out of the repository's own metadata. [`Branches`]
+//! is where the second is read from, once per time somebody looks at the
+//! workspace rather than once per frame drawn of it.
 
 #![warn(missing_docs)]
 
@@ -89,6 +98,7 @@ pub mod config;
 pub mod correlation;
 pub mod daemon;
 pub mod devcontainer;
+pub mod git;
 pub mod ids;
 mod lookup;
 pub mod naming;
@@ -105,6 +115,7 @@ pub use daemon::{DaemonError, Daemons, Ended, Host, Lifecycle, Presence, Unavail
 pub use devcontainer::{
     ContainerError, Containers, Devcontainer, Machine, Outcome, Shells, StartError, described,
 };
+pub use git::{Branches, current_branch};
 pub use ids::{ShellAddress, ShellId, ShellIds, TabId, TabIds, WorkspaceId, WorkspaceIds};
 pub use naming::{FOREGROUND_INTERVAL, Foreground, ForegroundProcess, Kernel, Pid, ShellName};
 pub use rollup::{RollupStatus, rollup, shell_status};

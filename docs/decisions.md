@@ -2925,3 +2925,68 @@ through an asset source, and this application has none — so an icon would be a
 missing image where a control should be. A multiplication sign and a plus are
 two characters in a font the machine certainly has, and are what those two
 controls have looked like for thirty years.
+
+## 2026-08-28 — the branch a workspace is on
+
+### The repository's metadata is read directly; no library, no program
+
+**Two small files are opened and one line is read out of them: no git library
+is taken as a dependency, and the `git` command is never run.** What is wanted
+is one short string per project folder, refreshed when somebody looks at that
+folder — a value so small that both alternatives cost more than the thing they
+would deliver. A library brings a full implementation of an object database,
+its packfile formats and its configuration resolution into a build that needs
+none of it; running the command makes a program that may not be installed a
+requirement for a folder's name to be drawn correctly, on a host which — for a
+workspace whose shells run in a development container — may quite reasonably
+have no toolchain on it at all.
+
+What is given up is generality, and that is stated rather than hidden: the two
+shapes read are a working tree with its metadata beside it and a working tree
+whose metadata is a file naming where the metadata really is, which is what an
+additional working tree of one repository and a repository held inside another
+both look like. Anything else — a repository arranged in a way this does not
+recognise, a `HEAD` saying something unfamiliar, a folder nobody has run
+version control in — is no branch at all, silently. A project folder having no
+branch to show is an ordinary thing that happens to people, not a condition to
+put in front of them, and the row is drawn without one.
+
+The decision is bounded by being read-only and by being the *only* thing read.
+Nothing about what is modified, staged, stashed or ahead of anything is
+touched. The moment something here wants to know any of that, this decision is
+the wrong one and should be replaced rather than extended — reimplementing a
+status walk against the metadata by hand is exactly the second, worse copy that
+taking a library would have avoided.
+
+### A tree on no branch is named by its commit, abbreviated
+
+**A detached head reads as the first seven characters of the commit it is on,
+not as nothing and not as an error.** It is what such a state is called
+everywhere else it is written down, and a person who has deliberately checked
+out a commit is helped more by seeing which one than by a row that has gone
+blank. The abbreviation is not distinguishable from a branch by its type — the
+answer is one string either way — because nothing displaying it needs to tell
+them apart, and a caller that did could ask the repository itself.
+
+The whole of the name has to be a commit's for it to be shortened into one. The
+first seven characters of a `HEAD` this does not otherwise understand would be
+a plausible-looking answer manufactured out of a file whose meaning was not
+established, and a wrong answer that looks right is worse than the nothing that
+every other unreadable state produces.
+
+### The branch is read when a workspace is looked at, and remembered in between
+
+**A workspace's branch is read as it becomes the current one and held until it
+becomes current again; nothing polls, nothing watches the filesystem, and
+nothing reads while a frame is being drawn.** A branch name is drawn wherever a
+workspace is drawn, which is every frame, and a filesystem read per row per
+frame would pay continuously for a value that changes when somebody runs a
+command in a terminal. Refresh-on-focus makes the name right whenever anybody
+is in a position to be looking at it, which is the only time its being right
+matters, and free the rest of the time.
+
+The staleness that buys is real and deliberate: a workspace switched to another
+branch while somebody was working in a different one keeps its old name until
+they come back to it. A watcher would close that window, at the cost of a watch
+descriptor per open project and a stream of events for every file written in a
+build — for a label whose being a few seconds old has never misled anybody.
