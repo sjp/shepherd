@@ -13,3 +13,18 @@ exists.
 
 Technology choices and the reasoning behind them are recorded in
 [`docs/decisions.md`](docs/decisions.md).
+
+## Running Shepherd on macOS
+
+macOS only treats a program as an application when it is inside a bundle, so
+Shepherd is built into one. A Mac is also the only machine that can build it at
+all — the toolkit compiles its shaders with Xcode's own tools on the machine
+doing the building.
+
+```sh
+scripts/bundle-macos.sh              # dist/Shepherd.app, for this Mac
+open dist/Shepherd.app               # or double-click it in Finder
+```
+
+The bundle is ad-hoc signed, which is enough for the machine that built it. It is
+not notarised, so it is not something to pass on to anybody else.

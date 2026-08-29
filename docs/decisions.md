@@ -3078,3 +3078,62 @@ That is a change to what the window *is*, not to what the sidebar draws, and it
 is deliberately not smuggled in behind a rendering change. Recorded here rather
 than left as an omission: until it is built, the top level of the tree is a
 level of one, and everything below it is the part that carries its weight.
+
+## 2026-08-29 — the application bundle
+
+### The identity is a directory, and a script assembles it
+
+**`scripts/bundle-macos.sh` builds `shepherd` for one macOS triple and puts it in
+`dist/Shepherd.app`, and that bundle — not anything in the program — is what gives
+the application its name.** Run as a bare executable the process is not an
+application at all as far as the system is concerned: the menu bar goes on naming
+the terminal that launched it, there is no Dock tile to put a window under and no
+About panel to open. Every one of those is decided from `Contents/Info.plist`
+before `main` runs, so no amount of code could have asked for them.
+
+A shell script rather than a packaging crate or a `build.rs` step, because this
+repository already spells release mechanics as scripts — the same directory
+builds the bus's assets and writes their manifest — and because the plist is a
+document that wants reviewing rather than generating from a table somebody has to
+learn. It shares `release-lib.sh` with those scripts so the version number has one
+source here as it does there.
+
+The bundle is assembled into `dist/`, which is untracked, and nothing it produces
+is committed. It is ad-hoc signed (`codesign --sign -`), which is the minimum that
+lets the machine that built it launch it without an argument; it is not notarised
+and is not something to hand to anybody else. That remains the release workflow's
+business, and Shepherd is still not in it.
+
+### `io.github.sjp.shepherd`
+
+**The bundle identifier is `io.github.sjp.shepherd`, and it does not change
+again.** macOS keys durable per-application state to it — window positions, the
+Dock's idea of what is pinned, permissions granted once and expected to stick —
+so an identifier that moved would silently orphan all of it. It is spelt from
+where this repository lives, which is the one name that is already unambiguous and
+already belongs to whoever publishes it.
+
+### The version and the oldest system are read off what was built
+
+**Neither number in the plist is written down.** `CFBundleShortVersionString` and
+`CFBundleVersion` are the workspace version, the same one the binary answers
+`--version` with, so a bundle cannot claim a release the binary inside it is not.
+`LSMinimumSystemVersion` is read from the built binary's own load commands, which
+is where the compiler recorded the deployment target it actually chose. Asserting
+that floor by hand gets it wrong in one of two directions — too high turns away
+machines the binary runs on perfectly, too low lets the system launch something
+that cannot load — and both are silent until somebody with the wrong Mac tries it.
+When the load command cannot be read the script says so and falls back, rather
+than producing a plist whose provenance nobody could tell.
+
+### The placeholder icon is drawn, so that nothing binary is committed for it
+
+**With no `--icon`, the script draws the icon it bundles: a rounded square with a
+ring in it, rendered at each size the system asks for and handed to `iconutil`.**
+An icon is the one asset a bundle cannot do without, and the alternative to
+drawing one was committing a binary blob that exists only to be replaced. The
+drawing is a few lines over a signed distance field with no dependency beyond a
+standard library, and it is deliberately plain: it should read as a placeholder to
+anyone who sees it, and it costs nothing to delete. `--icon` takes an `.icns`
+whole or builds one from a square `.png`, which is the whole of what changes on
+the day there is a real one.
