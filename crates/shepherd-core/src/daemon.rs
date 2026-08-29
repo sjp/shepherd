@@ -4,7 +4,9 @@
 //! machine where nobody has started one is the ordinary case rather than a
 //! misconfigured one: somebody installs the bus, installs its hooks in their
 //! coding agent, and expects the thing that reads it to work. So this starts
-//! one when there is none, and notices when the one it started has gone.
+//! one when there is none, notices when the one it started has gone, and stops
+//! it again when whatever was reading it is done — a daemon nobody asked for
+//! should not outlive the thing that wanted it.
 //!
 //! ```no_run
 //! use std::time::Instant;
@@ -52,7 +54,9 @@
 //! — a bus that behaved differently under this application would be a bus whose
 //! behaviour could not be reasoned about from its own documentation, and the
 //! same daemon has to serve the shell scripts and the command line that are
-//! reading it alongside this.
+//! reading it alongside this. Stopping one is the same story told backwards: a
+//! termination signal, which is what any shell would send it, and no way for
+//! the daemon to tell who sent it.
 //!
 //! What it says goes where the bus puts what a daemon nobody is watching says:
 //! a file beside its sockets, named by the bus and appended to. That is not a
@@ -81,6 +85,7 @@ use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use agentbus_paths::{LOG_MODE, SocketPaths};
@@ -139,6 +144,22 @@ pub const DEFAULT_BACKOFF: Duration = Duration::from_secs(2);
 /// starting at once, a daemon shutting down as this one arrives — and few
 /// because the failures that are not races are permanent.
 pub const DEFAULT_ATTEMPTS: u32 = 3;
+
+/// How long a daemon that has been asked to stop is given to do it.
+///
+/// A daemon stopping has files to unlink and far ends to say goodbye to, and
+/// none of that is instant on a machine that is busy shutting other things down
+/// too. What follows the wait is a kill, so this is the whole of the daemon's
+/// chance to leave in good order — and it is also the longest that quitting can
+/// be made to take by a daemon that is never going to answer.
+pub const DEFAULT_STOPPING: Duration = Duration::from_secs(2);
+
+/// How often a daemon that has been asked to stop is looked at.
+///
+/// Short enough that quitting is not visibly slower than the daemon is, and
+/// long enough that the wait is not a spin: what is being waited for is a
+/// process exiting, and the answer arrives in milliseconds or not at all.
+const LOOK: Duration = Duration::from_millis(10);
 
 /// What is known about the bus.
 ///
@@ -275,10 +296,29 @@ pub trait Daemons {
 ///
 /// The daemon it starts is an ordinary child, which is what makes it
 /// supervisable: a process that had been put beyond this one's reach could not
-/// afterwards be asked whether it is still there. It is left running when this
-/// application exits, because the bus is not this application's — a person's
-/// hooks go on emitting into it, and the next thing to read the stream finds
-/// the state that accumulated in the meantime rather than an empty daemon.
+/// afterwards be asked whether it is still there, nor asked to stop.
+///
+/// # A daemon started here is stopped here
+///
+/// Ownership decides it, and only ownership. A daemon this started was started
+/// because there was no bus and something wanted one, which makes it a
+/// convenience of this run rather than a thing anybody asked for — and leaving
+/// it behind would mean a program somebody had closed went on running a process
+/// they never knew it had made. So [`stop`] ends it.
+///
+/// A bus that was already there when this looked is never signalled. Somebody
+/// who runs their own daemon has one that outlives whatever reads it, which is
+/// the arrangement they chose by starting it, and nothing here may take that
+/// away from them. The distinction is recorded by [`started`] and is the whole
+/// of the test: what was found is not what was started, however alike the two
+/// look from outside.
+///
+/// Dropping one of these stops it too, for the same reason: this holds the only
+/// handle on that process, so a host that went away quietly would leave behind
+/// exactly the daemon nobody can account for.
+///
+/// [`stop`]: Host::stop
+/// [`started`]: Host::started
 #[derive(Debug, Default)]
 pub struct Host {
     path: Vec<PathBuf>,
@@ -307,12 +347,75 @@ impl Host {
     /// The process the daemon started here is, while it is still running.
     ///
     /// The one thing this knows that nothing else can find out: a bus may be
-    /// served by a daemon somebody else started, and the difference matters to
-    /// anything reporting on what this application is responsible for. It is
-    /// not a handle on the daemon — stopping one is nobody's business here, and
-    /// a bus is left running when this application exits.
+    /// served by a daemon somebody else started, and the difference matters
+    /// both to anything reporting on what this application is responsible for
+    /// and to [`stop`](Self::stop), which acts on this and on nothing else.
     pub fn started(&self) -> Option<u32> {
         self.daemon.as_ref().map(Child::id)
+    }
+
+    /// Stops the daemon started here, and waits for it to go.
+    ///
+    /// Does nothing at all when this started none — including when the one it
+    /// started has already ended, and when the bus is served by a daemon
+    /// somebody else runs. Nothing is signalled that was not started here.
+    ///
+    /// For the end of a run: what is stopped cannot be started again by this,
+    /// and the next [`start`](Daemons::start) would be a new daemon.
+    pub fn stop(&mut self) {
+        self.stop_within(DEFAULT_STOPPING);
+    }
+
+    /// Stops it, allowing `within` for it to stop rather than
+    /// [`DEFAULT_STOPPING`].
+    ///
+    /// `SIGTERM` first, which is what the daemon shuts down in good order on:
+    /// its sockets come back down with it, and whatever it was attached to is
+    /// told. Then the wait, which is bounded, and then `SIGKILL` — because the
+    /// one thing worse than a daemon left running is an application that will
+    /// not close because of one.
+    pub fn stop_within(&mut self, within: Duration) {
+        let Some(mut daemon) = self.daemon.take() else {
+            return;
+        };
+        let pid = daemon.id();
+        debug!(pid, "stopping the bus started here");
+        // Safe: a signal to a process this one started and has not yet waited
+        // for, so the number still names that process and cannot have come to
+        // name another. A failure means it is already dead, which is where the
+        // wait below was going anyway.
+        if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } != 0 {
+            debug!(pid, error = %io::Error::last_os_error(), "cannot ask the bus to stop");
+        }
+
+        let deadline = Instant::now() + within;
+        loop {
+            match daemon.try_wait() {
+                Ok(Some(status)) => {
+                    debug!(pid, status = status.code(), "the bus stopped");
+                    return;
+                }
+                Ok(None) if Instant::now() < deadline => thread::sleep(LOOK),
+                Ok(None) => break,
+                // The same reasoning as everywhere else a child cannot be waited
+                // for: nothing can be asked of it, so it is treated as gone. The
+                // signal has been sent and this run is over.
+                Err(error) => {
+                    warn!(pid, %error, "cannot tell whether the bus stopped");
+                    return;
+                }
+            }
+        }
+
+        warn!(
+            pid,
+            ?within,
+            "the bus did not stop when it was asked, and is being killed"
+        );
+        let _ = daemon.kill();
+        // Reaped rather than left: a zombie outlives this either way, but only
+        // until this process does, and waiting is what says the kill landed.
+        let _ = daemon.wait();
     }
 }
 
@@ -374,6 +477,17 @@ impl Daemons for Host {
                 Some(Ended::Stopped { status: None })
             }
         }
+    }
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        // This holds the only handle there is on the daemon it started: letting
+        // go of it without stopping the daemon would leave a process nothing
+        // can afterwards be asked of and nothing can stop, which is the one
+        // outcome the started-here distinction exists to prevent. A host that
+        // started nothing has nothing to do here.
+        self.stop();
     }
 }
 

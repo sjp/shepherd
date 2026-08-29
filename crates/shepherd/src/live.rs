@@ -98,6 +98,19 @@ impl Live {
         self.lifecycle.presence()
     }
 
+    /// Stops the daemon this started, and waits for it to go.
+    ///
+    /// For the end of a run: a daemon started here was started because there
+    /// was no bus and this wanted one, and a window closing is the end of that
+    /// wanting. A bus that was already running when this looked is left exactly
+    /// as it was found — somebody else started it, and it is theirs.
+    pub fn stop(&mut self) {
+        if let Some(pid) = self.host.started() {
+            info!(pid, "stopping the bus this started");
+        }
+        self.host.stop();
+    }
+
     /// Where everything the bus is reporting is running, as of the last look.
     pub fn attribution(&self) -> &Attribution {
         &self.attribution

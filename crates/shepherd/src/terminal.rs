@@ -198,6 +198,9 @@ pub struct TerminalView {
     /// The timer that looks at all of it. Held because dropping it stops the
     /// looking.
     _ticking: Task<()>,
+    /// The standing arrangement by which the toolkit says this application is
+    /// quitting. Held because letting go of it would cancel it.
+    _quitting: Subscription,
 }
 
 impl TerminalView {
@@ -223,6 +226,21 @@ impl TerminalView {
         if let Some(workspace) = layout.workspace(address.workspace) {
             branches.focused(workspace);
         }
+        // Quitting is where the bus this window started is put down: a daemon
+        // that exists because this wanted one has no reason to outlive the
+        // application that wanted it, and once this process is gone there is
+        // nothing left that can stop it. The toolkit calls this whichever way
+        // the quit was asked for, and calls it while there is still a window;
+        // the way out that closes the last window instead takes this view with
+        // it, and what covers that is the bus being stopped as it is dropped.
+        let quitting = cx.on_app_quit(|view: &mut Self, _| {
+            view.live.stop();
+            // Nothing to wait for: the stop has already waited, on this thread,
+            // for as long as it is prepared to. The toolkit gives what is
+            // returned here far less time than a daemon may need to shut down
+            // in good order, so what it gets is a future that is already done.
+            async {}
+        });
         let ticking = cx.spawn(async move |view, cx| {
             loop {
                 cx.background_executor().timer(TICK).await;
@@ -250,6 +268,7 @@ impl TerminalView {
             metrics,
             frames: Frames::new(),
             _ticking: ticking,
+            _quitting: quitting,
         };
         view.hold(first, window, cx);
         view.focus(address.shell, window);

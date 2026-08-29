@@ -567,7 +567,8 @@ fn a_daemon_that_is_still_running_has_not_ended() {
         panic!("a daemon that was started should say which process it is");
     };
 
-    // Nothing here stops a daemon, so this test does what a person would.
+    // What a person at a terminal would do, rather than what this crate now
+    // does: `ended` should answer the same either way.
     stop(pid);
     assert!(matches!(
         wait_for_end(&mut host, "the daemon to stop"),
@@ -581,6 +582,140 @@ fn stop(pid: u32) {
     // defines and an integer it can only refuse.
     let sent = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
     assert_eq!(sent, 0, "cannot stop the process this test started");
+}
+
+/// Waits for `path` to appear, or fails saying what it was waiting for.
+fn wait_for(path: &Path, expectation: &str) {
+    let deadline = Instant::now() + PATIENCE;
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "waited {PATIENCE:?} for {expectation}"
+        );
+        thread::sleep(GLANCE);
+    }
+}
+
+/// Whether a process is still there to be signalled.
+///
+/// Signal nought is the question without the signal: the platform does every
+/// check it would do for a real one and delivers nothing. Asked only of
+/// processes these tests started and have already reaped or are about to, so
+/// the number cannot have come to name somebody else's process by the time it
+/// is asked.
+fn alive(pid: u32) -> bool {
+    // Safe: no signal is sent; the call only reports whether one could be.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[test]
+fn stopping_ends_the_daemon_this_started() {
+    let bin = dir();
+    let mut host = command_in(bin.path(), "exec sleep 60");
+    host.start(dir().path()).expect("a daemon");
+    let pid = host.started().expect("the daemon this started");
+
+    host.stop();
+
+    assert!(
+        !alive(pid),
+        "the daemon this started should have been stopped"
+    );
+    assert_eq!(
+        host.started(),
+        None,
+        "a daemon that has been stopped is not one that is running"
+    );
+    assert_eq!(host.ended(), None, "there is nothing left to report on");
+}
+
+#[test]
+fn a_daemon_started_here_does_not_outlive_what_started_it() {
+    let bin = dir();
+    let pid = {
+        let mut host = command_in(bin.path(), "exec sleep 60");
+        host.start(dir().path()).expect("a daemon");
+        host.started().expect("the daemon this started")
+    };
+
+    assert!(
+        !alive(pid),
+        "letting go of the host should not leave its daemon running"
+    );
+}
+
+#[test]
+fn a_bus_this_did_not_start_is_left_alone() {
+    let bin = dir();
+    // Somebody else's daemon: started here the way a person would start one,
+    // and never handed to the host that is asked to stop.
+    let mut theirs = Command::new("sleep")
+        .arg("60")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("a process standing in for a bus somebody else runs");
+
+    let mut host = command_in(bin.path(), "exec sleep 60");
+    assert_eq!(host.started(), None, "this has started nothing");
+    host.stop();
+
+    assert!(
+        alive(theirs.id()),
+        "a bus this did not start should be untouched by this stopping"
+    );
+    stop(theirs.id());
+    let _ = theirs.wait();
+
+    // And the same once one it started has ended on its own: what it may stop
+    // is what it is still running, not what it once ran.
+    host.start(dir().path()).expect("a daemon");
+    let pid = host.started().expect("the daemon this started");
+    stop(pid);
+    wait_for_end(&mut host, "the daemon to stop");
+    assert_eq!(
+        host.started(),
+        None,
+        "a daemon that has ended is not one this is still running"
+    );
+    host.stop();
+}
+
+#[test]
+fn a_daemon_that_will_not_stop_is_killed_rather_than_waited_for() {
+    let bin = dir();
+    let deaf = bin.path().join("deaf");
+    // Ignoring a signal survives the exec that follows it, so what ends up
+    // running is a process that has been asked to stop and will not. The file
+    // is what says the trap is installed: a script signalled before it has run
+    // its first line dies of the signal like anything else, and this test is
+    // about the ones that do not.
+    let mut host = command_in(
+        bin.path(),
+        &format!("trap '' TERM\n: > {}\nexec sleep 60", deaf.display()),
+    );
+    host.start(dir().path()).expect("a daemon");
+    let pid = host.started().expect("the daemon this started");
+    wait_for(&deaf, "the daemon to stop listening for the signal");
+
+    let bound = Duration::from_millis(200);
+    let began = Instant::now();
+    host.stop_within(bound);
+    let took = began.elapsed();
+
+    assert!(
+        !alive(pid),
+        "a daemon that would not stop should have been killed"
+    );
+    assert!(
+        took >= bound,
+        "a daemon should be given the whole of its chance to stop: {took:?}"
+    );
+    assert!(
+        took < PATIENCE,
+        "quitting should not wait on a daemon that is never going to answer: {took:?}"
+    );
 }
 
 #[test]
@@ -750,6 +885,45 @@ fn a_real_bus_is_started_where_there_is_none() {
         wait_for_end(&mut host, "the daemon to stop"),
         Ended::Stopped { .. }
     ));
+}
+
+#[test]
+fn a_real_bus_stopped_here_takes_its_sockets_down_with_it() {
+    let Some(bus) = built() else {
+        return;
+    };
+    let served = dir();
+    let paths = SocketPaths::in_dir(served.path());
+    let mut host = Host::searching([bus.parent().expect("a directory")]);
+
+    host.start(served.path()).expect("a daemon");
+    let pid = host.started().expect("the daemon this started");
+    let deadline = Instant::now() + PATIENCE;
+    while std::os::unix::net::UnixStream::connect(paths.sub()).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon this test started never served {}",
+            served.path().display()
+        );
+        thread::sleep(GLANCE);
+    }
+
+    host.stop();
+
+    assert!(
+        !alive(pid),
+        "the daemon this started should have been stopped"
+    );
+    // Nothing here removed any of these: the daemon takes down what it put up
+    // when it is asked to stop, and their being gone is what says it was asked
+    // rather than killed where it stood.
+    for file in paths.ephemeral() {
+        assert!(
+            !file.exists(),
+            "a daemon that stopped in good order should have removed {}",
+            file.display()
+        );
+    }
 }
 
 #[test]
