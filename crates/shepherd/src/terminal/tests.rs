@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use agentbus_protocol::SessionStatus::{Blocked, Working};
 use agentbus_protocol::{Agent, SessionEntry, SessionStatus, Snapshot, Source, Timestamp};
-use gpui::{Entity, Modifiers, Point, TestAppContext, VisualTestContext, point};
+use gpui::{Action, Entity, Modifiers, Point, TestAppContext, VisualTestContext, point};
 use shepherd_core::{Program, ShellAddress, ShellStatus, Update};
 
 use super::*;
@@ -178,6 +178,66 @@ fn share_of(view: &TerminalView, shell: ShellId) -> shepherd_core::Rect {
         .find(|placed| placed.shell == shell)
         .expect("the shell is in the tab on screen")
         .bounds
+}
+
+/// Every action a menu offers that acts on a shell, paired with the chord bound
+/// to the same one, in an order that gets through all of them: a tab opened,
+/// stepped away from and back to, a shell split both ways, focus walked around
+/// what that made, and the last shell closed.
+///
+/// The two menu items that are the application's own are not here — one of them
+/// ends the process, which is not a thing a test can do halfway.
+fn both_ways() -> Vec<(Box<dyn Action>, &'static str)> {
+    let keys = keys();
+    vec![
+        (Box::new(NewTab), keys.new_tab),
+        (Box::new(NextTab), keys.next_tab),
+        (Box::new(PreviousTab), keys.previous_tab),
+        (Box::new(SplitRight), keys.split_right),
+        (Box::new(SplitDown), keys.split_down),
+        (Box::new(FocusLeft), keys.focus_left),
+        (Box::new(FocusRight), keys.focus_right),
+        (Box::new(FocusUp), keys.focus_up),
+        (Box::new(FocusDown), keys.focus_down),
+        (Box::new(Close), keys.close),
+    ]
+}
+
+/// Which of the two ways in a step of that script is taken by.
+#[derive(Debug, Clone, Copy)]
+enum By {
+    Chord,
+    Menu,
+}
+
+/// Runs the whole script one of the two ways, in a window of its own, and
+/// answers what that window was showing after each step.
+fn walked(cx: &mut TestAppContext, by: By) -> Vec<String> {
+    let (view, cx) = opened(cx);
+    let mut said = Vec::new();
+    for (action, chord) in both_ways() {
+        match by {
+            By::Chord => cx.simulate_keystrokes(chord),
+            // Choosing a menu item is this and nothing else: the platform hands
+            // the action back and the toolkit dispatches it, with no idea where
+            // it will be answered.
+            By::Menu => cx.update(|window, cx| window.dispatch_action(action, cx)),
+        }
+        cx.run_until_parked();
+        said.push(view.read_with(cx, arrangement));
+    }
+    said
+}
+
+/// What the window is showing, in a line: how many tabs are open, the shells in
+/// the one on screen, and which of them is being typed in.
+fn arrangement(view: &TerminalView, _: &App) -> String {
+    format!(
+        "{} tabs; showing {:?}; typing in {:?}",
+        view.open().tabs().len(),
+        view.showing(),
+        view.focused,
+    )
 }
 
 /// Types `text` one key at a time, the way a person would.
@@ -878,5 +938,28 @@ fn folding_a_workspace_takes_its_tabs_off_the_sidebar_and_leaves_its_badge(
         sidebar.agents.len(),
         1,
         "the list of agents is not folded away with it"
+    );
+}
+
+#[gpui::test]
+fn a_menu_item_does_what_its_chord_does(cx: &mut TestAppContext) {
+    let script = both_ways();
+    for binding in crate::keymap::bindings() {
+        let action = binding.action();
+        assert!(
+            action.partial_eq(&crate::keymap::Quit)
+                || script.iter().any(|(named, _)| named.partial_eq(action)),
+            "`{}` can be chosen or pressed, and nothing here does both",
+            action.name()
+        );
+    }
+
+    let by_chord = walked(cx, By::Chord);
+    let by_menu = walked(cx, By::Menu);
+
+    assert_eq!(
+        by_menu, by_chord,
+        "the two ways in reach the same actions, so they cannot leave the window \
+         saying different things"
     );
 }

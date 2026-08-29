@@ -30,6 +30,7 @@ mod grid;
 mod keymap;
 mod keys;
 mod live;
+mod menu;
 mod palette;
 mod screen;
 mod sidebar;
@@ -56,9 +57,6 @@ use crate::terminal::TerminalView;
 /// itself, for a person who wants to see the bus being read rather than infer it
 /// from the window.
 const LOG_VAR: &str = "SHEPHERD_LOG";
-
-/// What the window is called.
-const TITLE: &str = "Shepherd";
 
 /// What the desktop groups this application's windows under.
 const APP_ID: &str = "shepherd";
@@ -153,6 +151,7 @@ fn open(command: &[String]) -> Result<()> {
         move |cx: &mut App| {
             gpui_component::init(cx);
             keymap::install(cx);
+            menu::install(cx);
             let opened = cx.open_window(window(cx), |window, cx| {
                 let view = cx.new(|cx| TerminalView::new(shell, layout, options, window, cx));
                 // The first layer in the window is the widget layer's own root,
@@ -192,7 +191,7 @@ fn window(cx: &App) -> WindowOptions {
             cx,
         ))),
         titlebar: Some(TitlebarOptions {
-            title: Some(TITLE.into()),
+            title: Some(menu::NAME.into()),
             ..TitlebarOptions::default()
         }),
         app_id: Some(APP_ID.to_owned()),

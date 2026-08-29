@@ -13,9 +13,14 @@
 //! toolkit's own keymap. That means the binding and the code that answers it
 //! never meet: a key press is matched against the keymap, becomes an action,
 //! and is delivered to whichever part of the window the toolkit decides should
-//! handle it — which, for everything here, is the shell that has focus, because
-//! that is where the handlers are registered. Everything that matches nothing
-//! here goes on to be typed, and one module over is what it is typed as.
+//! handle it — which, for everything that acts on a shell, is the shell that
+//! has focus, because that is where the handlers are registered. Everything
+//! that matches nothing here goes on to be typed, and one module over is what
+//! it is typed as.
+//!
+//! Two of the actions are not a shell's — saying what this application is, and
+//! ending it — and they are answered by the application itself, one module the
+//! other way, alongside the menus that offer the same two by name.
 //!
 //! # Two tables, because the two platforms disagree
 //!
@@ -51,6 +56,10 @@ actions!(
         FocusUp,
         /// Moves focus to the shell below.
         FocusDown,
+        /// Says what this application is, and which build of it this is.
+        About,
+        /// Ends the application, and everything it started with it.
+        Quit,
     ]
 );
 
@@ -75,6 +84,7 @@ pub struct Keys {
     pub focus_right: &'static str,
     pub focus_up: &'static str,
     pub focus_down: &'static str,
+    pub quit: &'static str,
 }
 
 /// The defaults on macOS, which are the ones its terminals use.
@@ -95,6 +105,7 @@ const MAC: Keys = Keys {
     focus_right: "cmd-alt-right",
     focus_up: "cmd-alt-up",
     focus_down: "cmd-alt-down",
+    quit: "cmd-q",
 };
 
 /// The defaults everywhere else, which are the ones its terminals use.
@@ -119,6 +130,11 @@ const ELSEWHERE: Keys = Keys {
     focus_right: "alt-right",
     focus_up: "alt-up",
     focus_down: "alt-down",
+    // Quitting is what this platform's applications leave on control, shift and
+    // Q, and it is what the terminals here leave it on too — which is what
+    // makes it the one chord that can be taken from a shell without taking
+    // anything a program running in one is entitled to.
+    quit: "ctrl-shift-q",
 };
 
 /// The table this machine uses.
@@ -138,6 +154,17 @@ pub fn table() -> Keys {
 /// The keymap, ready to be given to the application.
 pub fn bindings() -> Vec<KeyBinding> {
     let keys = table();
+    let mut bindings = in_a_shell(keys);
+    // Quitting is the one press that is not asked of a shell, so it is the one
+    // that is not scoped to one: a person who has just answered a dialog and
+    // wants to leave should not have to put focus back in a terminal first.
+    bindings.push(KeyBinding::new(keys.quit, Quit, None));
+    bindings
+}
+
+/// The bindings that act on the shell being typed in, which is all of them bar
+/// one.
+fn in_a_shell(keys: Keys) -> Vec<KeyBinding> {
     vec![
         KeyBinding::new(keys.new_tab, NewTab, Some(CONTEXT)),
         KeyBinding::new(keys.next_tab, NextTab, Some(CONTEXT)),
@@ -166,7 +193,7 @@ mod tests {
     impl Keys {
         /// Every key in this table, so a test can say something about all of
         /// them without listing them again.
-        fn all(self) -> [&'static str; 10] {
+        fn all(self) -> [&'static str; 11] {
             [
                 self.new_tab,
                 self.next_tab,
@@ -178,6 +205,7 @@ mod tests {
                 self.focus_right,
                 self.focus_up,
                 self.focus_down,
+                self.quit,
             ]
         }
     }
@@ -223,12 +251,24 @@ mod tests {
     }
 
     #[test]
-    fn the_bindings_are_scoped_to_a_shell() {
-        for binding in bindings() {
+    fn everything_a_shell_is_asked_is_scoped_to_one() {
+        for binding in in_a_shell(table()) {
             assert!(
                 binding.predicate().is_some(),
                 "an unscoped binding would apply wherever focus happened to be"
             );
         }
+    }
+
+    #[test]
+    fn quitting_is_answered_wherever_focus_is() {
+        let quit = bindings()
+            .into_iter()
+            .find(|binding| binding.action().partial_eq(&Quit))
+            .expect("the quit is bound");
+        assert!(
+            quit.predicate().is_none(),
+            "scoping the quit to a shell would be a way out that a dialog could stand in front of"
+        );
     }
 }
