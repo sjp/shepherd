@@ -54,6 +54,12 @@
 //! same daemon has to serve the shell scripts and the command line that are
 //! reading it alongside this.
 //!
+//! What it says goes where the bus puts what a daemon nobody is watching says:
+//! a file beside its sockets, named by the bus and appended to. That is not a
+//! decision about the daemon's logging — it keeps the flags and the defaults it
+//! has — only about which end of the pipe this hands it, and the end it must
+//! not be handed is a terminal somebody launched a window from.
+//!
 //! Hook installation is not here and is not anywhere else in this application
 //! either. Putting hooks into somebody's coding agent edits files they own, and
 //! that is a decision they make with the bus's own command. An agent appears
@@ -70,12 +76,14 @@
 //!
 //! [`tick`]: Lifecycle::tick
 
+use std::fs::OpenOptions;
 use std::io;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use agentbus_paths::SocketPaths;
+use agentbus_paths::{LOG_MODE, SocketPaths};
 use thiserror::Error;
 use tracing::{debug, warn};
 
@@ -325,14 +333,19 @@ impl Daemons for Host {
             .current_dir(Path::new("/"))
             // Nothing to read: a daemon started here is not attached to
             // anybody's terminal, and one that inherited this process's input
-            // would be a second reader of it.
+            // would be a second reader of it. Nothing to write on stdout
+            // either — the bus keeps that for what a consumer parses, and a
+            // daemon says everything it has to say on stderr.
             .stdin(Stdio::null())
-            // What it says goes wherever this application's own diagnostics go,
-            // which is the same place they would go had somebody run it in the
-            // terminal this was started from. Capturing them into a pipe nobody
-            // drains would eventually stop the daemon writing them, and sending
-            // them to a file of this application's choosing would be a decision
-            // about the bus's own logging that belongs to the bus.
+            .stdout(Stdio::null())
+            // And its stderr is not this process's. Somebody who launched this
+            // application from a terminal would otherwise have the daemon's
+            // logging arrive in that terminal, and go on arriving in it after
+            // the application had gone: output pumping from a program its
+            // owner believes is closed. The bus already names a file beside
+            // its sockets for a daemon nobody is watching start, and one
+            // started from a window is exactly that.
+            .stderr(diagnostics(dir))
             .spawn()
             .map_err(|source| DaemonError::CannotRun {
                 path: path.clone(),
@@ -360,6 +373,37 @@ impl Daemons for Host {
                 self.daemon = None;
                 Some(Ended::Stopped { status: None })
             }
+        }
+    }
+}
+
+/// Where a daemon serving `dir` is given to say what it has to say.
+///
+/// The file the bus names for the purpose, opened here because the daemon does
+/// not open it: whoever starts one with nobody watching hands it somewhere its
+/// account of itself survives, and appending is what makes the run before this
+/// one still readable.
+///
+/// A file that cannot be opened is reported and given up on rather than
+/// falling back to this process's own stderr, which is the terminal this is
+/// trying to keep clear. A bus running without a log is worth more than a
+/// terminal that carries it.
+fn diagnostics(dir: &Path) -> Stdio {
+    let path = SocketPaths::in_dir(dir).log().to_owned();
+    match OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(LOG_MODE)
+        .open(&path)
+    {
+        Ok(log) => Stdio::from(log),
+        Err(error) => {
+            warn!(
+                path = %path.display(),
+                %error,
+                "cannot keep what the bus says; it is being discarded"
+            );
+            Stdio::null()
         }
     }
 }

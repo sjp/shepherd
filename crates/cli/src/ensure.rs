@@ -30,19 +30,9 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use agentbus_daemon::SocketPaths;
+use agentbus_paths::{LOG_FILE, LOG_MODE};
 use thiserror::Error;
 use tracing::debug;
-
-/// The file a detached daemon's diagnostics are appended to.
-///
-/// Beside the sockets rather than anywhere a system logger would put it, because
-/// the directory is already the one thing everything talking to this bus agrees
-/// on, and because a daemon nobody watched start is one whose only account of
-/// itself is this file.
-pub const LOG_FILE: &str = "daemon.log";
-
-/// The mode the log is kept at, matching the rest of the directory.
-const LOG_MODE: u32 = 0o600;
 
 /// How long to wait for a daemon that has just been started to begin serving.
 ///
@@ -111,7 +101,7 @@ pub fn daemon(paths: &SocketPaths) -> Result<(), Error> {
         dir: paths.dir().to_owned(),
         source,
     })?;
-    let path = paths.dir().join(LOG_FILE);
+    let path = paths.log().to_owned();
     let log = OpenOptions::new()
         .create(true)
         .append(true)

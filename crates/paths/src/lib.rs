@@ -50,6 +50,18 @@ pub const LOCK_FILE: &str = "daemon.lock";
 /// The file name a daemon writes what it is attached to in.
 pub const ATTACHMENTS_FILE: &str = "attachments.json";
 
+/// The file name a daemon nobody is watching appends its diagnostics to.
+///
+/// Beside the sockets rather than anywhere a system logger would put it,
+/// because the directory is already the one thing everything talking to this
+/// bus agrees on, and because a daemon nobody watched start is one whose only
+/// account of itself is this file. It is named here rather than by whoever
+/// starts such a daemon so that every one of them — this project's own
+/// detached start, a program launching a bus for itself, a shell script
+/// running `agentbus daemon 2>>` — writes where the next person to debug that
+/// bus will look.
+pub const LOG_FILE: &str = "daemon.log";
+
 /// The mode the bus directory is kept at: nobody but its owner has any business
 /// listing it, and its contents are enough to drive someone's coding agent.
 pub const DIR_MODE: u32 = 0o700;
@@ -57,9 +69,13 @@ pub const DIR_MODE: u32 = 0o700;
 /// The mode both sockets are kept at, for the same reason.
 pub const SOCKET_MODE: u32 = 0o600;
 
+/// The mode the log is kept at, matching the rest of the directory.
+pub const LOG_MODE: u32 = 0o600;
+
 /// The directory the bus uses and the files inside it: the two sockets, the
-/// lock a daemon holds while it is serving them, and what it says about the
-/// other endpoints it has attached.
+/// lock a daemon holds while it is serving them, what it says about the other
+/// endpoints it has attached, and where one nobody is watching says everything
+/// else.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SocketPaths {
     dir: PathBuf,
@@ -67,6 +83,7 @@ pub struct SocketPaths {
     sub: PathBuf,
     lock: PathBuf,
     attachments: PathBuf,
+    log: PathBuf,
 }
 
 impl SocketPaths {
@@ -87,6 +104,7 @@ impl SocketPaths {
             sub: dir.join(SUB_SOCKET),
             lock: dir.join(LOCK_FILE),
             attachments: dir.join(ATTACHMENTS_FILE),
+            log: dir.join(LOG_FILE),
             dir,
         }
     }
@@ -114,6 +132,16 @@ impl SocketPaths {
     /// The file saying which other endpoints this daemon is attached to.
     pub fn attachments(&self) -> &Path {
         &self.attachments
+    }
+
+    /// The file a daemon started with nobody watching appends its diagnostics
+    /// to.
+    ///
+    /// Not among the files a daemon owns: it is opened by whoever starts one,
+    /// it is appended to rather than replaced, and what a run that has ended
+    /// said about itself is the whole reason to keep it.
+    pub fn log(&self) -> &Path {
+        &self.log
     }
 
     /// Both sockets, in no particular order.
@@ -260,6 +288,7 @@ mod tests {
             paths.attachments(),
             Path::new("/run/user/1000/agentbus/attachments.json")
         );
+        assert_eq!(paths.log(), Path::new("/run/user/1000/agentbus/daemon.log"));
         assert_eq!(paths.dir(), Path::new("/run/user/1000/agentbus"));
         assert_eq!(paths.sockets(), [paths.emit(), paths.sub()]);
         assert_eq!(

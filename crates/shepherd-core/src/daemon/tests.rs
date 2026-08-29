@@ -583,6 +583,88 @@ fn stop(pid: u32) {
     assert_eq!(sent, 0, "cannot stop the process this test started");
 }
 
+#[test]
+fn what_a_daemon_says_is_kept_beside_the_sockets_and_not_on_this_terminal() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = dir();
+    let served = dir();
+    let mut host = command_in(
+        bin.path(),
+        "printf '%s\\n' 'the daemon spoke' >&2; printf '%s\\n' 'not diagnostics'",
+    );
+
+    host.start(served.path()).expect("a daemon");
+    wait_for_end(&mut host, "the daemon to finish saying it");
+
+    // That the file has it is also what says this process's own stderr did
+    // not: the daemon was given one place to write, and it wrote there.
+    let log = SocketPaths::in_dir(served.path()).log().to_owned();
+    let said = fs::read_to_string(&log).expect("what the daemon said");
+    assert!(
+        said.contains("the daemon spoke"),
+        "the daemon's diagnostics should be in {}: {said:?}",
+        log.display()
+    );
+    assert!(
+        !said.contains("not diagnostics"),
+        "stdout is not where a daemon's diagnostics go: {said:?}"
+    );
+
+    let mode = fs::metadata(&log).expect("the log").permissions().mode();
+    assert_eq!(
+        mode & 0o777,
+        LOG_MODE,
+        "the log should be as private as everything else in the directory"
+    );
+}
+
+#[test]
+fn a_second_daemon_adds_to_the_log_rather_than_replacing_it() {
+    let bin = dir();
+    let served = dir();
+    let mut host = command_in(bin.path(), "printf '%s\\n' 'a daemon started here' >&2");
+
+    host.start(served.path()).expect("a daemon");
+    wait_for_end(&mut host, "the first daemon to finish");
+    host.start(served.path()).expect("another daemon");
+    wait_for_end(&mut host, "the second daemon to finish");
+
+    let said = fs::read_to_string(SocketPaths::in_dir(served.path()).log())
+        .expect("what the daemons said");
+    assert_eq!(
+        said.lines()
+            .filter(|line| *line == "a daemon started here")
+            .count(),
+        2,
+        "what an earlier daemon said should survive a later one: {said:?}"
+    );
+}
+
+#[test]
+fn a_log_that_cannot_be_opened_is_not_a_reason_to_go_without_a_bus() {
+    let bin = dir();
+    let elsewhere = dir();
+    let served = elsewhere.path().join("a directory nothing has made");
+    let record = bin.path().join("ran");
+    let mut host = command_in(
+        bin.path(),
+        &format!("printf '%s\\n' ran > {}", record.display()),
+    );
+
+    host.start(&served).expect("a daemon, log or no log");
+    wait_for_end(&mut host, "the daemon to run");
+
+    assert!(
+        record.exists(),
+        "a daemon should be started even where its diagnostics cannot be kept"
+    );
+    assert!(
+        !served.exists(),
+        "starting a daemon does not make the bus's directory; the daemon does"
+    );
+}
+
 /// The bus's own binary, where this workspace has been built.
 ///
 /// The tests below need the real thing: what the lock does when two daemons
