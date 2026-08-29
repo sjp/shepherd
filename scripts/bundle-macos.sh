@@ -6,16 +6,28 @@
 # panel. None of that is something the program can ask for; it is what the
 # bundle tells the system before the program starts.
 #
-#   bundle-macos.sh [-o DIR] [-i ICON] [TRIPLE]
+#   bundle-macos.sh [-o DIR] [-i ICON] [-a DIR] [TRIPLE]
 #
 #     TRIPLE       a macOS target triple; default is this machine's
 #     -o, --out    where the bundle is assembled; default dist/
 #     -i, --icon   an .icns to use as it is, or a square .png to build one
 #                  from; default is the placeholder this script draws
+#     -a, --assets a directory of already-built bus assets to carry inside the
+#                  bundle; default dist/
 #
 # The result is DIR/Shepherd.app, ad-hoc signed so that the machine it was
 # built on will launch it without a word. It is not notarised and is not meant
 # to be given to anybody else.
+#
+# The bundle carries the bus's binaries for the machines this one is not: a Mac
+# does not contain a Linux binary, and putting a bus inside a container needs
+# one. They are taken from a directory rather than built here, because building
+# them wants a Linux toolchain this machine has no reason to have; make them
+# with build-release.sh wherever that is easy, leave them in dist/, and this
+# copies them in and checks every one of them against the manifest it writes
+# beside them. A directory with none in it is not an error — the bundle is then
+# one that fetches its binaries when it needs them, which is what a bundle
+# without this did.
 #
 # Two numbers in the plist are read rather than written down. The version is the
 # workspace's, the same one the binary answers --version with. The oldest system
@@ -36,6 +48,7 @@ usage() {
 
 outdir=dist
 icon=
+assets=dist
 triple=
 
 while [ $# -gt 0 ]; do
@@ -54,6 +67,14 @@ while [ $# -gt 0 ]; do
 			exit 2
 		}
 		icon=$2
+		shift
+		;;
+	-a | --assets)
+		[ $# -ge 2 ] || {
+			printf 'bundle-macos: %s needs a directory\n' "$1" >&2
+			exit 2
+		}
+		assets=$2
 		shift
 		;;
 	-h | --help)
@@ -75,6 +96,7 @@ done
 # relative to here instead, where nothing can mistake it for an option.
 case $outdir in -*) outdir=./$outdir ;; esac
 case $icon in -*) icon=./$icon ;; esac
+case $assets in -*) assets=./$assets ;; esac
 
 [ "$(uname -s)" = Darwin ] || {
 	printf 'bundle-macos: this builds and signs a macOS application; it needs a Mac\n' >&2
@@ -269,7 +291,56 @@ case $icon in
 esac
 
 # Anything else the application needs to carry with it belongs beside the icon,
-# in Resources, and is found at runtime relative to the executable.
+# in Resources, and is found at runtime relative to the executable. What goes
+# there is the bus's binaries for the machines this one is not, laid out as a
+# release is laid out anywhere else: a manifest, and the assets it describes
+# beside it. The manifest is written with nothing in front of the names, because
+# these assets are never published anywhere and the only place they are is here.
+release=$resources/agentbus-release
+
+: >"$work/assets"
+if [ -d "$assets" ]; then
+	for path in "$assets"/agentbus-"$version"-*; do
+		[ -f "$path" ] || continue
+		printf '%s\n' "${path##*/}" >>"$work/assets"
+	done
+fi
+
+if [ ! -s "$work/assets" ]; then
+	printf 'assets: none for %s in %s; this bundle fetches its bus binaries when it wants them\n' \
+		"$version" "$assets"
+else
+	mkdir -p -- "$release"
+	scripts/make-manifest.sh -o "$release/manifest.json" "$assets"
+	while read -r name; do
+		cp -- "$assets/$name" "$release/$name"
+		# What the manifest says about the copy that was just made, looked up by
+		# the name an asset is taken by: the last segment of its url. Checking it
+		# here is checking the copy, since the manifest was written from the
+		# directory it was copied from — and a copy that did not answer to it
+		# would be a bundle that fails much later, on the machine the binary was
+		# being sent to.
+		described=$(jq -r --arg name "$name" \
+			'.assets[] | select((.url | split("/") | last) == $name) | "\(.sha256) \(.size)"' \
+			"$release/manifest.json")
+		found="$(sha256_of "$release/$name") $(wc -c <"$release/$name" | tr -d ' ')"
+		[ "$described" = "$found" ] || {
+			printf 'bundle-macos: %s is "%s" and the manifest it is under says "%s"\n' \
+				"$name" "$found" "$described" >&2
+			exit 1
+		}
+		printf 'asset: %s\n' "$name"
+	done <"$work/assets"
+
+	# The two that are the reason for carrying any. A container is a Linux
+	# machine whatever the Mac around it is, so a bundle without these provisions
+	# nothing until somebody publishes a release it can reach.
+	for wanted in aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
+		grep -qx "agentbus-$version-$wanted" "$work/assets" ||
+			printf 'no %s asset: a container of that kind will need a published release\n' "$wanted"
+	done
+fi
+
 cat >"$contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

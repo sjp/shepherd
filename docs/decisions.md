@@ -3137,3 +3137,42 @@ standard library, and it is deliberately plain: it should read as a placeholder 
 anyone who sees it, and it costs nothing to delete. `--icon` takes an `.icns`
 whole or builds one from a square `.png`, which is the whole of what changes on
 the day there is a real one.
+
+### The bundle carries the bus's binaries for the machines a Mac is not
+
+**`Contents/Resources/agentbus-release/` holds a manifest and the linux-musl
+assets it describes, copied in by `bundle-macos.sh` from a directory of already
+built ones.** Putting a bus inside a container needs a binary built for that
+container, and a Mac contains no Linux binary at all — so either the machine
+fetches one when the moment comes, which is a network and a published release it
+may not have, or it was carrying one all along. Carrying one is what makes the
+first container on a fresh machine work.
+
+They are copied rather than built, because building them wants a Linux toolchain
+that a Mac has no other reason to have, and cross-building them there is not
+reliably possible. What the script does instead is check: every asset it copies
+in is checked against the manifest written beside it, so a bundle either holds a
+release that answers to its own description or is not produced.
+
+The manifest it writes names each asset by its own name and nothing more. A
+reader takes the last segment of an asset's `url` and looks for it beside the
+manifest it has just read, so a copy that is never published anywhere has no
+location to put in front of that name — and writing one down would be recording
+where the machine that did the building happened to keep its files.
+
+### The daemon is told where they are in the bus's own variable
+
+**Shepherd starts a daemon with `AGENTBUS_RELEASE_BASE` pointing at the release
+it is carrying, and only when the environment has not already set it.** That
+variable is the bus's own, documented interface for reading a release from
+somewhere else, a `file://` directory included; setting it is what a person
+provisioning from a copied directory would do by hand, and a daemon cannot tell
+that this application rather than a shell was the one that did it. No flag was
+added and nothing about the bus changed.
+
+The environment outranks what is carried, always. Somebody who has pointed the
+bus at their own mirror said so deliberately, and a copy that rides inside an
+application is a default for a machine that has said nothing. Where the carried
+release sits is worked out from the running executable — a bundle keeps what it
+carries one directory up and one across from its executable — and a build that is
+not in a bundle finds nothing there and passes nothing on.

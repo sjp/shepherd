@@ -3,11 +3,13 @@
 # has to fetch the binary rather than be handed one: which target triples exist,
 # where each is, how long it is and what it hashes to.
 #
-#   make-manifest.sh [-o FILE] [-V VERSION] DIR BASE_URL
+#   make-manifest.sh [-o FILE] [-V VERSION] DIR [BASE_URL]
 #
 #     DIR             a directory holding assets named agentbus-<version>-<triple>
 #     BASE_URL        where those assets will be reachable; each asset's own
-#                     name is appended to it, so pass the directory part only
+#                     name is appended to it, so pass the directory part only.
+#                     Left out, each asset is named on its own, which says the
+#                     assets are wherever the manifest is
 #     -o, --out FILE  write here instead of to standard output
 #     -V, --version   the version to describe; default is the workspace's
 #
@@ -31,6 +33,14 @@
 # "v" is the version of this shape and is 1. "sha256" and "size" describe the
 # bytes exactly as they will be downloaded. Assets are listed in triple order so
 # that regenerating a manifest for the same directory produces the same file.
+#
+# Whoever reads this manifest takes the last segment of each "url" as the name of
+# the asset and looks for it beside the manifest they have just read, which is
+# what makes a copy of a directory a mirror. A manifest written for a copy that
+# is never published anywhere — a directory handed to a machine, a release
+# carried inside an application — therefore has nothing to say in front of that
+# name, and leaving BASE_URL out is how to say so rather than writing down a
+# location that was true on the machine that built it.
 
 set -eu
 
@@ -84,8 +94,8 @@ while [ $# -gt 0 ]; do
 	shift
 done
 
-[ -n "$dir" ] && [ -n "$base" ] || {
-	printf 'make-manifest: a directory and a base URL are needed\n' >&2
+[ -n "$dir" ] || {
+	printf 'make-manifest: a directory of assets is needed\n' >&2
 	usage >&2
 	exit 2
 }
@@ -117,7 +127,7 @@ entries=$(
 		name=${path##*/}
 		jq -n \
 			--arg triple "${name#agentbus-$version-}" \
-			--arg url "$base/$name" \
+			--arg url "${base:+$base/}$name" \
 			--arg sha256 "$(sha256_of "$path")" \
 			--argjson size "$(wc -c <"$path" | tr -d ' ')" \
 			'{triple: $triple, url: $url, sha256: $sha256, size: $size}'

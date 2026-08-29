@@ -49,7 +49,8 @@
 //! # What gets started is a daemon, not this application's daemon
 //!
 //! `agentbus daemon --dir <directory>`, and nothing else: no flag, no argument
-//! and no variable that somebody starting one by hand would not also use. The
+//! and no variable that somebody starting one by hand would not also use — the
+//! one variable it is ever given is the bus's own, described below. The
 //! daemon has no way of telling that this started it and must not be given one
 //! — a bus that behaved differently under this application would be a bus whose
 //! behaviour could not be reasoned about from its own documentation, and the
@@ -69,6 +70,22 @@
 //! that is a decision they make with the bus's own command. An agent appears
 //! here only because its user has already made it.
 //!
+//! # A daemon is told where the binaries carried here are
+//!
+//! Putting a bus on a machine of another kind — inside a container, say — needs
+//! a binary built for that machine, and this one does not contain one: a Mac
+//! holds no Linux binary however much of it is asked. The bus already knows how
+//! to get one, from the release its own version was published in, and it takes
+//! any location for that release it is given, a directory included. So a copy
+//! of that release travels with this application, and the daemon it starts is
+//! told where the copy is — which is what lets a machine with no network reach
+//! a container anyway.
+//!
+//! It is told in the bus's own words, [`RELEASE_BASE_VAR`], and only when this
+//! application is actually carrying a release. Somebody who has set that
+//! variable themselves keeps what they set: what is carried here is a default
+//! for a machine that has said nothing, never an answer to somebody who has.
+//!
 //! # Giving up is a state, not an exception
 //!
 //! A machine with no bus installed on it will never grow one because this asked
@@ -80,6 +97,7 @@
 //!
 //! [`tick`]: Lifecycle::tick
 
+use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
@@ -106,6 +124,25 @@ const DAEMON: &str = "daemon";
 
 /// The flag naming the directory whose sockets a daemon should serve.
 const DIR: &str = "--dir";
+
+/// The variable the bus reads to learn where its releases are published.
+///
+/// The bus's own and documented as such: any http(s) base, or a `file://`
+/// directory holding a manifest and the binaries it describes. Nothing here
+/// interprets it — it is passed on when this application has somewhere to point
+/// it and left alone when the environment already says something.
+pub const RELEASE_BASE_VAR: &str = "AGENTBUS_RELEASE_BASE";
+
+/// The directory a release carried with this application is in, inside the
+/// resources of an application bundle.
+const RELEASE_DIR: &str = "agentbus-release";
+
+/// The directory an application bundle keeps what it carries in, beside the one
+/// its executable is in.
+const RESOURCES: &str = "Resources";
+
+/// The file a release is described by, which is what makes a directory one.
+const RELEASE_MANIFEST: &str = "manifest.json";
 
 /// What a daemon exits with when another one already holds the directory.
 ///
@@ -317,26 +354,71 @@ pub trait Daemons {
 /// handle on that process, so a host that went away quietly would leave behind
 /// exactly the daemon nobody can account for.
 ///
+/// # It knows where the binaries it is carrying are
+///
+/// A release of the bus may travel with this application, for the machines this
+/// one is not — see [`RELEASE_BASE_VAR`]. [`from_env`] looks for it where an
+/// application bundle carries what it carries, and [`releasing_from`] names one
+/// anywhere else. Either way it is a place the daemon is told about and nothing
+/// this reads itself.
+///
 /// [`stop`]: Host::stop
 /// [`started`]: Host::started
+/// [`from_env`]: Host::from_env
+/// [`releasing_from`]: Host::releasing_from
 #[derive(Debug, Default)]
 pub struct Host {
     path: Vec<PathBuf>,
+    release: Option<PathBuf>,
     daemon: Option<Child>,
 }
 
 impl Host {
-    /// This machine, with commands looked for where it says they are.
+    /// This machine, with commands looked for where it says they are and a
+    /// release found where this application would be carrying one.
     pub fn from_env() -> Self {
-        Self::searching(search_path(std::env::var_os(PATH_VAR)))
+        let mut host = Self::searching(search_path(std::env::var_os(PATH_VAR)));
+        host.release = carried_release(std::env::current_exe().ok().as_deref());
+        host
     }
 
     /// A machine that looks for the command in `directories` and nowhere else.
     pub fn searching(directories: impl IntoIterator<Item = impl Into<PathBuf>>) -> Self {
         Self {
             path: directories.into_iter().map(Into::into).collect(),
+            release: None,
             daemon: None,
         }
+    }
+
+    /// The same machine, carrying the release of the bus in `dir`.
+    ///
+    /// For somewhere this cannot work out for itself: a build that is not in a
+    /// bundle, a directory somebody keeps their assets in. The daemon started
+    /// here is pointed at it unless the environment already points somewhere.
+    pub fn releasing_from(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.release = Some(dir.into());
+        self
+    }
+
+    /// Where the daemon started here should look for the binaries it may need,
+    /// given what `environment` says this process was told.
+    ///
+    /// Nothing, whenever the environment says anything at all: a person who
+    /// pointed the bus at their own mirror meant it, and what is carried here
+    /// is only a default for a machine that has said nothing. Blank is not
+    /// saying anything, which is how the bus reads it too.
+    ///
+    /// Nothing, too, when there is no release to point at — a directory with no
+    /// manifest in it is not one, and naming it would replace the location the
+    /// bus would otherwise have fetched from with a location holding nothing.
+    fn release_base(&self, environment: Option<OsString>) -> Option<String> {
+        let theirs = environment.is_some_and(|value| !value.to_string_lossy().trim().is_empty());
+        if theirs {
+            return None;
+        }
+        let dir = self.release.as_deref().filter(|dir| is_release(dir))?;
+        Some(format!("file://{}", dir.display()))
     }
 
     /// Where the bus's command is, if it is anywhere this machine looks.
@@ -424,7 +506,8 @@ impl Daemons for Host {
         let path = self.command()?;
         debug!(dir = %dir.display(), "starting a bus");
 
-        let started = Command::new(&path)
+        let mut command = Command::new(&path);
+        command
             .arg(DAEMON)
             .arg(DIR)
             .arg(dir)
@@ -448,12 +531,22 @@ impl Daemons for Host {
             // owner believes is closed. The bus already names a file beside
             // its sockets for a daemon nobody is watching start, and one
             // started from a window is exactly that.
-            .stderr(diagnostics(dir))
-            .spawn()
-            .map_err(|source| DaemonError::CannotRun {
-                path: path.clone(),
-                source,
-            })?;
+            .stderr(diagnostics(dir));
+
+        // The one thing this puts into a daemon's environment, and only when
+        // there is a release here to point it at. It is the bus's own variable,
+        // spelt the way anybody provisioning from a copied directory would spell
+        // it by hand, and the daemon cannot tell it was set by this rather than
+        // by a shell.
+        if let Some(base) = self.release_base(std::env::var_os(RELEASE_BASE_VAR)) {
+            debug!(%base, "telling the bus where the release carried here is");
+            command.env(RELEASE_BASE_VAR, base);
+        }
+
+        let started = command.spawn().map_err(|source| DaemonError::CannotRun {
+            path: path.clone(),
+            source,
+        })?;
 
         self.daemon = Some(started);
         Ok(())
@@ -489,6 +582,28 @@ impl Drop for Host {
         // started nothing has nothing to do here.
         self.stop();
     }
+}
+
+/// The release carried beside `exe`, if the thing running it carries one.
+///
+/// An application bundle keeps its executable in one directory of its contents
+/// and everything it carries in another, so a release travelling with this is
+/// one step up from where this is running and one across. None of that is
+/// insisted on: an executable run from a build directory has no such neighbour,
+/// finds nothing here, and the daemon it starts fetches from wherever the bus
+/// would have fetched from anyway.
+fn carried_release(exe: Option<&Path>) -> Option<PathBuf> {
+    let contents = exe?.parent()?.parent()?;
+    let dir = contents.join(RESOURCES).join(RELEASE_DIR);
+    is_release(&dir).then_some(dir)
+}
+
+/// Whether `dir` is a release: a directory the manifest describing one is in.
+///
+/// The manifest is the whole of the test, because it is the first thing anything
+/// reading a release asks for and the thing that names everything else.
+fn is_release(dir: &Path) -> bool {
+    dir.join(RELEASE_MANIFEST).is_file()
 }
 
 /// Where a daemon serving `dir` is given to say what it has to say.

@@ -516,7 +516,8 @@ fn nothing_of_this_application_is_put_into_the_daemon_environment() {
 
     // What the shell running the script sets for itself. Anything else the
     // daemon can see that this process cannot came from here, and nothing
-    // should.
+    // should. A host carrying a release of the bus does add one variable — the
+    // bus's own, which has its own test below — and this one carries none.
     const THE_SHELL_S_OWN: [&str; 3] = ["PWD", "SHLVL", "_"];
 
     let ours: HashSet<OsString> = std::env::vars_os().map(|(name, _)| name).collect();
@@ -532,6 +533,139 @@ fn nothing_of_this_application_is_put_into_the_daemon_environment() {
     assert!(
         added.is_empty(),
         "the daemon was given variables of this application's own: {added:?}"
+    );
+}
+
+/// A directory under `dir` holding a release, which here means the manifest
+/// that says it is one: nothing on this side reads what is in it, and what
+/// would read it is the bus.
+fn release_in(dir: &Path) -> PathBuf {
+    let release = dir.join(RELEASE_DIR);
+    fs::create_dir_all(&release).expect("a directory to carry a release in");
+    fs::write(release.join(RELEASE_MANIFEST), "{}").expect("a manifest");
+    release
+}
+
+/// The path an executable inside an application bundle under `dir` would have,
+/// with the directories above it made.
+fn bundled_executable(dir: &Path) -> PathBuf {
+    let macos = dir.join("Shepherd.app").join("Contents").join("MacOS");
+    fs::create_dir_all(&macos).expect("a bundle");
+    macos.join("shepherd")
+}
+
+#[test]
+fn a_release_travelling_in_a_bundle_is_found_from_the_executable() {
+    let dir = dir();
+    let exe = bundled_executable(dir.path());
+    let contents = exe
+        .parent()
+        .expect("a directory")
+        .parent()
+        .expect("a bundle");
+    let release = release_in(&contents.join(RESOURCES));
+
+    assert_eq!(carried_release(Some(&exe)), Some(release));
+}
+
+#[test]
+fn a_build_that_is_not_in_a_bundle_carries_nothing() {
+    let dir = dir();
+    let exe = dir.path().join("target").join("release").join("shepherd");
+    fs::create_dir_all(exe.parent().expect("a directory")).expect("a build directory");
+
+    assert_eq!(
+        carried_release(Some(&exe)),
+        None,
+        "a release should only be found where a bundle would have put one"
+    );
+    assert_eq!(
+        carried_release(None),
+        None,
+        "not knowing where this is running is not a release either"
+    );
+}
+
+#[test]
+fn a_directory_with_no_manifest_in_it_is_not_a_release() {
+    let dir = dir();
+    let exe = bundled_executable(dir.path());
+    let contents = exe
+        .parent()
+        .expect("a directory")
+        .parent()
+        .expect("a bundle");
+    let empty = contents.join(RESOURCES).join(RELEASE_DIR);
+    fs::create_dir_all(&empty).expect("a directory");
+
+    assert_eq!(carried_release(Some(&exe)), None);
+    assert_eq!(
+        Host::searching(Vec::<PathBuf>::new())
+            .releasing_from(&empty)
+            .release_base(None),
+        None,
+        "a daemon pointed at a directory holding no release would fetch nothing \
+         from it and could no longer fetch from where it would have"
+    );
+}
+
+#[test]
+fn a_release_carried_here_is_where_a_daemon_is_pointed_unless_it_was_told_otherwise() {
+    let dir = dir();
+    let release = release_in(dir.path());
+    let host = Host::searching(Vec::<PathBuf>::new()).releasing_from(&release);
+    let carried = format!("file://{}", release.display());
+
+    assert_eq!(host.release_base(None), Some(carried.clone()));
+    assert_eq!(
+        host.release_base(Some(OsString::from("   "))),
+        Some(carried),
+        "a variable saying nothing is what an unset one says"
+    );
+    assert_eq!(
+        host.release_base(Some(OsString::from("https://mirror.invalid/v1"))),
+        None,
+        "somebody pointing the bus at their own mirror meant it"
+    );
+    assert_eq!(
+        Host::searching(Vec::<PathBuf>::new()).release_base(None),
+        None,
+        "nothing carried here is nothing to say"
+    );
+}
+
+#[test]
+fn a_daemon_is_started_knowing_where_the_release_carried_here_is() {
+    let bin = dir();
+    let served = dir();
+    let carried = dir();
+    let release = release_in(carried.path());
+    let record = bin.path().join("environment");
+    let mut host =
+        command_in(bin.path(), &format!("env > {}", record.display())).releasing_from(&release);
+
+    host.start(served.path()).expect("a daemon");
+    wait_for_end(&mut host, "the script to finish");
+
+    // Whatever this process was told is what the daemon must have been told,
+    // and only a machine that was told nothing gets what is carried here —
+    // which is the rule, applied to the environment these tests are being run
+    // in rather than to one they arrange.
+    let expected = match std::env::var_os(RELEASE_BASE_VAR) {
+        Some(theirs) if !theirs.to_string_lossy().trim().is_empty() => {
+            theirs.to_string_lossy().into_owned()
+        }
+        _ => format!("file://{}", release.display()),
+    };
+
+    let theirs = fs::read_to_string(&record).expect("the daemon's environment");
+    let told = theirs
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{RELEASE_BASE_VAR}=")));
+    assert_eq!(
+        told,
+        Some(expected.as_str()),
+        "the daemon should look for its binaries where this application knows some are"
     );
 }
 

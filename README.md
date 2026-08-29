@@ -28,3 +28,16 @@ open dist/Shepherd.app               # or double-click it in Finder
 
 The bundle is ad-hoc signed, which is enough for the machine that built it. It is
 not notarised, so it is not something to pass on to anybody else.
+
+It also carries the bus's binaries for the machines a Mac is not, so that
+Shepherd can put a bus inside a container without fetching anything. They are
+taken from `dist/`, or from `--assets DIR`, and are built wherever a Linux
+toolchain is at hand:
+
+```sh
+scripts/build-release.sh aarch64-unknown-linux-musl
+scripts/build-release.sh x86_64-unknown-linux-musl
+```
+
+A bundle built without them is still a bundle; it fetches what it needs from a
+published release instead, and says so as it is assembled.
