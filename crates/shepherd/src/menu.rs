@@ -10,10 +10,12 @@
 //! things, and the chord drawn beside each item is looked up by the platform in
 //! that same keymap rather than spelt out again here.
 //!
-//! Two items go the other way and answer to no keys, so that a menu is the only
-//! way to reach them: saying what this application is, which no platform has a
-//! chord for; and closing a workspace, which takes every shell in one away at
-//! once and is better reached deliberately than by a slip of the fingers.
+//! Three items go the other way and answer to no keys, so that a menu is the
+//! only way to reach them: saying what this application is, which no platform
+//! has a chord for; closing a workspace, which takes every shell in one away at
+//! once and is better reached deliberately than by a slip of the fingers; and
+//! choosing where a workspace's shells run, which is a decision about a project
+//! rather than an act repeated while working.
 //!
 //! # Two of them are the application's own
 //!
@@ -37,7 +39,7 @@ use gpui_component::WindowExt as _;
 
 use crate::keymap::{
     About, Close, CloseWorkspace, FocusDown, FocusLeft, FocusRight, FocusUp, NewTab, NextTab,
-    OpenWorkspace, PreviousTab, Quit, SplitDown, SplitRight,
+    OpenWorkspace, PreviousTab, Quit, SplitDown, SplitRight, UseContainer,
 };
 
 /// What this application is called, wherever it says so.
@@ -76,6 +78,7 @@ fn menus() -> Vec<Menu> {
             items: vec![
                 MenuItem::action("Open Workspace\u{2026}", OpenWorkspace),
                 MenuItem::action("Close Workspace", CloseWorkspace),
+                MenuItem::action("Use Development Container", UseContainer),
                 MenuItem::separator(),
                 MenuItem::action("New Tab", NewTab),
                 MenuItem::action("Next Tab", NextTab),
@@ -165,16 +168,23 @@ mod tests {
         actions
     }
 
-    /// The two items that deliberately answer to no keys.
+    /// The items that deliberately answer to no keys.
     ///
     /// Saying what this application is, because a chord for it would be one
-    /// this application had invented and no platform asks for; and closing a
+    /// this application had invented and no platform asks for; closing a
     /// workspace, because it takes every shell in one away at once and the
     /// obvious chord for it is a shift away from the one that closes a single
-    /// shell. Both are reachable by name on a menu, which is the right amount
-    /// of reachable for something done rarely and regretted immediately.
+    /// shell; and choosing where a workspace's shells run, which is settled
+    /// once for a project and not something anybody reaches for twice in an
+    /// afternoon. All are reachable by name on a menu, which is the right
+    /// amount of reachable for something done rarely and regretted
+    /// immediately.
     fn unbound() -> Vec<Box<dyn Action>> {
-        vec![About.boxed_clone(), CloseWorkspace.boxed_clone()]
+        vec![
+            About.boxed_clone(),
+            CloseWorkspace.boxed_clone(),
+            UseContainer.boxed_clone(),
+        ]
     }
 
     /// A window with nothing in it but the layer a panel is shown on.

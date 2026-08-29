@@ -40,6 +40,9 @@ actions!(
         OpenWorkspace,
         /// Closes the workspace on screen, and every shell open in it.
         CloseWorkspace,
+        /// Runs the shells opened in this workspace from now on inside its
+        /// development container, or stops doing so.
+        UseContainer,
         /// Opens a tab, with a shell in it.
         NewTab,
         /// Shows the next tab along, coming back round at the last.

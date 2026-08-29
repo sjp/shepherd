@@ -25,6 +25,16 @@
 //! here, and re-answering them in a renderer is how two parts of one window
 //! start disagreeing about what is blocked.
 //!
+//! # What a workspace's row says besides its name
+//!
+//! What its folder is checked out on, and — for a workspace whose shells run
+//! inside its development container — that they do, and whether an agent
+//! started in there would be reported at all. The last of those is the one
+//! worth reading: a container the bus could not be put into runs shells
+//! perfectly well and reports nothing about what runs in them, and a row that
+//! looked like every other row would leave somebody waiting for a badge that
+//! is never coming.
+//!
 //! # On whose word
 //!
 //! A status an agent reported through its own hooks and a status something
@@ -56,6 +66,7 @@ use gpui::{
     StatefulInteractiveElement as _, Styled, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{ActiveTheme, Theme};
+use shepherd_core::provision::{Provisioning, Standing};
 use shepherd_core::{
     Attribution, Branches, Layout, RollupStatus, ShellAddress, ShellId, ShellStatus, TabId,
     WorkspaceId,
@@ -117,6 +128,20 @@ const NOWHERE: &str = "directory not reported";
 
 /// What the sidebar says when the bus is reporting no agents at all.
 const NO_AGENTS: &str = "no agents running";
+
+/// What is said beside a workspace whose shells run inside its development
+/// container, while the bus is still being put into that container.
+const CONTAINER_STARTING: &str = "container\u{2026}";
+
+/// And once the bus is in there, which is when an agent started in that
+/// container is reported like an agent started anywhere else.
+const CONTAINER: &str = "container";
+
+/// And when it could not be put in, which is the one of the three worth
+/// reading: the shells in there work, and nothing will report what runs in
+/// them. Why is written out in full in this application's own diagnostics —
+/// this is the row saying to go and look.
+const CONTAINER_UNREPORTED: &str = "container: agents unreported";
 
 /// What the window is currently showing, which the sidebar marks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,6 +240,9 @@ pub struct WorkspaceRow {
     pub name: SharedString,
     /// What the folder is checked out on, where it is a repository at all.
     pub branch: Option<SharedString>,
+    /// Where its shells run, where that is not this machine — and whether an
+    /// agent started in there would be reported.
+    pub container: Option<SharedString>,
     pub status: ShellStatus,
     pub folded: bool,
     /// Its tabs, or nothing at all when it is folded away. The badge above
@@ -285,6 +313,7 @@ impl Sidebar {
         layout: &Layout,
         attribution: &Attribution,
         branches: &Branches,
+        provisioning: &Provisioning,
         folded: &Folded,
         showing: Showing,
         name: impl Fn(ShellAddress) -> Option<String>,
@@ -345,6 +374,7 @@ impl Sidebar {
                 branch: branches
                     .of(id)
                     .map(|branch| SharedString::from(branch.to_owned())),
+                container: provisioning.of(id).map(container),
                 status,
                 folded: folded_workspace,
                 tabs: if folded_workspace { Vec::new() } else { tabs },
@@ -445,20 +475,37 @@ fn workspace_row(row: &WorkspaceRow, cx: &mut Context<TerminalView>) -> AnyEleme
         .child(marker(row.folded, cx))
         .child(name(row.name.clone()).font_weight(FontWeight::SEMIBOLD))
         .when_some(row.branch.clone(), |row, branch| {
-            row.child(
-                div()
-                    .flex_shrink_0()
-                    .max_w(px(80.0))
-                    .truncate()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(branch),
-            )
+            row.child(aside(branch, cx))
+        })
+        .when_some(row.container.clone(), |row, container| {
+            row.child(aside(container, cx))
         })
         .children(badge(row.status, cx))
         .on_click(cx.listener(move |view, _: &ClickEvent, window, cx| {
             view.picked(Picked::FoldWorkspace(workspace), window, cx);
         }))
         .into_any_element()
+}
+
+/// What is said about a workspace's development container, in the state that
+/// container is in.
+fn container(standing: Standing) -> SharedString {
+    SharedString::from(match standing {
+        Standing::UnderWay => CONTAINER_STARTING,
+        Standing::Ready => CONTAINER,
+        Standing::Unreported => CONTAINER_UNREPORTED,
+    })
+}
+
+/// Something said quietly beside a row's name, taking as little room as it can
+/// and giving way to the name when there is not enough.
+fn aside(text: SharedString, cx: &mut Context<TerminalView>) -> Div {
+    div()
+        .flex_shrink_0()
+        .max_w(px(80.0))
+        .truncate()
+        .text_color(cx.theme().muted_foreground)
+        .child(text)
 }
 
 /// One tab's row. Pressing the marker folds its shells away; pressing the rest

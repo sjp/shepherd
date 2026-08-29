@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use agentbus_protocol::SessionStatus::{Blocked, Working};
 use agentbus_protocol::{Agent, SessionEntry, SessionStatus, Snapshot, Source, Timestamp};
 use gpui::{Action, Entity, Modifiers, Point, TestAppContext, VisualTestContext, point};
+use shepherd_core::provision::Standing;
 use shepherd_core::{Program, ShellAddress, ShellStatus, Update};
 
 use super::*;
@@ -1171,4 +1172,259 @@ fn a_menu_item_does_what_its_chord_does(cx: &mut TestAppContext) {
         "the two ways in reach the same actions, so they cannot leave the window \
          saying different things"
     );
+}
+
+/// What the stub container command below calls the container it brings up.
+const CONTAINER: &str = "brave_kepler";
+
+/// What the stub bus below writes down every run of it in.
+const INSTALLED: &str = "installed";
+
+/// A directory holding a stand-in for the container command and one for the
+/// bus, and a window whose workspace runs its shells in a container through
+/// them.
+///
+/// The container command is written rather than borrowed from the machine
+/// because these tests have to run where no container runtime exists, and
+/// because what is worth asserting is what the application asks for. It answers
+/// being asked to bring a container up the way the real one does — with an
+/// account naming the container — and answers being asked to run something by
+/// running it here, with the environment it was told to carry across, which is
+/// what makes the shell in these tests a real shell on a real terminal device.
+///
+/// The bus's stand-in writes down what it was asked and does nothing else, and
+/// `refuses` is whether it then says no.
+fn in_a_container<'a>(
+    cx: &'a mut TestAppContext,
+    dir: &Path,
+    refuses: bool,
+) -> (Entity<TerminalView>, &'a mut VisualTestContext) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let runnable = std::fs::Permissions::from_mode(0o755);
+    let container = dir.join(shepherd_core::devcontainer::COMMAND);
+    std::fs::write(
+        &container,
+        format!(
+            r#"#!/bin/sh
+case "$1" in
+up)
+  echo '{{"outcome":"success","containerId":"{CONTAINER}"}}'
+  ;;
+exec)
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --workspace-folder) shift 2 ;;
+      --remote-env) export "$2"; shift 2 ;;
+      --) shift; break ;;
+      *) shift ;;
+    esac
+  done
+  exec "$@"
+  ;;
+esac
+"#
+        ),
+    )
+    .expect("a container command");
+    std::fs::set_permissions(&container, runnable.clone()).expect("one anybody may run");
+
+    let bus = dir.join(shepherd_core::daemon::COMMAND);
+    let refusal = if refuses { "exit 1" } else { "exit 0" };
+    std::fs::write(
+        &bus,
+        format!("#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/{INSTALLED}\"\n{refusal}\n"),
+    )
+    .expect("a bus command");
+    std::fs::set_permissions(&bus, runnable).expect("one anybody may run");
+
+    let (view, cx) = opened(cx);
+    view.update(cx, |view, _| view.commands_in(dir));
+    // The choice a person makes on the menu: this workspace's shells go in its
+    // development container from now on.
+    cx.update(|window, cx| window.dispatch_action(Box::new(UseContainer), cx));
+    cx.run_until_parked();
+    (view, cx)
+}
+
+/// Everything the stub bus has been asked, one line per run of it.
+fn installed(dir: &Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join(INSTALLED))
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+/// Waits until `ready`, letting whatever the window has running away from this
+/// thread finish between looks.
+fn wait_while_working(
+    view: &Entity<TerminalView>,
+    cx: &mut VisualTestContext,
+    expectation: &str,
+    mut ready: impl FnMut(&TerminalView) -> bool,
+) {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        cx.run_until_parked();
+        if view.read_with(cx, |view, _| ready(view)) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "waited {PATIENCE:?} for {expectation}"
+        );
+        thread::sleep(GLANCE);
+    }
+}
+
+#[gpui::test]
+#[cfg(unix)]
+fn a_shell_of_a_workspace_using_a_container_is_started_inside_it(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let (view, cx) = in_a_container(cx, dir.path(), false);
+
+    // Bringing a container up may build an image, and a window that waited for
+    // that on the thread it draws on would be a window that had stopped
+    // drawing. So asking for a tab comes straight back, with the tab open and
+    // no shell in it yet: what the window did was ask, not wait.
+    view.update_in(cx, |view, window, cx| view.new_tab(window, cx));
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.open().tabs().len(), 2);
+        assert_eq!(
+            view.shells.len(),
+            1,
+            "the window waited for a container on the thread it draws on"
+        );
+    });
+
+    wait_while_working(&view, cx, "the shell in the container to start", |view| {
+        view.shells.len() == 2
+    });
+
+    // A shell that answers is a shell whose process was started through the
+    // container command, since that command is the only thing on the path this
+    // window looks at and it is what ran the shell.
+    type_out(cx, "echo inside");
+    cx.simulate_keystrokes("enter");
+    wait_for_line(&view, cx, "inside");
+}
+
+#[gpui::test]
+#[cfg(unix)]
+fn the_bus_is_put_into_the_container_once_however_many_shells_open_in_it(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let (view, cx) = in_a_container(cx, dir.path(), false);
+    let workspace = view.read_with(cx, |view, _| view.workspace);
+
+    cx.simulate_keystrokes(keys().new_tab);
+    wait_while_working(&view, cx, "the bus to go into the container", |view| {
+        view.provisioning.of(workspace) == Some(Standing::Ready)
+    });
+
+    assert_eq!(
+        installed(dir.path()),
+        vec![format!("install docker {CONTAINER}")],
+        "the container was named to the bus in some other way than the command a person would type"
+    );
+
+    // A second shell in the same container, and a third: the command is
+    // idempotent, and running it again would be time spent for nothing.
+    cx.simulate_keystrokes(keys().new_tab);
+    cx.simulate_keystrokes(keys().split_right);
+    wait_while_working(&view, cx, "both further shells to start", |view| {
+        view.shells.len() == 4
+    });
+
+    assert_eq!(
+        installed(dir.path()).len(),
+        1,
+        "the bus was put into one container more than once"
+    );
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.shown().workspaces[0]
+                .container
+                .as_ref()
+                .map(AsRef::as_ref),
+            Some("container"),
+            "the row does not say where this workspace's shells run"
+        );
+    });
+}
+
+#[gpui::test]
+#[cfg(unix)]
+fn a_bus_that_will_not_go_in_leaves_the_workspace_working_and_says_so(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let (view, cx) = in_a_container(cx, dir.path(), true);
+    let workspace = view.read_with(cx, |view, _| view.workspace);
+
+    cx.simulate_keystrokes(keys().new_tab);
+    wait_while_working(
+        &view,
+        cx,
+        "the bus to refuse to go into the container",
+        |view| view.provisioning.of(workspace) == Some(Standing::Unreported),
+    );
+
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.shells.len(),
+            2,
+            "the shell in the container did not start"
+        );
+        assert_eq!(
+            view.layout.workspaces().len(),
+            1,
+            "the workspace was taken away"
+        );
+        assert_eq!(
+            view.shown().workspaces[0]
+                .container
+                .as_ref()
+                .map(AsRef::as_ref),
+            Some("container: agents unreported"),
+            "the row does not say that agents in this container will go unreported"
+        );
+    });
+    // And the shell in there is a working shell, whatever the bus did.
+    type_out(cx, "echo working");
+    cx.simulate_keystrokes("enter");
+    wait_for_line(&view, cx, "working");
+}
+
+#[gpui::test]
+#[cfg(unix)]
+fn a_workspace_taken_back_off_its_container_starts_its_shells_here_again(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let (view, cx) = in_a_container(cx, dir.path(), false);
+    let workspace = view.read_with(cx, |view, _| view.workspace);
+
+    cx.simulate_keystrokes(keys().new_tab);
+    wait_while_working(&view, cx, "the bus to go into the container", |view| {
+        view.provisioning.of(workspace) == Some(Standing::Ready)
+    });
+
+    cx.update(|window, cx| window.dispatch_action(Box::new(UseContainer), cx));
+    cx.run_until_parked();
+    cx.simulate_keystrokes(keys().new_tab);
+    wait_while_working(&view, cx, "a shell on this machine to start", |view| {
+        view.shells.len() == 3
+    });
+
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.starting.get(&workspace),
+            Some(&Shells::ThisMachine),
+            "shells opened after the choice was taken back still go into the container"
+        );
+        assert_eq!(
+            view.shown().workspaces[0].container,
+            None,
+            "the row still says the workspace's shells run somewhere else"
+        );
+    });
 }

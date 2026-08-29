@@ -102,6 +102,7 @@ pub mod git;
 pub mod ids;
 mod lookup;
 pub mod naming;
+pub mod provision;
 pub mod rollup;
 pub mod split;
 pub mod terminal;
@@ -118,6 +119,7 @@ pub use devcontainer::{
 pub use git::{Branches, current_branch};
 pub use ids::{ShellAddress, ShellId, ShellIds, TabId, TabIds, WorkspaceId, WorkspaceIds};
 pub use naming::{FOREGROUND_INTERVAL, Foreground, ForegroundProcess, Kernel, Pid, ShellName};
+pub use provision::{Bus, ProvisionError, Provisioned, Provisioning, Provisions, Standing};
 pub use rollup::{RollupStatus, rollup, shell_status};
 pub use split::{
     Axis, Branch, Closed, Direction, Divider, MalformedSplit, PlacedDivider, PlacedShell, Rect,

@@ -17,6 +17,12 @@
 //! and joins the string back to the shell it named. Nothing was added to the bus
 //! for any of that, and nothing in the bus knows this program exists.
 //!
+//! A shell running inside a workspace's development container is the same
+//! arrangement one machine further out: the variable is handed across the
+//! boundary explicitly, and the bus is installed inside the container so that
+//! an agent started there has hooks to report through. Both are the bus's own
+//! public commands, run for a container this application already had in hand.
+//!
 //! # What is on screen
 //!
 //! Down the left, everything that is open — the workspaces, their tabs, the

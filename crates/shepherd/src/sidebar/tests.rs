@@ -11,6 +11,7 @@ use std::fs;
 use agentbus_protocol::SessionStatus::{Blocked, Done, Idle, Starting, Working};
 use agentbus_protocol::{Agent, SessionEntry, SessionStatus, Snapshot, Source, Timestamp};
 use gpui::TestAppContext;
+use shepherd_core::provision::Provisioning;
 use shepherd_core::{Attribution, BusState, Direction, Layout, Update, WorkspaceId};
 
 use super::*;
@@ -124,6 +125,7 @@ fn sidebar(layout: &Layout, sessions: Vec<SessionEntry>) -> Sidebar {
         layout,
         &attribution,
         &Branches::new(),
+        &Provisioning::new(),
         &Folded::default(),
         showing(layout),
         |_| None,
@@ -212,6 +214,7 @@ fn a_shell_is_called_whatever_is_running_in_it() {
         &layout,
         &Attribution::default(),
         &Branches::new(),
+        &Provisioning::new(),
         &Folded::default(),
         showing(&layout),
         |address| (address == first).then(|| "claude".to_owned()),
@@ -281,6 +284,7 @@ fn a_workspace_says_what_its_folder_is_checked_out_on() {
         &layout,
         &Attribution::default(),
         &branches,
+        &Provisioning::new(),
         &Folded::default(),
         showing(&layout),
         |_| None,
@@ -357,6 +361,7 @@ fn a_badge_follows_the_bus_as_the_bus_changes_its_mind() {
             &layout,
             &attribution,
             &Branches::new(),
+            &Provisioning::new(),
             &Folded::default(),
             showing(&layout),
             |_| None,
@@ -429,6 +434,7 @@ fn folding_takes_away_the_rows_and_leaves_the_badge() {
         &layout,
         &attribution,
         &Branches::new(),
+        &Provisioning::new(),
         &Folded::default(),
         showing(&layout),
         |_| None,
@@ -439,6 +445,7 @@ fn folding_takes_away_the_rows_and_leaves_the_badge() {
         &layout,
         &attribution,
         &Branches::new(),
+        &Provisioning::new(),
         &folded,
         showing(&layout),
         |_| None,
@@ -456,6 +463,7 @@ fn folding_takes_away_the_rows_and_leaves_the_badge() {
         &layout,
         &attribution,
         &Branches::new(),
+        &Provisioning::new(),
         &folded,
         showing(&layout),
         |_| None,

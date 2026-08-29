@@ -115,6 +115,14 @@ const NOTHING: [&str; 2] = ["-c", ":"];
 /// What is reported for a command that failed without saying why.
 const UNEXPLAINED: &str = "it gave no reason";
 
+/// What the command calls the container it brought up, in the account it prints
+/// when it has brought one up.
+///
+/// The command's own field name, in the command's own output. Reading it is not
+/// a way of asking a container runtime anything: it is the answer to the
+/// question that was just asked, in the reply to it.
+const CONTAINER_ID: &str = "containerId";
+
 /// Whether `folder` describes a development container.
 ///
 /// A directory holding the description, or the description alone at the top of
@@ -135,7 +143,11 @@ pub fn described(folder: &Path) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// It did what it was asked.
-    Succeeded,
+    Succeeded {
+        /// What it printed for a caller to read, which for bringing a
+        /// container up is the account of which container that was.
+        said: String,
+    },
     /// It ran, and said no.
     Refused {
         /// What it exited with, where the platform said.
@@ -148,7 +160,7 @@ pub enum Outcome {
 impl Outcome {
     /// Whether it did what it was asked.
     pub fn succeeded(&self) -> bool {
-        matches!(self, Self::Succeeded)
+        matches!(self, Self::Succeeded { .. })
     }
 }
 
@@ -229,7 +241,9 @@ impl Containers for Machine {
             })?;
 
         Ok(match output.status.success() {
-            true => Outcome::Succeeded,
+            true => Outcome::Succeeded {
+                said: String::from_utf8_lossy(&output.stdout).into_owned(),
+            },
             false => Outcome::Refused {
                 status: output.status.code(),
                 said: said(&output),
@@ -307,6 +321,7 @@ pub enum StartError {
 pub struct Devcontainer {
     folder: PathBuf,
     up: bool,
+    named: Option<String>,
 }
 
 impl Devcontainer {
@@ -315,6 +330,7 @@ impl Devcontainer {
         Self {
             folder: folder.into(),
             up: false,
+            named: None,
         }
     }
 
@@ -333,6 +349,22 @@ impl Devcontainer {
         self.up
     }
 
+    /// What the container that was brought up is called, once one has been.
+    ///
+    /// The name the command gave it when it brought it up, kept so that
+    /// anything with business with that container — the bus, which has to be
+    /// put inside it — can be told which one it is without going and asking a
+    /// container runtime a question this already has the answer to.
+    ///
+    /// A container that was brought up again is a different answer, because the
+    /// command names whichever container it has just brought up: the identity
+    /// is of the container, not of the folder, and something that did its work
+    /// once per name does that work again after a restart without having to be
+    /// told a restart happened.
+    pub fn named(&self) -> Option<&str> {
+        self.named.as_deref()
+    }
+
     /// Makes sure there is a container running to start shells in.
     ///
     /// The first time, that means bringing one up. Afterwards it means asking
@@ -345,12 +377,20 @@ impl Devcontainer {
             }
             debug!(folder = %self.folder.display(), "the development container has stopped");
             self.up = false;
+            self.named = None;
         }
 
         let args = self.bring_up()?;
         match containers.run(&args)? {
-            Outcome::Succeeded => {
+            Outcome::Succeeded { said } => {
                 self.up = true;
+                self.named = named(&said);
+                if self.named.is_none() {
+                    debug!(
+                        folder = %self.folder.display(),
+                        "`{COMMAND}` did not say which container it brought up"
+                    );
+                }
                 Ok(())
             }
             Outcome::Refused { status, said } => Err(ContainerError::NotUp {
@@ -472,21 +512,48 @@ impl Shells {
         }
     }
 
-    /// Starts a shell for `address`.
+    /// Gets ready to start a shell for `address`, and answers the options it
+    /// is then started with.
+    ///
+    /// This is the half of starting a shell that can block for minutes:
+    /// bringing a container up, which may build an image. Starting the process
+    /// afterwards is quick wherever it runs, so a caller with a window to keep
+    /// drawing can do this away from the thread that draws and start the shell
+    /// on it. What comes back is what the shell is started with — the options
+    /// as they were for a workspace whose shells run here, and the same
+    /// options turned into a run of the container command for one whose do
+    /// not.
     ///
     /// `containers` is untouched for a workspace whose shells run here, which
     /// is most of them: nothing about a machine without the container command
     /// on it affects an ordinary workspace.
+    pub fn prepare(
+        &mut self,
+        address: ShellAddress,
+        options: &ShellOptions,
+        containers: &impl Containers,
+    ) -> Result<ShellOptions, ContainerError> {
+        match self {
+            Self::ThisMachine => Ok(options.clone()),
+            Self::Container(container) => {
+                container.ensure_up(containers)?;
+                container.options(address, options, containers)
+            }
+        }
+    }
+
+    /// Starts a shell for `address`, getting ready for it first.
+    ///
+    /// Everything [`prepare`](Self::prepare) may block on happens here too, on
+    /// whichever thread this is called from.
     pub fn start(
         &mut self,
         address: ShellAddress,
         options: &ShellOptions,
         containers: &impl Containers,
     ) -> Result<Shell, StartError> {
-        match self {
-            Self::ThisMachine => Ok(Shell::spawn(address, options)?),
-            Self::Container(container) => container.spawn(address, options, containers),
-        }
+        let options = self.prepare(address, options, containers)?;
+        Ok(Shell::spawn(address, &options)?)
     }
 }
 
@@ -506,6 +573,21 @@ fn line(args: &[String]) -> String {
         line.push_str(arg);
     }
     line
+}
+
+/// The container named in what the command printed about the one it brought up.
+///
+/// The account is one object of JSON, and the command has been known to print
+/// other lines around it, so every line is offered to the reader and the last
+/// one that names a container wins — the account of what has just happened
+/// rather than of anything before it. A line that is not JSON, or is JSON
+/// without a container in it, is not an error: the container came up, which is
+/// what was asked for, and this is a second thing being read out of the answer.
+fn named(said: &str) -> Option<String> {
+    said.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|value| value.get(CONTAINER_ID)?.as_str().map(ToOwned::to_owned))
+        .rfind(|named| !named.is_empty())
 }
 
 /// What a command that refused said about why.

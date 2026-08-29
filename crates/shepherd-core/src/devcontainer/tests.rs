@@ -88,11 +88,23 @@ impl Containers for Stand {
     fn run(&self, args: &[String]) -> Result<Outcome, ContainerError> {
         self.command()?;
         self.asked.borrow_mut().push(args.to_vec());
-        Ok(self
-            .answers
-            .borrow_mut()
-            .pop_front()
-            .unwrap_or(Outcome::Succeeded))
+        Ok(self.answers.borrow_mut().pop_front().unwrap_or_else(agreed))
+    }
+}
+
+/// Agreement with nothing to say, which is every run but bringing a container
+/// up: only that one prints an account of what it did.
+fn agreed() -> Outcome {
+    Outcome::Succeeded {
+        said: String::new(),
+    }
+}
+
+/// Agreement from a command that brought up the container called `named`,
+/// spelt the way the command spells it.
+fn brought_up(named: &str) -> Outcome {
+    Outcome::Succeeded {
+        said: format!(r#"{{"outcome":"success","containerId":"{named}","remoteUser":"someone"}}"#),
     }
 }
 
@@ -246,12 +258,7 @@ fn a_container_that_has_stopped_is_brought_up_again_rather_than_assumed() {
     let folder = Path::new("/home/someone/projects/thing");
     // Up, then still up, then gone — and the run after that is what puts it
     // back.
-    let stand = Stand::installed().answering([
-        Outcome::Succeeded,
-        Outcome::Succeeded,
-        refused(),
-        Outcome::Succeeded,
-    ]);
+    let stand = Stand::installed().answering([agreed(), agreed(), refused(), agreed()]);
     let mut container = Devcontainer::at(folder);
 
     for _ in 0..3 {
@@ -492,5 +499,96 @@ fn a_workspace_that_uses_a_container_carries_the_correlation_across_the_boundary
             .expect("a workspace that uses a container")
             .is_up(),
         "the container was not brought up before the shell"
+    );
+}
+
+#[test]
+fn the_container_that_was_brought_up_is_remembered_by_name() {
+    let folder = Path::new("/home/someone/projects/thing");
+    let stand = Stand::installed().answering([brought_up("brave_kepler")]);
+    let mut container = Devcontainer::at(folder);
+
+    assert_eq!(container.named(), None, "nothing has been brought up yet");
+    container.ensure_up(&stand).expect("a container to run in");
+
+    assert_eq!(container.named(), Some("brave_kepler"));
+}
+
+#[test]
+fn the_name_survives_the_container_merely_being_checked_on() {
+    let folder = Path::new("/home/someone/projects/thing");
+    let stand = Stand::installed().answering([brought_up("brave_kepler"), agreed()]);
+    let mut container = Devcontainer::at(folder);
+
+    container.ensure_up(&stand).expect("a container to run in");
+    // The second call only asks whether the container is still there, and what
+    // that answers says nothing about which container it is.
+    container.ensure_up(&stand).expect("a container to run in");
+
+    assert_eq!(container.named(), Some("brave_kepler"));
+}
+
+#[test]
+fn a_container_brought_up_again_is_remembered_by_the_name_it_now_has() {
+    let folder = Path::new("/home/someone/projects/thing");
+    let stand = Stand::installed().answering([
+        brought_up("brave_kepler"),
+        refused(),
+        brought_up("eager_mclean"),
+    ]);
+    let mut container = Devcontainer::at(folder);
+
+    container.ensure_up(&stand).expect("a container to run in");
+    container.ensure_up(&stand).expect("a container to run in");
+
+    assert_eq!(
+        container.named(),
+        Some("eager_mclean"),
+        "the container that was restarted is still known by the name of the one it replaced"
+    );
+}
+
+#[test]
+fn a_container_that_stopped_is_nameless_until_another_has_come_up() {
+    let folder = Path::new("/home/someone/projects/thing");
+    let stand = Stand::installed().answering([brought_up("brave_kepler"), refused(), refused()]);
+    let mut container = Devcontainer::at(folder);
+
+    container.ensure_up(&stand).expect("a container to run in");
+    // Found stopped, and the attempt to bring another up refused: there is no
+    // container, so there is no container to name.
+    container.ensure_up(&stand).expect_err("no container");
+
+    assert_eq!(container.named(), None);
+}
+
+#[test]
+fn the_container_is_named_out_of_whatever_else_the_command_printed() {
+    let folder = Path::new("/home/someone/projects/thing");
+    let said = format!(
+        "reading the description\n{{\"not\":\"an account\"}}\n{}\n",
+        r#"{"outcome":"success","containerId":"brave_kepler"}"#
+    );
+    let stand = Stand::installed().answering([Outcome::Succeeded { said }]);
+    let mut container = Devcontainer::at(folder);
+
+    container.ensure_up(&stand).expect("a container to run in");
+
+    assert_eq!(container.named(), Some("brave_kepler"));
+}
+
+#[test]
+fn a_command_that_names_no_container_is_still_a_container_to_run_in() {
+    let folder = Path::new("/home/someone/projects/thing");
+    let stand = Stand::installed().answering([agreed()]);
+    let mut container = Devcontainer::at(folder);
+
+    container.ensure_up(&stand).expect("a container to run in");
+
+    assert!(container.is_up());
+    assert_eq!(
+        container.named(),
+        None,
+        "a container was named from an account that named none"
     );
 }

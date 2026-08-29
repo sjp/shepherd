@@ -42,6 +42,24 @@
 //! reading thread needs; so it is read once, quickly, into an owned description
 //! of the screen, and the lock is gone before a single glyph has been shaped.
 //!
+//! # Shells that are not on this machine
+//!
+//! A workspace can be set to run its shells inside the development container
+//! its project describes, and then opening a shell in it means bringing that
+//! container up first — which may build an image, and may take minutes. None of
+//! that waiting happens here: what the window does with the keystroke is ask,
+//! away from the thread it draws on, and the shell arrives when there is one.
+//! The choice is a person's, taken from a menu, and it decides where the shells
+//! opened after it run rather than moving the ones already open — a shell is a
+//! running process on a particular machine, and there is no moving one.
+//!
+//! Once a container is up, the bus is put inside it, because a shell in a
+//! container is a shell on a machine with none of what makes an agent visible
+//! here. That too happens away from this thread, and after the shell rather
+//! than before it: somebody waiting on a terminal should have it as soon as
+//! there is one. A container the bus will not go into still runs shells, and
+//! the workspace's row in the sidebar is where that is said.
+//!
 //! # Where focus is
 //!
 //! Every shell has a focus handle of the toolkit's, and each shell's rectangle
@@ -83,10 +101,11 @@ use gpui::{
 };
 use gpui_component::ActiveTheme;
 use gpui_component::tab::{Tab as TabButton, TabBar};
+use shepherd_core::provision::{Bus, Provisioning, Provisions as _};
 use shepherd_core::{
-    Axis, Branches, Closed, Direction, Divider, Layout, PlacedDivider, PlacedShell, Rect, Shell,
-    ShellAddress, ShellId, ShellOptions, ShellSize, SpawnError, SplitTree, TabId, Workspace,
-    WorkspaceId,
+    Axis, Branches, Closed, ContainerError, Devcontainer, Direction, Divider, Layout, Machine,
+    PlacedDivider, PlacedShell, Rect, Shell, ShellAddress, ShellId, ShellOptions, ShellSize,
+    Shells, SpawnError, SplitTree, StartError, TabId, Workspace, WorkspaceId,
 };
 use tracing::{debug, info, warn};
 
@@ -94,7 +113,7 @@ use crate::frames::Frames;
 use crate::grid::{Metrics, painting};
 use crate::keymap::{
     self, Close, CloseWorkspace, FocusDown, FocusLeft, FocusRight, FocusUp, NewTab, NextTab,
-    OpenWorkspace, PreviousTab, SplitDown, SplitRight,
+    OpenWorkspace, PreviousTab, SplitDown, SplitRight, UseContainer,
 };
 use crate::keys;
 use crate::live::{Live, described};
@@ -183,6 +202,20 @@ pub struct TerminalView {
     /// How a shell is started, before the workspace it belongs to says which
     /// folder it starts in.
     options: ShellOptions,
+    /// Where each workspace's shells are started, and what that has learnt
+    /// about the container it starts them in.
+    ///
+    /// Kept per workspace and across shells, because the container half
+    /// remembers what it has already brought up — which is what stops the
+    /// second shell of a workspace paying for what the first one did.
+    starting: BTreeMap<WorkspaceId, Shells>,
+    /// The machine's container command, for the workspaces whose shells run in
+    /// one.
+    containers: Machine,
+    /// The bus's command, for putting the bus inside those containers.
+    bus: Bus,
+    /// Which containers the bus has been put into, and what became of that.
+    provisioning: Provisioning,
     shells: Vec<Held>,
     /// The tab on screen.
     ///
@@ -281,6 +314,10 @@ impl TerminalView {
             layout,
             workspace: address.workspace,
             options,
+            starting: BTreeMap::new(),
+            containers: Machine::from_env(),
+            bus: Bus::from_env(),
+            provisioning: Provisioning::new(),
             shells: Vec::new(),
             active,
             focused: address,
@@ -493,6 +530,8 @@ impl TerminalView {
         self.branches.forget(workspace);
         self.folded.forget(workspace);
         self.left_in.remove(&workspace);
+        self.starting.remove(&workspace);
+        self.provisioning.forget(workspace);
 
         if self.workspace == workspace {
             // Whatever took its place, or the last one where what closed was
@@ -624,10 +663,11 @@ impl TerminalView {
 
     /// Starts the process for a shell the model has just made room for.
     ///
-    /// A shell that will not start leaves the model as it found it. A slot with
-    /// no process in it draws as a rectangle nothing can ever appear in, and
-    /// there is nothing to be done with one but take it away again — so the
-    /// failure is said out loud and the arrangement goes back to what it was.
+    /// A shell of a workspace whose shells run here is started at once, which
+    /// is what starting a process on this machine costs. One that runs inside a
+    /// development container may have to wait for a container to be built, so
+    /// the waiting happens away from this thread and the shell arrives when it
+    /// arrives — see [`TerminalView::starting_in_a_container`].
     fn started(
         &mut self,
         address: ShellAddress,
@@ -638,7 +678,158 @@ impl TerminalView {
         let Some(options) = self.options_for(address.workspace) else {
             return;
         };
-        match Shell::spawn(address, &options) {
+        let containers = self.containers.clone();
+        match self.starting(address.workspace) {
+            Some(Shells::Container(container)) => {
+                let container = container.clone();
+                self.starting_in_a_container(address, tab, options, container, window, cx);
+            }
+            Some(Shells::ThisMachine) | None => {
+                // Through the same preparation a container's shells go
+                // through, which for a workspace whose shells run here does
+                // nothing at all and touches no container command.
+                let mut here = Shells::ThisMachine;
+                let started = here
+                    .prepare(address, &options, &containers)
+                    .map_err(StartError::from)
+                    .and_then(|options| Ok(Shell::spawn(address, &options)?));
+                self.holding(address, tab, started, window, cx);
+            }
+        }
+    }
+
+    /// Brings a workspace's development container up, starts a shell for
+    /// `address` inside it, and puts the bus in there.
+    ///
+    /// Bringing a container up can take minutes — it may build an image — and
+    /// none of that may happen on the thread drawing the window. So the waiting
+    /// is done on a thread of the toolkit's, and what comes back to this one is
+    /// what the shell is to be started with, which is a run of the container
+    /// command and is as quick to start as anything else.
+    fn starting_in_a_container(
+        &mut self,
+        address: ShellAddress,
+        tab: TabId,
+        options: ShellOptions,
+        container: Devcontainer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let containers = self.containers.clone();
+        let waiting = cx.background_executor().spawn(async move {
+            let mut shells = Shells::Container(container);
+            let prepared = shells.prepare(address, &options, &containers);
+            (shells, prepared)
+        });
+        cx.spawn_in(window, async move |view, cx| {
+            let (shells, prepared) = waiting.await;
+            let _ = view.update_in(cx, |view, window, cx| {
+                view.came_up(address, tab, shells, prepared, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// The container is up, or it is not: either way this is where a shell that
+    /// was waiting for one is started.
+    fn came_up(
+        &mut self,
+        address: ShellAddress,
+        tab: TabId,
+        shells: Shells,
+        prepared: Result<ShellOptions, ContainerError>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // What the container command learnt while it was away — that a
+        // container is up, and which one — goes back into the record the next
+        // shell of this workspace is started from.
+        let named = shells.container().and_then(|container| container.named());
+        let named = named.map(ToOwned::to_owned);
+        self.starting.insert(address.workspace, shells);
+
+        let started = prepared
+            .map_err(StartError::from)
+            .and_then(|options| Ok(Shell::spawn(address, &options)?));
+        self.holding(address, tab, started, window, cx);
+
+        // After the shell rather than before it: somebody waiting on a terminal
+        // should have it as soon as there is one, and putting the bus into the
+        // container is for whatever they start in it next.
+        if let Some(named) = named {
+            self.provision(address.workspace, named, cx);
+        }
+    }
+
+    /// Puts the bus into `container`, so that agents started in there are
+    /// reported like agents started anywhere else.
+    ///
+    /// Once per container: the command is idempotent, and a container that has
+    /// been restarted is a different container with a different name, which is
+    /// how a restart comes to be provisioned again without anything here having
+    /// to watch for one.
+    ///
+    /// A container the bus will not go into is not a failure worth taking a
+    /// workspace away over. Its shells run, and what is lost is that agents
+    /// started in them will not be reported — which the workspace's row then
+    /// says, and which is written out here in full for somebody who wants to
+    /// know why.
+    fn provision(&mut self, workspace: WorkspaceId, container: String, cx: &mut Context<Self>) {
+        if !self.provisioning.using(workspace, &container) {
+            return;
+        }
+        let bus = self.bus.clone();
+        let named = container.clone();
+        let putting = cx
+            .background_executor()
+            .spawn(async move { bus.provision(&named) });
+        cx.spawn(async move |view, cx| {
+            let installed = match putting.await {
+                Ok(provisioned) if provisioned.installed() => {
+                    info!(container, "the bus is in this development container");
+                    true
+                }
+                Ok(provisioned) => {
+                    warn!(
+                        container,
+                        ?provisioned,
+                        "the bus would not go into this development container, so agents started in it will not be reported"
+                    );
+                    false
+                }
+                Err(error) => {
+                    warn!(
+                        container,
+                        %error,
+                        "cannot put the bus into this development container, so agents started in it will not be reported"
+                    );
+                    false
+                }
+            };
+            let _ = view.update(cx, |view, cx| {
+                view.provisioning.provisioned(&container, installed);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Takes charge of a shell that has started, or takes the slot away again
+    /// if it did not.
+    ///
+    /// A slot with no process in it draws as a rectangle nothing can ever
+    /// appear in, and there is nothing to be done with one but take it away —
+    /// so the failure is said out loud and the arrangement goes back to what it
+    /// was.
+    fn holding(
+        &mut self,
+        address: ShellAddress,
+        tab: TabId,
+        started: Result<Shell, StartError>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match started {
             Ok(started) => {
                 info!(correlation = started.correlation(), "started a shell");
                 self.hold(started, window, cx);
@@ -655,6 +846,56 @@ impl TerminalView {
                     open.close_shell(tab, address.shell);
                 }
             }
+        }
+        cx.notify();
+    }
+
+    /// Where `workspace`'s shells are started, worked out from its settings the
+    /// first time it is asked and remembered afterwards.
+    fn starting(&mut self, workspace: WorkspaceId) -> Option<&Shells> {
+        if !self.starting.contains_key(&workspace) {
+            let open = self.layout.workspace(workspace)?;
+            let shells = Shells::for_workspace(open);
+            self.starting.insert(workspace, shells);
+        }
+        self.starting.get(&workspace)
+    }
+
+    /// Runs the shells opened in `workspace` from now on inside its development
+    /// container, or stops doing so.
+    ///
+    /// The shells already open are left where they are. A shell is a running
+    /// process on a particular machine, and moving one would mean ending it and
+    /// starting another somewhere else with none of what had been typed into
+    /// it — so this is a choice about what happens next rather than a choice
+    /// that reaches backwards.
+    fn use_container(&mut self, workspace: WorkspaceId, cx: &mut Context<Self>) {
+        let Some(open) = self.layout.workspace_mut(workspace) else {
+            return;
+        };
+        let settings = &mut open.settings_mut().devcontainer;
+        *settings = !*settings;
+        let inside = *settings;
+        let describes = shepherd_core::described(open.path());
+        let folder = open.path().to_owned();
+        // Worked out again from the settings that have just changed, which also
+        // puts down whatever was known about a container this workspace is no
+        // longer using.
+        self.starting.insert(workspace, Shells::for_workspace(open));
+        if !inside {
+            self.provisioning.forget(workspace);
+        }
+        info!(
+            directory = %folder.display(),
+            inside,
+            describes,
+            "where this workspace's shells are opened from now on"
+        );
+        if inside && !describes {
+            warn!(
+                directory = %folder.display(),
+                "this folder describes no development container, and the command will say so"
+            );
         }
         cx.notify();
     }
@@ -943,6 +1184,7 @@ impl TerminalView {
             &self.layout,
             self.live.attribution(),
             &self.branches,
+            &self.provisioning,
             &self.folded,
             Showing {
                 workspace: self.workspace,
@@ -1204,6 +1446,9 @@ impl TerminalView {
             .on_action(cx.listener(move |view, _: &CloseWorkspace, window, cx| {
                 view.close_workspace(address.workspace, window, cx);
             }))
+            .on_action(cx.listener(move |view, _: &UseContainer, _, cx| {
+                view.use_container(address.workspace, cx);
+            }))
             .on_action(cx.listener(move |view, _: &NewTab, window, cx| view.new_tab(window, cx)))
             .on_action(cx.listener(move |view, _: &NextTab, window, cx| {
                 view.step(true, window, cx);
@@ -1305,6 +1550,21 @@ impl TerminalView {
     /// is.
     fn at(&self, shell: ShellId) -> ShellAddress {
         ShellAddress::new(self.workspace, shell)
+    }
+}
+
+#[cfg(test)]
+impl TerminalView {
+    /// Looks for the container command and the bus's command in `dir` and
+    /// nowhere else.
+    ///
+    /// For a test that has written a program of its own under each of those
+    /// names: everything past the lookup — which arguments are produced, when
+    /// the waiting happens, what is done with what came back — is the code a
+    /// real machine's commands go through.
+    fn commands_in(&mut self, dir: &Path) {
+        self.containers = Machine::searching([dir]);
+        self.bus = Bus::searching([dir]);
     }
 }
 
