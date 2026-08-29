@@ -8,10 +8,19 @@ name: Shepherd (macOS)
 # workflow is how somebody whose Mac has no Rust toolchain on it gets a copy of
 # the window to run.
 #
-# It is not a release. Nothing here is signed, notarised or put in an
-# application bundle, and the binary it produces is meant to be run from a
-# terminal by whoever asked for it. The bus's own release workflow is next door
-# and is the one that makes assets other people are given.
+# What comes out is the application bundle, carrying the bus's binaries for the
+# machines a Mac is not. Putting a bus inside a container needs a Linux binary,
+# a Mac contains none, and the bundle is where the window looks for one before
+# it asks the network — so a bundle assembled without them is one that cannot
+# provision a container until somebody publishes a release it can reach. Those
+# binaries are built on a Linux runner next door and handed to the Mac, because
+# building them wants a toolchain the Mac job has no reason to have.
+#
+# It is still not a release. The bundle is signed with no identity at all, which
+# is enough for a machine to run it and nothing like notarisation, and the
+# assets it carries are described by a manifest that names no location because
+# the only place they are is inside the bundle. The bus's own release workflow
+# is next door and is the one that makes assets other people are given.
 on:
   workflow_dispatch:
     inputs:
@@ -30,8 +39,49 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  # The two kinds of machine a container is, built where a Linux toolchain
+  # already is. Named and checked exactly as a release builds them, since these
+  # are the same assets under a different roof.
+  bus:
+    name: ${{ matrix.triple }}
+    runs-on: ubuntu-latest
+    strategy:
+      # A broken target should report itself rather than be hidden by whichever
+      # target failed first.
+      fail-fast: false
+      matrix:
+        include:
+          - triple: x86_64-unknown-linux-musl
+          - triple: aarch64-unknown-linux-musl
+            # Built on an x86_64 runner, so answering --version needs an
+            # emulator. Verifying the asset is worth the one package.
+            emulator: qemu-aarch64-static
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.triple }}
+      - name: Install the emulator
+        if: matrix.emulator != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+      - name: Build, verify and name the asset
+        env:
+          AGENTBUS_RUN_WRAPPER: ${{ matrix.emulator }}
+        run: scripts/build-release.sh "${{ matrix.triple }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bus-${{ matrix.triple }}
+          path: dist/*
+          if-no-files-found: error
+
+  app:
     name: ${{ inputs.triple }}
+    needs: bus
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -53,11 +103,27 @@ jobs:
           fi
           xcrun --sdk macosx --find metal
 
-      # --locked for the same reason a release is built that way: from the
-      # dependency graph this repository recorded, rather than from whatever
-      # resolves on the day.
-      - name: cargo build
-        run: cargo build --release --locked --target "${{ inputs.triple }}" --package shepherd
+      - name: Collect the container binaries
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: bus-*
+          merge-multiple: true
+
+      # The bus's command for this Mac itself, which is a different need from
+      # the ones above: the window starts a daemon by looking for that command
+      # where the machine says its commands are, so somebody with no toolchain
+      # has to be given one to put there. It joins the assets in the bundle as
+      # well, at no cost, so that a copy of what this build ran with travels
+      # with it.
+      - name: Build the bus's command for this Mac
+        run: scripts/build-release.sh "${{ inputs.triple }}"
+
+      # Builds the window and assembles the bundle around it, carrying every
+      # asset in dist/ and checking each copy against the manifest written
+      # beside them.
+      - name: Assemble the bundle
+        run: scripts/bundle-macos.sh --assets dist --out build "${{ inputs.triple }}"
 
       # The one thing a runner with no display can check about a window: that it
       # links, starts, and answers the flag it answers before anything is
@@ -66,25 +132,30 @@ jobs:
       # business to depend on.
       - name: The binary links and runs
         if: inputs.triple == 'aarch64-apple-darwin'
-        run: ./target/${{ inputs.triple }}/release/shepherd --version
+        run: ./build/Shepherd.app/Contents/MacOS/shepherd --version
 
       # Named the way the bus's assets are named, from the same one version
       # number, so a downloaded copy says what it is without being asked.
-      - name: Name the binary
+      #
+      # The bundle travels as a tar archive rather than as itself, because an
+      # artifact is a zip and a zip is not told which files were executable: an
+      # application whose executable arrived without its bit is one the system
+      # will not start, and one whose contents changed on the way is one whose
+      # signature no longer describes it. Tar carries both.
+      - name: Name what comes out
         id: asset
         run: |
           . scripts/release-lib.sh
-          name=shepherd-$(workspace_version)-${{ inputs.triple }}
-          mkdir -p dist
-          cp -- "target/${{ inputs.triple }}/release/shepherd" "dist/$name"
-          # No end-of-options marker after the mode: this machine's chmod stops
-          # reading options at the first operand, so the marker would be taken
-          # for a file and the step would fail on a name it invented itself.
-          chmod +x "dist/$name"
+          version=$(workspace_version)
+          name=Shepherd-$version-${{ inputs.triple }}
+          mkdir -p out
+          tar -C build -czf "out/$name.app.tar.gz" Shepherd.app
+          cp -- "dist/agentbus-$version-${{ inputs.triple }}" out/
           printf 'name=%s\n' "$name" >>"$GITHUB_OUTPUT"
+          printf 'bus=agentbus-%s-%s\n' "$version" "${{ inputs.triple }}" >>"$GITHUB_OUTPUT"
 
       # What to do with it, written where the person who asked for the build
-      # will see it: an unsigned binary that arrived over the network is
+      # will see it: an unsigned application that arrived over the network is
       # quarantined by the system, and the first thing it does otherwise is
       # refuse to run for a reason that sounds much worse than it is.
       - name: Say how to run it
@@ -92,22 +163,43 @@ jobs:
           cat >>"$GITHUB_STEP_SUMMARY" <<'SUMMARY'
           ## `${{ steps.asset.outputs.name }}`
 
-          Unsigned, unbundled, and meant to be run from a terminal:
+          Two things in the download: the application, and the bus's command for
+          this Mac. The window starts a daemon by running that command, so it has
+          to be somewhere the machine looks for commands.
 
           ```sh
-          xattr -dr com.apple.quarantine ./${{ steps.asset.outputs.name }}
-          chmod +x ./${{ steps.asset.outputs.name }}
-          ./${{ steps.asset.outputs.name }}                 # your login shell
-          ./${{ steps.asset.outputs.name }} yes hello       # something to look at
+          tar -xzf ${{ steps.asset.outputs.name }}.app.tar.gz
+          xattr -dr com.apple.quarantine Shepherd.app
+
+          sudo install -m 755 ${{ steps.asset.outputs.bus }} /usr/local/bin/agentbus
+          xattr -dr com.apple.quarantine /usr/local/bin/agentbus
+
+          ./Shepherd.app/Contents/MacOS/shepherd
           ```
 
-          It opens a window on the directory it was started in. Diagnostics go to
-          the terminal it was started from; `SHEPHERD_LOG=shepherd=debug` asks for
-          more of them.
+          Started that way it is handed the terminal's `PATH` and finds the
+          command; it is also where its diagnostics go, and
+          `SHEPHERD_LOG=shepherd=debug` asks it for more of them. An application
+          the Finder launches is handed the system's own short `PATH` instead,
+          which does not include `/usr/local/bin` — so `open Shepherd.app` finds
+          no bus until the machine is told to hand applications a longer one:
+
+          ```sh
+          sudo launchctl config user path /usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+          ```
+
+          That takes a restart to take effect.
+
+          It opens a window on your home directory; the folder chord opens
+          another anywhere else.
+
+          The bundle carries the bus's Linux binaries, so a workspace whose
+          folder holds a devcontainer gets one provisioned from what is inside
+          the application and needs no network to do it.
           SUMMARY
 
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.asset.outputs.name }}
-          path: dist/*
+          path: out/*
           if-no-files-found: error
