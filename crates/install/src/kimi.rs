@@ -460,11 +460,19 @@ fn read(path: &Path) -> Result<Option<String>, Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+    use std::{fs, io, process, thread};
 
     use super::*;
     use crate::assets::tests::is_well_formed;
+
+    /// How long to wait between asking again whether a command just written can
+    /// be run, and how many times to ask. Generous enough that a loaded machine
+    /// is not mistaken for a broken one, and short enough that a file which
+    /// really cannot be run is reported rather than waited on.
+    const BREATH: Duration = Duration::from_millis(5);
+    const PATIENCE: u32 = 200;
 
     /// The agent this module installs for.
     const AGENT: Agent = Agent::Kimi;
@@ -514,6 +522,38 @@ mod tests {
         fs::write(&path, format!("#!/bin/sh\n{body}")).expect("cannot write the agent's command");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
             .expect("cannot make the agent's command runnable");
+        wait_until_runnable(&path);
+    }
+
+    /// Waits until the command just written is one this machine will really run.
+    ///
+    /// Writing a file and running it are not the same moment. These tests run
+    /// beside one another in one process, and a process another test is starting
+    /// inherits every handle open at the instant it is started — including the
+    /// one this test had open on the file it was writing. Until that other
+    /// process reaches its own command the file counts as open for writing, and
+    /// a machine refuses to run a file that anything holds open for writing.
+    ///
+    /// The refusal lasts as long as it takes another test to start a process and
+    /// says nothing about what is being tested, so it is waited out here. Once
+    /// the command runs once it will run every time after: the only handle that
+    /// was ever open on it for writing belonged to the write above, and nothing
+    /// opens it again.
+    fn wait_until_runnable(path: &Path) {
+        for _ in 0..PATIENCE {
+            match process::Command::new(path)
+                .stdin(process::Stdio::null())
+                .stdout(process::Stdio::null())
+                .stderr(process::Stdio::null())
+                .status()
+            {
+                Err(refusal) if refusal.kind() == io::ErrorKind::ExecutableFileBusy => {
+                    thread::sleep(BREATH);
+                }
+                _ => return,
+            }
+        }
+        panic!("{} could not be run after being written", path.display());
     }
 
     /// What installing on `env` would do, with nothing installed before.
