@@ -695,6 +695,35 @@ fn provisioning_a_container_pushes_a_copy_starts_it_and_wires_up_the_agents_insi
 }
 
 #[test]
+fn a_caller_that_is_wiring_the_agents_up_itself_is_not_done_for_underneath() {
+    let fake = Fake::new();
+    let local = Local::new();
+    let container = fake.docker().container("eager_mclean").wired_by_hand();
+
+    let mut running = sending(&local)
+        .run(&container, &attach::FAR_END)
+        .expect("nothing was started");
+
+    let installed = fake.installed("eager_mclean");
+    let calls = fake.calls_beside_the_probe();
+    assert!(
+        !calls.contains(&format!("exec -i eager_mclean {installed} install")),
+        "the hooks were put in anyway: {calls:#?}"
+    );
+    // Everything else about getting a copy in there is what it always was:
+    // what the caller has taken over is the agents, not the provisioning.
+    assert!(
+        calls.contains(&format!(
+            "cp {} eager_mclean:{installed}",
+            local.path.display()
+        )),
+        "{calls:#?}"
+    );
+    let _ = running.kill();
+    let _ = running.wait();
+}
+
+#[test]
 fn a_container_that_already_has_the_right_copy_is_not_written_to_again() {
     let fake = Fake::new();
     let local = Local::new();

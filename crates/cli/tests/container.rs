@@ -8,6 +8,43 @@
 //! file a daemon will read. The only pretence is `docker` itself, which keeps
 //! each container's filesystem in a directory and rewrites the paths that mean
 //! something inside one into it.
+//!
+//! # Checking it against a real container
+//!
+//! Nothing here needs Docker, and nothing here can show that Docker behaves the
+//! way the stand-in does. On a machine that has it, that is a few commands
+//! against a scratch container — from a checkout, with the declarations kept in
+//! a directory of their own so that trying this does not attach anything to the
+//! bus somebody is actually running:
+//!
+//! ```sh
+//! d=$(mktemp -d)
+//! c=$(docker run -d --rm debian:stable-slim sleep 3600)
+//! docker exec "$c" mkdir -p /root/.codex   # give it an agent to find
+//!
+//! cargo run --bin agentbus -- install docker "$c" --config-dir "$d"
+//! #   agentbus <version> in <c>
+//! #     found codex (configuration directory /root/.codex)
+//! #     codex
+//! #       created /root/.codex/hooks.json          … and the rest of them
+//! #   declared: docker <c>
+//! docker exec "$c" cat /root/.codex/hooks.json     # it is really in there
+//!
+//! cargo run --bin agentbus -- install docker "$c" --config-dir "$d"
+//! #   … already installed / already declared, and nothing copied in again
+//!
+//! cargo run --bin agentbus -- uninstall docker "$c" --config-dir "$d"
+//! docker rm -f "$c"; rm -rf "$d"
+//! ```
+//!
+//! A container that is not there, which is the other half of what these tests
+//! stand in for, is `install docker no-such-container`: it should name that
+//! container and say which step could not be done.
+//!
+//! This only works from a machine whose own build can run inside the container.
+//! Where it cannot — a mac reaching a Linux container — the copy is fetched from
+//! the published release for the container's triple instead, so the check needs
+//! a release of this version to exist.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -20,6 +57,10 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The container these tests provision.
 const CONTAINER: &str = "eager_mclean";
+
+/// A container the stand-in refuses every command for, the way `docker` refuses
+/// one for a container that was never created or has been stopped.
+const ABSENT: &str = "zealous_ride";
 
 /// The variables that would otherwise decide, behind a test's back, where any
 /// of this ends up.
@@ -73,6 +114,14 @@ impl Fake {
     /// What is inside the container.
     fn inside(&self) -> PathBuf {
         self.dir.path().join("fs").join(CONTAINER)
+    }
+
+    /// Puts a coding agent's configuration directory inside the container, so
+    /// that an installation run in there has something to find.
+    fn holding(&self, agent: &str) -> PathBuf {
+        let dir = self.inside().join(agent);
+        fs::create_dir_all(&dir).expect("cannot make the agent's directory");
+        dir
     }
 }
 
@@ -138,6 +187,17 @@ root='{root}'
 case ${{1:-}} in --ready) exit 0 ;; esac
 printf '%s\n' "$@" >> "$root/argv"
 printf '%s\n' '<end>' >> "$root/argv"
+# What docker says about a container that was never created, and about one that
+# has been stopped: nothing on stdout, a sentence naming it on stderr, and a
+# non-zero status. Whichever of the two it is, no command runs in it.
+for a in "$@"; do
+  case $a in
+    '{absent}')
+      printf 'Error response from daemon: No such container: %s\n' "$a" >&2
+      exit 1
+      ;;
+  esac
+done
 case "$1" in
   cp)
     ref=${{3%%:*}}
@@ -196,7 +256,8 @@ case "$1" in
     ;;
 esac
 "#,
-        root = root.display()
+        root = root.display(),
+        absent = ABSENT,
     )
 }
 
@@ -226,6 +287,7 @@ fn said(output: &Output) -> String {
 fn a_container_is_provisioned_once_and_declared_once() {
     let mut fake = Fake::new();
     let config = tempfile::tempdir().expect("cannot make a temporary directory");
+    let codex = fake.holding(".codex");
 
     let first = agentbus(&fake, config.path(), &["install", "docker", CONTAINER]);
 
@@ -240,9 +302,23 @@ fn a_container_is_provisioned_once_and_declared_once() {
         "{printed}"
     );
 
+    // What the agents in there got is reported agent by agent, the way an
+    // installation on this machine reports it, under the line saying where it
+    // happened.
+    assert!(printed.contains("\n  found codex"), "{printed}");
+    assert!(
+        printed.contains(&format!(
+            "\n    created {}\n",
+            codex.join("hooks.json").display()
+        )),
+        "{printed}"
+    );
+    assert!(codex.join("hooks.json").is_file(), "{printed}");
+
     // A copy of this build is in there, in the directory the container itself
-    // said to put one in, and the agents in there were wired up to that copy
-    // rather than to a path anything on this side chose.
+    // said to put one in, and it is the copy that ran the installation: the
+    // search that accepted it is what execs it, so nothing on this side had to
+    // guess at the path.
     let calls = fake.calls();
     let put = calls
         .iter()
@@ -260,11 +336,16 @@ fn a_container_is_provisioned_once_and_declared_once() {
         there.ends_with(&format!("agentbus-{VERSION}")),
         "the copy is not named for its version: {there}"
     );
-    assert!(
+    // Once, and once only: the transport would put the hooks in itself for a
+    // container it found by looking, and a run somebody asked for has to take
+    // that over rather than have it happen twice.
+    assert_eq!(
         calls
             .iter()
-            .any(|call| call == &format!("exec -i {CONTAINER} {there} install")),
-        "the agents in there were never wired up to the copy: {calls:#?}"
+            .filter(|call| *call == &format!("exec -i {CONTAINER} {there} install"))
+            .count(),
+        1,
+        "the agents in there were not wired up to the copy exactly once: {calls:#?}"
     );
 
     // And the declaration is the one a daemon reads.
@@ -277,12 +358,63 @@ fn a_container_is_provisioned_once_and_declared_once() {
     assert!(second.status.success(), "{}", said(&second));
     let printed = String::from_utf8_lossy(&second.stdout);
     assert!(printed.contains("already declared"), "{printed}");
+    assert!(printed.contains("\n    already installed\n"), "{printed}");
     // Nothing was written the second time: the copy that is there answers to
     // the version that was wanted, which is the whole of the check.
     let calls = fake.calls();
     assert!(
         !calls.iter().any(|call| call.starts_with("cp ")),
         "a second run copied a binary in again: {calls:#?}"
+    );
+}
+
+#[test]
+fn an_installation_that_failed_in_there_fails_the_command_and_declares_nothing() {
+    let mut fake = Fake::new();
+    let config = tempfile::tempdir().expect("cannot make a temporary directory");
+    // A directory where the agent's hooks file goes, which is a path nothing
+    // can write a file over.
+    fs::create_dir_all(fake.holding(".codex").join("hooks.json")).expect("cannot block the path");
+
+    let output = agentbus(&fake, config.path(), &["install", "docker", CONTAINER]);
+
+    assert!(!output.status.success(), "{}", said(&output));
+    let complained = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        complained.contains(&format!("wiring up the agents in {CONTAINER} failed")),
+        "{complained}"
+    );
+    assert!(
+        complained.contains(&format!("{CONTAINER} has not been declared")),
+        "{complained}"
+    );
+    assert!(
+        !config.path().join("targets.json").exists(),
+        "a container whose agents were not wired up was declared anyway",
+    );
+    // The copy is still in there. What failed is one step of the command, and
+    // saying which one is worth more than pretending none of it happened.
+    assert!(
+        fake.calls().iter().any(|call| call.starts_with("cp ")),
+        "nothing was copied in at all",
+    );
+}
+
+#[test]
+fn a_container_that_is_not_there_is_named_along_with_what_could_not_be_done() {
+    let fake = Fake::new();
+    let config = tempfile::tempdir().expect("cannot make a temporary directory");
+
+    let output = agentbus(&fake, config.path(), &["install", "docker", ABSENT]);
+
+    assert!(!output.status.success(), "{}", said(&output));
+    let complained = String::from_utf8_lossy(&output.stderr);
+    assert!(complained.contains(ABSENT), "{complained}");
+    assert!(complained.contains("bootstrap"), "{complained}");
+    assert!(complained.contains("No such container"), "{complained}");
+    assert!(
+        !config.path().join("targets.json").exists(),
+        "a container that could not be reached was declared anyway",
     );
 }
 

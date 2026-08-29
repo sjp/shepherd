@@ -104,6 +104,22 @@ const BACKOFF: Backoff = Backoff {
     jitter: 0.2,
 };
 
+/// Who puts the hooks into the agents inside a container.
+///
+/// The two answers are for the two kinds of caller. Something that found a
+/// container by looking has nobody in front of it and nothing else that will
+/// ever do this, so it does it itself and logs how it went. Something a person
+/// ran has both, and doing it underneath them would be the same work twice with
+/// the half nobody can see being the half that goes wrong quietly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wiring {
+    /// This transport does it, as soon as there is a daemon in there for the
+    /// agents to report to.
+    Itself,
+    /// Whoever asked for the connection does it, and says what happened.
+    Caller,
+}
+
 /// The `docker` command line, as this daemon drives it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Docker {
@@ -148,6 +164,7 @@ impl Docker {
             id: Mutex::new(None),
             installed: Mutex::new(None),
             landing: OnceLock::new(),
+            wiring: Wiring::Itself,
         }
     }
 
@@ -162,6 +179,7 @@ impl Docker {
             id: Mutex::new(None),
             installed: Mutex::new(None),
             landing: OnceLock::new(),
+            wiring: Wiring::Itself,
         }
     }
 
@@ -193,9 +211,25 @@ pub struct Container {
     /// Where it said a borrowed copy of this program goes, once it has been
     /// asked.
     landing: OnceLock<String>,
+    /// Whose job the hooks inside it are.
+    wiring: Wiring,
 }
 
 impl Container {
+    /// The same container, with the agents inside it left to whoever asked for
+    /// this to wire up.
+    ///
+    /// For a caller that is going to run the installation itself and relay what
+    /// it said, which is what anything with a person in front of it should do:
+    /// an account of what happened to each agent is worth far more than a line
+    /// in a log nobody is reading, and it is the only way a failure in there
+    /// becomes a failure of the command they ran.
+    #[must_use]
+    pub fn wired_by_hand(mut self) -> Self {
+        self.wiring = Wiring::Caller;
+        self
+    }
+
     /// What every command to this container begins with.
     ///
     /// `-i` always and `-t` never: what is on the other end of this is a pipe
@@ -439,7 +473,15 @@ impl Transport for Container {
     /// It has to be again: the hooks name the copy by its full path, the path
     /// carries the version, and a hook naming a path nothing is at would report
     /// nothing at all.
+    ///
+    /// Unless whoever asked for the connection said they would do it — see
+    /// [`Container::wired_by_hand`] — in which case doing it here would be the
+    /// same installation twice, and the copy of it that nobody can see is the
+    /// one that fails without saying so.
     fn established(&self, version: &str) {
+        if self.wiring == Wiring::Caller {
+            return;
+        }
         let done = self
             .installed
             .lock()

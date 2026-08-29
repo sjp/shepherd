@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 
 use agentbus_daemon::remote::attachments::Attachments;
 use agentbus_daemon::remote::bootstrap::Bootstrap;
-use agentbus_daemon::remote::docker::Docker;
+use agentbus_daemon::remote::docker::{Container, Docker};
 use agentbus_daemon::remote::provision::{Hooks, Provision};
 use agentbus_daemon::remote::ssh;
 use agentbus_daemon::remote::targets::{CONFIG_DIR_VAR, DOCKER, SSH, Targets};
@@ -112,9 +112,15 @@ const ALREADY_RUNNING: u8 = 3;
 /// one the parser itself uses for the same thing.
 const USAGE: u8 = 2;
 
-/// What this program is asked at a far end to find out whether the copy there
-/// is the one that was wanted.
-const VERSION_FLAG: &str = "--version";
+/// What a copy of this program established at a far end is asked to do about
+/// the coding agents around it.
+const WIRE_UP: &str = "install";
+
+/// What that is called when saying that it is what went wrong.
+const WIRING_UP: &str = "wiring up the agents";
+
+/// The prefix the search at a far end names the copy it accepted with.
+const FOUND: &str = "found=";
 
 /// How each command names itself in what it prints, so that a message read out
 /// of a supervisor's log or a shell's scrollback says which one produced it.
@@ -1304,44 +1310,137 @@ fn elsewhere(args: &InstallArgs, direction: install::Direction) -> ExitCode {
 /// Puts a copy of this program into a container, wires up the agents in there,
 /// and declares the container so that it stays attached.
 ///
-/// Only the last of those three is this process's own doing. Establishing the
-/// binary is the same provisioning a daemon does when it attaches, asked for by
-/// hand here; wiring up the agents inside is what a container is told when that
-/// has worked. Which means this command is worth having for exactly one reason:
-/// a container that carries no devcontainer label is one nothing would ever
-/// find, and this is how somebody says they want it anyway.
+/// Establishing the binary is the same provisioning a daemon does when it
+/// attaches, asked for by hand here, and it answers with the path of the copy
+/// that end accepted — which is then the copy that runs the installation. That
+/// is the whole reason the two are separate steps rather than one: a container
+/// may already have an agentbus somewhere a person put it, and the thing that
+/// wires the agents up has to be whatever the search settled on rather than a
+/// path composed on this side and hoped for. Keeping them apart is also what
+/// lets a failure say which of them failed.
+///
+/// What the installation printed is relayed under a line naming where it
+/// happened. It is an account of files somebody else's tools maintain, worth
+/// exactly as much run in a container as run here — a container is simply the
+/// one case where the person who asked cannot go and look. If it fails, this
+/// fails, and nothing is declared: a binary sitting in a container whose agents
+/// report nothing is the half-done state this command exists to avoid, and a
+/// declaration is this program saying the container is set up.
+///
+/// Declaring is this process's own doing rather than the far end's, and it is
+/// why the command is worth having at all: a container carrying no devcontainer
+/// label is one nothing would ever find by looking, and this is how somebody
+/// says they want it anyway.
 fn provision(args: &ContainerArgs) -> ExitCode {
-    let container = Docker::resolve().container(&args.container);
-    let mut running =
-        match Bootstrap::new(agentbus_daemon::VERSION).run(&container, &[VERSION_FLAG]) {
-            Ok(running) => running,
-            Err(error) => return fail(INSTALL, &error),
-        };
-    let mut answered = String::new();
-    if let Err(error) = running.stdout().read_line(&mut answered) {
+    let version = agentbus_daemon::VERSION;
+    // The hooks are taken over from the transport, which would otherwise put
+    // them in silently on its way past. What it does in the background for a
+    // container it found by looking is exactly what this command is, and a
+    // person who ran it is owed the account rather than a log line they are not
+    // reading.
+    let container = Docker::resolve().container(&args.container).wired_by_hand();
+    let Some(path) = provisioned(&container, version) else {
+        return ExitCode::FAILURE;
+    };
+
+    let mut running = match container.run(&path, &[WIRE_UP], None) {
+        Ok(running) => running,
+        Err(error) => return fail(INSTALL, &error),
+    };
+    let mut report = String::new();
+    if let Err(error) = running.stdout().read_to_string(&mut report) {
         return fail(INSTALL, &error);
     }
+    let said = running.complaint();
+    let status = match running.wait() {
+        Ok(status) => status,
+        Err(error) => return fail(INSTALL, &error),
+    };
+
+    let mut printed = format!("agentbus {version} in {}\n", args.container);
+    for line in report.lines() {
+        printed.push_str("  ");
+        printed.push_str(line);
+        printed.push('\n');
+    }
+    if !status.success() {
+        let _ = wrote(INSTALL, &printed);
+        eprintln!(
+            "{INSTALL}: {WIRING_UP} in {} failed: {status}{}",
+            args.container,
+            complained(&said)
+        );
+        eprintln!("{INSTALL}: {} has not been declared", args.container);
+        return ExitCode::FAILURE;
+    }
+
+    let words = vec![args.container.clone()];
+    match args.config.targets().declare(DOCKER, &words, &clock::now()) {
+        Ok(true) => printed.push_str(&format!("declared: docker {}\n", args.container)),
+        Ok(false) => printed.push_str("already declared\n"),
+        Err(error) => {
+            let _ = wrote(INSTALL, &printed);
+            return fail(INSTALL, &error);
+        }
+    }
+    wrote(INSTALL, &printed)
+}
+
+/// Makes sure a container holds an agentbus of this version, and says where it
+/// is — or says why it does not, and nothing.
+///
+/// The search that answers is the shared one, so the candidates, the order they
+/// are tried in and the byte-for-byte version check are the ones an attachment
+/// uses rather than a second implementation of them that could drift. It is
+/// asked with nothing to run, which is what makes it name the copy it accepted
+/// instead of handing the connection over to it.
+fn provisioned(container: &Container, version: &str) -> Option<String> {
+    let label = container.label();
+    let mut running = match Bootstrap::new(version).run(container, &[]) {
+        Ok(running) => running,
+        Err(error) => {
+            report(INSTALL, &error);
+            return None;
+        }
+    };
+    let mut answered = String::new();
+    if let Err(error) = running.stdout().read_line(&mut answered) {
+        report(INSTALL, &error);
+        return None;
+    }
+    let said = running.complaint();
     match running.wait() {
         Ok(status) if status.success() => {}
         Ok(status) => {
             eprintln!(
-                "{INSTALL}: the copy in {} would not say what it is: {status}",
-                args.container
+                "{INSTALL}: looking for an agentbus in {label} failed: {status}{}",
+                complained(&said)
             );
-            return ExitCode::FAILURE;
+            return None;
         }
-        Err(error) => return fail(INSTALL, &error),
+        Err(error) => {
+            report(INSTALL, &error);
+            return None;
+        }
     }
+    match answered.trim().strip_prefix(FOUND) {
+        Some(path) => Some(path.to_owned()),
+        // It succeeded and said nothing this understands. There is a copy in
+        // there of the version that was wanted — that is what succeeding means
+        // — and no way to name it, which is the same thing as not having one.
+        None => {
+            eprintln!("{INSTALL}: the copy in {label} would not say where it is");
+            None
+        }
+    }
+}
 
-    let words = vec![args.container.clone()];
-    let there = format!("{} in {}", answered.trim(), args.container);
-    match args.config.targets().declare(DOCKER, &words, &clock::now()) {
-        Ok(true) => said(
-            INSTALL,
-            &format!("{there}\ndeclared: docker {}", args.container),
-        ),
-        Ok(false) => said(INSTALL, &format!("{there}\nalready declared")),
-        Err(error) => fail(INSTALL, &error),
+/// A trailing clause carrying what a far end complained about, or nothing when
+/// it complained about nothing.
+fn complained(said: &str) -> String {
+    match said.trim() {
+        "" => String::new(),
+        said => format!(": {said}"),
     }
 }
 
