@@ -2990,3 +2990,91 @@ branch while somebody was working in a different one keeps its old name until
 they come back to it. A watcher would close that window, at the cost of a watch
 descriptor per open project and a stream of events for every file written in a
 build — for a label whose being a few seconds old has never misled anybody.
+
+## 2026-08-29 — the sidebar
+
+### A badge is a status and where it came from, and one fold folds the pair
+
+**The fold that answers "what does this row say" answers "on whose word" in the
+same breath, at every level: sessions into a shell, shells into a tab, tabs into
+a workspace.** The status half was already one fold used everywhere, for the
+reason that three folds which agree today are three folds to keep agreeing
+forever. The provenance half cannot simply travel beside it, because it is not
+foldable on its own — asking "is this workspace's status hook-backed" is not a
+question about all of its shells, it is a question about the one shell whose
+status won, and a source folded independently of the status it belongs to would
+answer about the wrong one.
+
+So the pair is what gets folded, by one function, and the rule for the second
+half is stated once: among whichever of them share the winning status, the most
+authoritative. A tab showing `blocked` because an agent said so shows it as an
+agent's word even if something else in the tab is a guess, and a tab showing it
+on nobody's word but an observer's cannot borrow authority from a quieter
+session beside it. This is what makes the requirement that a receiver be able to
+tell the two apart hold at every row rather than only at the leaves.
+
+### What the sidebar shows is a value, and only then a picture
+
+**One function turns the model, what the bus said, what the folders are checked
+out on and what has been folded away into rows; a second turns rows into
+elements.** The seam is there because everything worth being sure of — that the
+tree is the model, that the list of agents is in the tree's order, that a
+`blocked` shell three levels down badges its tab and its workspace, that a
+session nobody could place is kept apart with the directory it named — is a
+claim about those rows. Asserting it needs no window, no display and no frame,
+which is what lets the whole of it be tested on a machine that has neither.
+
+It also settles where the answers come from. The rows are assembled out of what
+the model and the attribution already say; there is no second precedence order
+in the drawing layer and no second opinion about which shell a session is
+running in. The one thing the rendering half decides for itself is what a badge
+looks like, and even that is worked out into a value first — a label, a colour, a
+fill, a weight and a slant — so that "blocked is the loudest thing on screen" is
+a property something can be asserted about rather than a hope about a stylesheet.
+
+### `blocked` is filled; an observed status is marked, outlined and slanted
+
+**Six statuses are text in six colours and `blocked` alone has a filled badge
+behind it in bold.** Colour alone makes six things that differ from each other
+equally, which is exactly what the one status that needs a person *now* must not
+be. Weight is the difference that survives being glanced at from across a room,
+and it is spent on the single state the whole product exists to surface.
+
+Provenance is drawn as a mark, not as a shade. A status only an observer vouches
+for is written with a leading `~`, outlined rather than filled, and slanted: a
+character, a shape and a slant, because a difference carried by hue alone is one
+that a screenshot, a colour-blind reader or a glance at the wrong angle throws
+away — and this is the distinction between what an agent said about itself and
+the best anybody could tell from outside. A `blocked` on an observer's word
+keeps the bold and loses the fill, which is the honest rendering of it: still the
+thing that needs somebody, still not something the agent has confirmed.
+
+### Folding is a fact about the person looking, and it hides rows, never agents
+
+**Which workspaces and tabs are folded shut is held by the window rather than
+derived from the model, and folding takes away rows of the tree while leaving
+every badge and every agent exactly where it was.** A tab stays folded while a
+shell inside it starts and finishes three agents, because it was folded by
+somebody who did not want to look at it — that is not a property of what is open.
+
+The badge staying is the point of the whole level. A folded workspace is
+precisely when its badge is the only thing on screen saying that something in
+there is waiting on a person, so folding hides its tabs and never its status.
+The flat list of agents is untouched by folding for the same reason from the
+other direction: it exists to answer "who needs me" in one column, and a list
+that quietly shortened as somebody tidied the tree above it would answer that
+question wrongly at exactly the moment they had stopped watching.
+
+### The window has one workspace, and the tree's top level is a level of one
+
+**The sidebar draws every workspace the model holds, and nothing in this
+application yet opens a second one.** The tree, the agent list and their ordering
+are written for as many as the model has, and are tested against two; what is
+missing is a way to add one — a folder picker, and with it a window that can hold
+shells belonging to more than one workspace at a time, spawn them in the right
+folder, and follow focus across the boundary.
+
+That is a change to what the window *is*, not to what the sidebar draws, and it
+is deliberately not smuggled in behind a rendering change. Recorded here rather
+than left as an omission: until it is built, the top level of the tree is a
+level of one, and everything below it is the part that carries its weight.

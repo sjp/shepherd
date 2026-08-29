@@ -559,3 +559,73 @@ fn closing_a_shell_moves_what_was_running_in_it_out_of_the_model() {
         RollupStatus::None
     );
 }
+
+#[test]
+fn a_badge_standing_for_several_says_what_the_most_urgent_of_them_says() {
+    let hooked = |status| ShellStatus {
+        status: RollupStatus::from(status),
+        source: Some(Source::Hook),
+    };
+    let watched = |status| ShellStatus {
+        status: RollupStatus::from(status),
+        source: Some(Source::Observed),
+    };
+
+    assert_eq!(ShellStatus::fold([]), ShellStatus::NONE);
+    assert_eq!(
+        ShellStatus::fold([ShellStatus::NONE, ShellStatus::NONE]),
+        ShellStatus::NONE,
+        "nowhere with anything running rolls up to nothing running"
+    );
+    assert_eq!(
+        ShellStatus::fold([ShellStatus::NONE, hooked(Blocked), watched(Working)]),
+        hooked(Blocked),
+        "the most urgent of them, on the word of whoever said it"
+    );
+    assert_eq!(
+        ShellStatus::fold([watched(Blocked), hooked(Blocked)]),
+        hooked(Blocked),
+        "two of them saying blocked and one of them is the agent itself"
+    );
+    assert_eq!(
+        ShellStatus::fold([watched(Blocked), hooked(Idle)]),
+        watched(Blocked),
+        "the provenance belongs to the status being shown, not to the loudest source"
+    );
+}
+
+#[test]
+fn folding_badges_upwards_says_what_folding_statuses_upwards_says() {
+    let open = workspace(9, "/src/thing", 3);
+    let correlations: Vec<String> = (0..3)
+        .map(|index| open.correlation(shell(&open, index).shell))
+        .collect();
+    let attribution = Attribution::derive(
+        [&open],
+        [
+            correlated(session("a", Idle), &correlations[0]),
+            correlated(observed(session("b", Blocked)), &correlations[1]),
+            correlated(session("c", Working), &correlations[2]),
+        ],
+    );
+
+    // The model folds statuses; a badge folds the pair of a status and where it
+    // came from. The two have to agree about the status, because they are the
+    // same fold — a tab whose badge said one thing and whose status said
+    // another would be a tab lying at one of the two places it is asked.
+    let badge = ShellStatus::fold(
+        open.shells()
+            .into_iter()
+            .map(|shell| attribution.status_at(ShellAddress::new(open.id(), shell))),
+    );
+    assert_eq!(
+        badge.status,
+        open.status(attribution.shell_status(open.id()))
+    );
+    assert_eq!(badge.status, RollupStatus::from(Blocked));
+    assert_eq!(
+        badge.source,
+        Some(Source::Observed),
+        "and the badge still says on whose word, which the status alone cannot"
+    );
+}

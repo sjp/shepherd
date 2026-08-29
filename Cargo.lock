@@ -5653,6 +5653,7 @@ dependencies = [
  "gpui",
  "gpui-component",
  "shepherd-core",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]

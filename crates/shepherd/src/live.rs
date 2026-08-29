@@ -21,8 +21,7 @@ use std::time::Instant;
 use shepherd_core::bus::{SocketPaths, now};
 use shepherd_core::daemon::{Host, Lifecycle, Presence};
 use shepherd_core::{
-    Attribution, BusState, ShellAddress, ShellStatus, Subscriber, SubscriberHandle, Workspace,
-    status_source,
+    Attribution, BusState, ShellAddress, Subscriber, SubscriberHandle, Workspace, status_source,
 };
 use tracing::{info, warn};
 
@@ -99,14 +98,9 @@ impl Live {
         self.lifecycle.presence()
     }
 
-    /// What one shell's badge would say.
-    pub fn status_at(&self, shell: ShellAddress) -> ShellStatus {
-        self.attribution.status_at(shell)
-    }
-
-    /// How many sessions the bus is reporting that are not in any shell here.
-    pub fn elsewhere(&self) -> usize {
-        self.attribution.elsewhere().len()
+    /// Where everything the bus is reporting is running, as of the last look.
+    pub fn attribution(&self) -> &Attribution {
+        &self.attribution
     }
 
     /// Says what is now running in each shell that changed.
@@ -166,6 +160,20 @@ impl Live {
     }
 }
 
+#[cfg(test)]
+impl Live {
+    /// Takes one update in as though it had come off the stream.
+    ///
+    /// For a test that needs the bus to have said something without a daemon
+    /// behind it saying it: everything after this point — the fold, the
+    /// attribution, the badges — is the same code an update off a real socket
+    /// goes through.
+    pub fn heard(&mut self, update: &shepherd_core::Update, workspaces: &[Workspace]) {
+        self.state.apply(update, &now());
+        self.attribution = Attribution::derive(workspaces, self.state.sessions());
+    }
+}
+
 /// What the window says about the bus in one line.
 pub fn described(presence: &Presence) -> String {
     match presence {
@@ -173,16 +181,5 @@ pub fn described(presence: &Presence) -> String {
         Presence::Running => "bus: serving".to_owned(),
         Presence::Lost => "bus: lost".to_owned(),
         Presence::Unavailable(why) => format!("bus: {why}"),
-    }
-}
-
-/// What one shell's badge says in one line, given no room to draw a badge.
-pub fn badged(status: ShellStatus) -> String {
-    match status.status.session() {
-        None => "no agent here".to_owned(),
-        Some(session) => match status.source {
-            Some(source) => format!("{session} ({source})"),
-            None => session.to_string(),
-        },
     }
 }

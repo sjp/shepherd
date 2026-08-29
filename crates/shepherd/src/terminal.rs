@@ -72,7 +72,7 @@ use gpui::{
 use gpui_component::ActiveTheme;
 use gpui_component::tab::{Tab as TabButton, TabBar};
 use shepherd_core::{
-    Axis, Closed, Direction, Divider, Layout, PlacedDivider, PlacedShell, Rect, Shell,
+    Axis, Branches, Closed, Direction, Divider, Layout, PlacedDivider, PlacedShell, Rect, Shell,
     ShellAddress, ShellId, ShellOptions, ShellSize, SplitTree, TabId, Workspace, WorkspaceId,
 };
 use tracing::{debug, info, warn};
@@ -84,8 +84,9 @@ use crate::keymap::{
     SplitDown, SplitRight,
 };
 use crate::keys;
-use crate::live::{Live, badged, described};
+use crate::live::{Live, described};
 use crate::screen::Screen;
+use crate::sidebar::{Folded, Picked, Showing, Sidebar};
 
 /// How often the window looks at everything that changes underneath it.
 ///
@@ -157,8 +158,8 @@ struct Held {
 
 /// The window's view: one workspace, and every shell open in it.
 pub struct TerminalView {
-    /// The model the bus's sessions are placed against, the tab bar is drawn
-    /// from, and a sidebar would eventually be drawn from too.
+    /// The model the bus's sessions are placed against, and the tab bar and
+    /// the sidebar are both drawn from.
     layout: Layout,
     /// The workspace this window is open on. There is one.
     workspace: WorkspaceId,
@@ -186,6 +187,11 @@ pub struct TerminalView {
     /// The divider being dragged, while one is.
     dragging: Option<Divider>,
     live: Live,
+    /// What each workspace's folder is checked out on, read when the workspace
+    /// is looked at rather than while a frame is being drawn.
+    branches: Branches,
+    /// What has been folded away in the sidebar.
+    folded: Folded,
     family: SharedString,
     metrics: Metrics,
     frames: Frames,
@@ -211,6 +217,12 @@ impl TerminalView {
             .expect("the tab holding the shell this window was opened on");
         let family = monospace(window);
         let metrics = Metrics::of(&family, FONT_SIZE, window);
+        // Read once, here, because this window is open on one workspace and
+        // this is the moment it becomes the one being looked at.
+        let mut branches = Branches::new();
+        if let Some(workspace) = layout.workspace(address.workspace) {
+            branches.focused(workspace);
+        }
         let ticking = cx.spawn(async move |view, cx| {
             loop {
                 cx.background_executor().timer(TICK).await;
@@ -232,6 +244,8 @@ impl TerminalView {
             area: Bounds::default(),
             dragging: None,
             live: Live::new(),
+            branches,
+            folded: Folded::default(),
             family,
             metrics,
             frames: Frames::new(),
@@ -620,7 +634,6 @@ impl TerminalView {
     /// The line above the shells: which one is being typed in, what is running
     /// in it, where it sits, and how fast all of it is being drawn.
     fn header(&self, cx: &App) -> impl IntoElement {
-        let elsewhere = self.live.elsewhere();
         let focused = self.held(self.focused);
         let state = focused.map(|held| held.shell.state());
         let said = [
@@ -634,11 +647,6 @@ impl TerminalView {
                 }),
             Some(self.placement()),
             Some(described(self.live.presence())),
-            Some(badged(
-                self.live
-                    .status_at(ShellAddress::new(self.workspace, self.focused)),
-            )),
-            (elsewhere > 0).then(|| format!("{elsewhere} elsewhere")),
             self.frames.last().map(|report| report.to_string()),
         ];
 
@@ -653,6 +661,71 @@ impl TerminalView {
             .text_size(px(12.0))
             .text_color(cx.theme().muted_foreground)
             .children(said.into_iter().flatten().map(SharedString::from))
+    }
+
+    /// Everything open and everything running in it, down the left.
+    ///
+    /// Worked out afresh each frame from the model, the bus and the folders,
+    /// because every one of those is somebody else's to change and a copy kept
+    /// here would be a copy to keep in step.
+    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        self.shown().drawn(cx)
+    }
+
+    /// What the sidebar would say, without a window to say it in.
+    fn shown(&self) -> Sidebar {
+        Sidebar::of(
+            &self.layout,
+            self.live.attribution(),
+            &self.branches,
+            &self.folded,
+            Showing {
+                workspace: self.workspace,
+                tab: self.active,
+                shell: self.focused,
+            },
+            |address| {
+                self.held(address.shell)
+                    .filter(|held| held.shell.address() == address)
+                    .and_then(|held| held.shell.name())
+                    .map(ToOwned::to_owned)
+            },
+        )
+    }
+
+    /// Answers a press on a row of the sidebar.
+    ///
+    /// One place for all of them, so that a shell reached from the tree and the
+    /// same shell reached from the list of agents cannot come to mean two
+    /// different things.
+    pub(crate) fn picked(&mut self, picked: Picked, window: &mut Window, cx: &mut Context<Self>) {
+        match picked {
+            // A shell in a workspace this window is not open on has nowhere
+            // here to be shown. There is one workspace, and the sidebar draws
+            // the model rather than only the part of it this window can reach.
+            Picked::Shell(address) if address.workspace != self.workspace => {}
+            Picked::Shell(address) => {
+                // Before focus is asked for, because the toolkit will not put
+                // focus in something it has not drawn.
+                if let Some(tab) = self.open().tab_of(address.shell) {
+                    self.active = tab;
+                }
+                self.focus(address.shell, window);
+                cx.notify();
+            }
+            Picked::Tab(workspace, tab) if workspace == self.workspace => {
+                self.show(tab, window, cx);
+            }
+            Picked::Tab(..) => {}
+            Picked::FoldWorkspace(workspace) => {
+                self.folded.fold_workspace(workspace);
+                cx.notify();
+            }
+            Picked::FoldTab(workspace, tab) => {
+                self.folded.fold_tab(workspace, tab);
+                cx.notify();
+            }
+        }
     }
 
     /// What the tab bar says: the tabs open in the workspace, in the order they
@@ -961,7 +1034,7 @@ impl Render for TerminalView {
 
         let screen = div()
             .flex()
-            .flex_col()
+            .flex_row()
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
@@ -974,9 +1047,17 @@ impl Render for TerminalView {
                 MouseButton::Left,
                 cx.listener(|view, _: &MouseUpEvent, _, cx| view.dropped(cx)),
             )
-            .child(self.header(cx))
-            .child(self.tabs(cx))
-            .child(self.arranged(window, cx));
+            .child(self.sidebar(cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .child(self.header(cx))
+                    .child(self.tabs(cx))
+                    .child(self.arranged(window, cx)),
+            );
         self.frames.built(began.elapsed());
         screen
     }

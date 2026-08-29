@@ -16,11 +16,14 @@
 //! and joins the string back to the shell it named. Nothing was added to the bus
 //! for any of that, and nothing in the bus knows this program exists.
 //!
-//! # What it does not have
+//! # What is on screen
 //!
-//! No sidebar. Tabs, splits and the dividers between them are all there, from
-//! the keyboard and from the mouse, but what the bus knows is said in a line of
-//! text above them rather than shown beside a list of the shells it is about.
+//! Down the left, everything that is open — the workspace, its tabs, the shells
+//! in each of them — with a badge on every row saying what the bus knows about
+//! what is running there, and beneath that one flat list of every agent it is
+//! reporting, including the ones running somewhere this application cannot
+//! claim. The rest of the window is the tabs and the arrangement of shells
+//! belonging to whichever tab is showing.
 
 mod frames;
 mod grid;
@@ -29,6 +32,7 @@ mod keys;
 mod live;
 mod palette;
 mod screen;
+mod sidebar;
 mod terminal;
 
 use std::cell::RefCell;

@@ -86,19 +86,27 @@ pub fn status_source(entry: &SessionEntry) -> Source {
     entry.status_source.unwrap_or(entry.source)
 }
 
-/// What one shell's badge says, and on whose word it says it.
+/// What one badge says, and on whose word it says it.
 ///
-/// The status is the fold over every session attributed to the shell. The source
-/// belongs to whichever of them won that fold — and where several sessions share
-/// the winning status, to the most authoritative of those, since a shell that is
-/// blocked on an agent's own word is blocked on an agent's own word whatever
-/// else is also going on in it.
+/// The status is [`rollup`]'s fold over whatever is being stood for — the
+/// sessions attributed to a shell, the shells of a tab, the tabs of a
+/// workspace. The source belongs to whichever of them won that fold, and where
+/// several share the winning status, to the most authoritative of those: a
+/// shell that is blocked on an agent's own word is blocked on an agent's own
+/// word whatever else is also going on in it.
+///
+/// The pair travels together because the second half is not foldable away.
+/// A receiver has to be able to say whether what it is showing came from an
+/// agent's own hooks or from something watching it from outside — a floor
+/// presented as authority is how trust in the whole stream dies — so the fold
+/// that answers "what does this say" answers "on whose word" in the same
+/// breath, at every level that has a badge to draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ShellStatus {
-    /// The one status standing for everything attributed here.
+    /// The one status standing for everything below here.
     pub status: RollupStatus,
-    /// Where that status came from, or `None` where there is no session here to
-    /// have come from anywhere.
+    /// Where that status came from, or `None` where there is no session below
+    /// here to have come from anywhere.
     pub source: Option<Source>,
 }
 
@@ -109,18 +117,43 @@ impl ShellStatus {
         source: None,
     };
 
-    /// The status standing for `sessions`, with the provenance of whichever of
-    /// them it came from.
-    fn of(sessions: &[SessionEntry]) -> Self {
-        let status = rollup(sessions.iter().map(|session| session.status.into()));
-        let source = sessions
+    /// One session's own status, and where it came from.
+    pub fn of_session(session: &SessionEntry) -> Self {
+        Self {
+            status: session.status.into(),
+            source: Some(status_source(session)),
+        }
+    }
+
+    /// The one badge standing for several, folded by [`rollup`] and carrying
+    /// the provenance of whichever of them won.
+    ///
+    /// This is the fold at every level above a session: a tab folds its shells
+    /// with it, a workspace folds its tabs with it, and a shell folds its
+    /// sessions with it by way of [`ShellStatus::of_session`]. Folding badges
+    /// rather than bare statuses is what keeps a tab able to say that the
+    /// `blocked` it is showing is an agent's own word — which a status alone,
+    /// having left its provenance behind a level down, could not.
+    pub fn fold<I>(statuses: I) -> Self
+    where
+        I: IntoIterator<Item = Self>,
+    {
+        let badges: Vec<Self> = statuses.into_iter().collect();
+        let status = rollup(badges.iter().map(|badge| badge.status));
+        let source = badges
             .iter()
-            .filter(|session| RollupStatus::from(session.status) == status)
-            .map(status_source)
+            .filter(|badge| badge.status == status)
+            .filter_map(|badge| badge.source)
             // `Hook` sorts before `Observed`, and the minimum is therefore the
             // strongest evidence for the status being shown.
             .min();
         Self { status, source }
+    }
+
+    /// The status standing for `sessions`, with the provenance of whichever of
+    /// them it came from.
+    fn of(sessions: &[SessionEntry]) -> Self {
+        Self::fold(sessions.iter().map(Self::of_session))
     }
 }
 

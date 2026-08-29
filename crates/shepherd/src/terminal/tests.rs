@@ -8,8 +8,10 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
+use agentbus_protocol::SessionStatus::{Blocked, Working};
+use agentbus_protocol::{Agent, SessionEntry, SessionStatus, Snapshot, Source, Timestamp};
 use gpui::{Entity, Modifiers, Point, TestAppContext, VisualTestContext, point};
-use shepherd_core::{Program, ShellAddress};
+use shepherd_core::{Program, ShellAddress, ShellStatus, Update};
 
 use super::*;
 
@@ -684,4 +686,197 @@ fn an_irregular_arrangement_puts_every_shell_where_the_model_says(cx: &mut TestA
             "pressing at {at:?} should land in the shell drawn there"
         );
     }
+}
+
+/// One session as the bus reports it, running in `shell`.
+///
+/// It carries the string this application gave that shell — which is the whole
+/// of the join, and the reason the bus never has to be told anything about
+/// shells for one of these to land on the right row.
+fn running_in(view: &TerminalView, shell: ShellId, status: SessionStatus) -> SessionEntry {
+    SessionEntry {
+        session: "s1".to_owned(),
+        agent: Agent::new("claude").expect("a valid agent id"),
+        status,
+        source: Source::Hook,
+        status_source: None,
+        cwd: None,
+        correlation: Some(view.open().correlation(shell)),
+        origin: Vec::new(),
+        since: Timestamp::parse("2026-08-17T10:31:02.006Z").expect("a well-formed timestamp"),
+    }
+}
+
+/// Tells the window's half of the bus that `sessions` are running, as though a
+/// daemon had said so.
+fn the_bus_says(
+    view: &Entity<TerminalView>,
+    cx: &mut VisualTestContext,
+    sessions: Vec<SessionEntry>,
+) {
+    view.update(cx, |view, cx| {
+        let workspaces = view.layout.workspaces().to_vec();
+        view.live
+            .heard(&Update::Reset(Snapshot::new(1, sessions)), &workspaces);
+        cx.notify();
+    });
+}
+
+#[gpui::test]
+fn the_sidebar_is_the_tree_of_what_is_open(cx: &mut TestAppContext) {
+    let (view, cx) = opened(cx);
+    cx.simulate_keystrokes(keys().split_right);
+    cx.simulate_keystrokes(keys().new_tab);
+
+    let sidebar = view.read_with(cx, |view, _| view.shown());
+    assert_eq!(sidebar.workspaces.len(), 1, "one workspace is open");
+    let workspace = &sidebar.workspaces[0];
+    assert_eq!(workspace.tabs.len(), 2);
+    assert_eq!(
+        workspace.tabs[0].shells.len(),
+        2,
+        "the tab that was split holds both of its shells"
+    );
+    assert!(
+        workspace.tabs[1].showing,
+        "the tab just opened is the one on screen"
+    );
+    assert_eq!(
+        workspace.tabs[1].shells[0].address,
+        ShellAddress::new(
+            view.read_with(cx, |view, _| view.workspace),
+            view.read_with(cx, |view, _| view.focused)
+        ),
+        "and its shell is the one being typed in"
+    );
+    assert!(workspace.tabs[1].shells[0].focused);
+}
+
+#[gpui::test]
+fn a_shell_the_bus_calls_blocked_is_blocked_all_the_way_up_the_sidebar(cx: &mut TestAppContext) {
+    let (view, cx) = opened(cx);
+    // In a tab nobody is looking at, so that what the badges say cannot be
+    // coming from what is on screen.
+    let hidden = view.read_with(cx, |view, _| view.focused);
+    cx.simulate_keystrokes(keys().new_tab);
+
+    let blocked = view.read_with(cx, |view, _| running_in(view, hidden, Blocked));
+    the_bus_says(&view, cx, vec![blocked]);
+
+    let sidebar = view.read_with(cx, |view, _| view.shown());
+    let workspace = &sidebar.workspaces[0];
+    let hook = ShellStatus {
+        status: Blocked.into(),
+        source: Some(Source::Hook),
+    };
+    assert_eq!(workspace.status, hook, "the workspace says so");
+    assert_eq!(workspace.tabs[0].status, hook, "the tab holding it says so");
+    assert_eq!(workspace.tabs[0].shells[0].status, hook);
+    assert_eq!(
+        workspace.tabs[1].status,
+        ShellStatus::NONE,
+        "the tab on screen has nothing running in it and says nothing"
+    );
+
+    assert_eq!(sidebar.agents.len(), 1, "one agent, in one row");
+    assert_eq!(sidebar.agents[0].status, hook);
+    assert!(
+        sidebar.elsewhere.is_empty(),
+        "it was placed, so there is nothing that could not be"
+    );
+}
+
+#[gpui::test]
+fn what_the_bus_says_next_is_what_the_sidebar_says_next(cx: &mut TestAppContext) {
+    let (view, cx) = opened(cx);
+    let shell = view.read_with(cx, |view, _| view.focused);
+
+    let working = view.read_with(cx, |view, _| running_in(view, shell, Working));
+    the_bus_says(&view, cx, vec![working]);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.shown()).workspaces[0]
+            .status
+            .status,
+        Working.into()
+    );
+
+    let blocked = view.read_with(cx, |view, _| running_in(view, shell, Blocked));
+    the_bus_says(&view, cx, vec![blocked]);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.shown()).workspaces[0]
+            .status
+            .status,
+        Blocked.into()
+    );
+
+    the_bus_says(&view, cx, Vec::new());
+    assert_eq!(
+        view.read_with(cx, |view, _| view.shown()).workspaces[0].status,
+        ShellStatus::NONE,
+        "a snapshot that no longer lists it is a session that is over"
+    );
+}
+
+#[gpui::test]
+fn pressing_an_agent_shows_the_shell_it_is_running_in(cx: &mut TestAppContext) {
+    let (view, cx) = opened(cx);
+    let hidden = view.read_with(cx, |view, _| view.focused);
+    let first = view.read_with(cx, |view, _| view.active);
+    cx.simulate_keystrokes(keys().new_tab);
+    assert_ne!(
+        view.read_with(cx, |view, _| view.active),
+        first,
+        "the shell the agent is in is not the one on screen"
+    );
+
+    let session = view.read_with(cx, |view, _| running_in(view, hidden, Blocked));
+    the_bus_says(&view, cx, vec![session]);
+
+    let row = view.read_with(cx, |view, _| view.shown()).agents[0].address;
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.picked(Picked::Shell(row), window, cx));
+    });
+    cx.run_until_parked();
+
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.active, first, "its tab is the one showing");
+        assert_eq!(
+            view.focused, hidden,
+            "and its shell is the one being typed in"
+        );
+    });
+}
+
+#[gpui::test]
+fn folding_a_workspace_takes_its_tabs_off_the_sidebar_and_leaves_its_badge(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = opened(cx);
+    let shell = view.read_with(cx, |view, _| view.focused);
+    let workspace = view.read_with(cx, |view, _| view.workspace);
+    let session = view.read_with(cx, |view, _| running_in(view, shell, Blocked));
+    the_bus_says(&view, cx, vec![session]);
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.picked(Picked::FoldWorkspace(workspace), window, cx);
+        });
+    });
+
+    let sidebar = view.read_with(cx, |view, _| view.shown());
+    assert!(sidebar.workspaces[0].folded);
+    assert!(
+        sidebar.workspaces[0].tabs.is_empty(),
+        "what is under it is folded away"
+    );
+    assert_eq!(
+        sidebar.workspaces[0].status.status,
+        Blocked.into(),
+        "and its badge is what is left saying something in there needs somebody"
+    );
+    assert_eq!(
+        sidebar.agents.len(),
+        1,
+        "the list of agents is not folded away with it"
+    );
 }
