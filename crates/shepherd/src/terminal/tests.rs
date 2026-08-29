@@ -119,8 +119,20 @@ fn screens(view: &TerminalView, _: &App) -> String {
         .join("\n")
 }
 
+/// Every shell on screen, addressed.
+///
+/// The arrangement deals in numbers, and every workspace numbers its own shells
+/// from one — so a number names a shell here only alongside the workspace whose
+/// arrangement it came out of.
+fn shown(view: &TerminalView) -> Vec<ShellAddress> {
+    view.showing()
+        .into_iter()
+        .map(|shell| view.at(shell))
+        .collect()
+}
+
 /// The rows one shell has on screen.
-fn screen_of(view: &TerminalView, shell: ShellId) -> Vec<String> {
+fn screen_of(view: &TerminalView, shell: ShellAddress) -> Vec<String> {
     view.held(shell)
         .map(|held| held.shell.screen())
         .unwrap_or_default()
@@ -132,13 +144,13 @@ fn screen_of(view: &TerminalView, shell: ShellId) -> Vec<String> {
 /// arrangement, and the room the window measured for it — so a test presses
 /// where the shell actually is rather than where the arithmetic in the test
 /// says it should be.
-fn middle_of(view: &TerminalView, shell: ShellId) -> Point<Pixels> {
+fn middle_of(view: &TerminalView, shell: ShellAddress) -> Point<Pixels> {
     let bounds = view
         .tree()
         .expect("a tab on screen")
         .layout_in(area(view.area))
         .into_iter()
-        .find(|placed| placed.shell == shell)
+        .find(|placed| placed.shell == shell.shell)
         .expect("the shell is in the tab on screen")
         .bounds;
     point(
@@ -170,12 +182,12 @@ fn press(cx: &mut VisualTestContext, at: Point<Pixels>) {
 }
 
 /// Where one shell sits in the tab on screen, as a fraction of it.
-fn share_of(view: &TerminalView, shell: ShellId) -> shepherd_core::Rect {
+fn share_of(view: &TerminalView, shell: ShellAddress) -> shepherd_core::Rect {
     view.tree()
         .expect("a tab on screen")
         .layout()
         .into_iter()
-        .find(|placed| placed.shell == shell)
+        .find(|placed| placed.shell == shell.shell)
         .expect("the shell is in the tab on screen")
         .bounds
 }
@@ -185,8 +197,7 @@ fn share_of(view: &TerminalView, shell: ShellId) -> shepherd_core::Rect {
 /// stepped away from and back to, a shell split both ways, focus walked around
 /// what that made, and the last shell closed.
 ///
-/// The two menu items that are the application's own are not here — one of them
-/// ends the process, which is not a thing a test can do halfway.
+/// What is not here is [`unwalkable`].
 fn both_ways() -> Vec<(Box<dyn Action>, &'static str)> {
     let keys = keys();
     vec![
@@ -200,6 +211,19 @@ fn both_ways() -> Vec<(Box<dyn Action>, &'static str)> {
         (Box::new(FocusUp), keys.focus_up),
         (Box::new(FocusDown), keys.focus_down),
         (Box::new(Close), keys.close),
+    ]
+}
+
+/// The bound actions the script above deliberately leaves out.
+///
+/// Quitting ends the process, which is not a thing a test can do halfway; and
+/// opening a workspace waits on the platform's own folder picker, which the
+/// platform these tests run on has none of. What the window does once a folder
+/// has been chosen is asserted directly instead, without a dialog in the way.
+fn unwalkable() -> Vec<Box<dyn Action>> {
+    vec![
+        crate::keymap::Quit.boxed_clone(),
+        OpenWorkspace.boxed_clone(),
     ]
 }
 
@@ -235,7 +259,7 @@ fn arrangement(view: &TerminalView, _: &App) -> String {
     format!(
         "{} tabs; showing {:?}; typing in {:?}",
         view.open().tabs().len(),
-        view.showing(),
+        shown(view),
         view.focused,
     )
 }
@@ -320,7 +344,7 @@ fn splitting_puts_a_shell_beside_the_one_with_focus(cx: &mut TestAppContext) {
 
     cx.simulate_keystrokes(keys().split_right);
 
-    let (shells, focused) = view.read_with(cx, |view, _| (view.showing(), view.focused));
+    let (shells, focused) = view.read_with(cx, |view, _| (shown(view), view.focused));
     assert_eq!(shells.len(), 2, "the tab now holds two shells");
     assert_eq!(shells[0], first, "the shell split from is still first");
     assert_ne!(focused, first, "the new shell is the one being typed in");
@@ -393,7 +417,7 @@ fn closing_a_shell_leaves_focus_where_the_arrangement_put_it(cx: &mut TestAppCon
     cx.simulate_keystrokes(keys().close);
 
     view.read_with(cx, |view, _| {
-        assert_eq!(view.showing(), vec![first], "the split collapsed");
+        assert_eq!(shown(view), vec![first], "the split collapsed");
         assert_eq!(view.focused, first, "onto the shell that is left");
         assert_eq!(view.shells.len(), 1, "and the other process is gone");
     });
@@ -458,7 +482,7 @@ fn the_model_is_told_where_the_toolkit_put_focus(cx: &mut TestAppContext) {
 
     // Focus is moved the way anything other than an action would move it, and
     // both the view's record of it and the model's follow.
-    let first = view.read_with(cx, |view, _| view.showing()[0]);
+    let first = view.read_with(cx, |view, _| shown(view)[0]);
     let handle = view.read_with(cx, |view, _| {
         view.held(first).expect("a shell being shown").focus.clone()
     });
@@ -467,10 +491,10 @@ fn the_model_is_told_where_the_toolkit_put_focus(cx: &mut TestAppContext) {
 
     view.read_with(cx, |view, _| {
         assert_eq!(view.focused, first);
-        let tab = view.open().tab_of(first).expect("the tab holding it");
+        let tab = view.open().tab_of(first.shell).expect("the tab holding it");
         assert_eq!(
             view.open().tab(tab).expect("that tab").focused(),
-            first,
+            first.shell,
             "the model was told, rather than keeping an opinion of its own"
         );
     });
@@ -588,10 +612,10 @@ fn pressing_in_a_shell_is_where_typing_goes(cx: &mut TestAppContext) {
 
     view.read_with(cx, |view, _| {
         assert_eq!(view.focused, left, "the shell pressed in has focus");
-        let tab = view.open().tab_of(left).expect("the tab holding it");
+        let tab = view.open().tab_of(left.shell).expect("the tab holding it");
         assert_eq!(
             view.open().tab(tab).expect("that tab").focused(),
-            left,
+            left.shell,
             "and the model was told the same thing the keyboard tells it"
         );
     });
@@ -753,7 +777,7 @@ fn an_irregular_arrangement_puts_every_shell_where_the_model_says(cx: &mut TestA
 /// It carries the string this application gave that shell — which is the whole
 /// of the join, and the reason the bus never has to be told anything about
 /// shells for one of these to land on the right row.
-fn running_in(view: &TerminalView, shell: ShellId, status: SessionStatus) -> SessionEntry {
+fn running_in(view: &TerminalView, shell: ShellAddress, status: SessionStatus) -> SessionEntry {
     SessionEntry {
         session: "s1".to_owned(),
         agent: Agent::new("claude").expect("a valid agent id"),
@@ -761,7 +785,7 @@ fn running_in(view: &TerminalView, shell: ShellId, status: SessionStatus) -> Ses
         source: Source::Hook,
         status_source: None,
         cwd: None,
-        correlation: Some(view.open().correlation(shell)),
+        correlation: Some(view.open().correlation(shell.shell)),
         origin: Vec::new(),
         since: Timestamp::parse("2026-08-17T10:31:02.006Z").expect("a well-formed timestamp"),
     }
@@ -803,10 +827,7 @@ fn the_sidebar_is_the_tree_of_what_is_open(cx: &mut TestAppContext) {
     );
     assert_eq!(
         workspace.tabs[1].shells[0].address,
-        ShellAddress::new(
-            view.read_with(cx, |view, _| view.workspace),
-            view.read_with(cx, |view, _| view.focused)
-        ),
+        view.read_with(cx, |view, _| view.focused),
         "and its shell is the one being typed in"
     );
     assert!(workspace.tabs[1].shells[0].focused);
@@ -941,13 +962,201 @@ fn folding_a_workspace_takes_its_tabs_off_the_sidebar_and_leaves_its_badge(
     );
 }
 
+/// A folder to open a workspace on, and its path as the shell running in it
+/// will report it.
+///
+/// Resolved, because a temporary directory is very often reached through a
+/// symbolic link — `/tmp` on a Mac is one — and a shell asked where it is
+/// answers with where it actually is.
+fn folder() -> (tempfile::TempDir, std::path::PathBuf) {
+    let folder = tempfile::tempdir().expect("a temporary directory");
+    let resolved = folder
+        .path()
+        .canonicalize()
+        .expect("a temporary directory that is there");
+    (folder, resolved)
+}
+
+/// Opens a workspace on `on`, the way choosing it in the folder picker does,
+/// and waits for the window to settle.
+///
+/// The picker itself is not here: the platform these tests run on has no
+/// dialogs to show, and what it would hand back is a path, which is what this
+/// hands over instead.
+fn open_workspace(view: &Entity<TerminalView>, cx: &mut VisualTestContext, on: &std::path::Path) {
+    let on = on.to_owned();
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.open_workspace(&on, window, cx));
+    });
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn opening_a_folder_puts_a_workspace_on_it_with_one_shell_in_it(cx: &mut TestAppContext) {
+    let (view, cx) = opened(cx);
+    let (_folder, path) = folder();
+
+    open_workspace(&view, cx, &path);
+
+    let opened = view.read_with(cx, |view, _| {
+        let workspaces = view.layout.workspaces();
+        assert_eq!(workspaces.len(), 2, "the folder chosen is a workspace now");
+        let opened = &workspaces[1];
+        assert_eq!(opened.path(), path, "on the folder that was chosen");
+        assert_eq!(opened.tabs().len(), 1, "with one tab in it");
+        assert_eq!(opened.tabs()[0].shells().len(), 1, "and one shell in that");
+        assert_eq!(view.shells.len(), 2, "which has a process of its own");
+        assert_eq!(view.workspace, opened.id(), "it is the one on screen");
+        assert_eq!(
+            view.focused.workspace,
+            opened.id(),
+            "and its shell is the one being typed in"
+        );
+        opened.id()
+    });
+
+    // The shell it opened with runs in the folder the workspace is on, which is
+    // the whole of what the workspace contributes to starting one — and the
+    // reason a folder set up to run its shells somewhere else needs nothing
+    // added here to do so.
+    type_out(cx, "pwd");
+    cx.simulate_keystrokes("enter");
+    wait_for_line(&view, cx, &path.display().to_string());
+
+    let sidebar = view.read_with(cx, |view, _| view.shown());
+    let listed = &sidebar.workspaces[1];
+    assert_eq!(
+        listed.workspace, opened,
+        "the sidebar lists it straight away"
+    );
+    assert_eq!(
+        listed.name.as_ref(),
+        path.file_name().expect("a folder with a name"),
+        "under the name of the folder it is on"
+    );
+    assert_eq!(listed.tabs.len(), 1, "with its tab under it");
+}
+
+#[gpui::test]
+fn a_folder_already_open_is_shown_rather_than_opened_twice(cx: &mut TestAppContext) {
+    let (view, cx) = opened(cx);
+    let (_folder, path) = folder();
+    let first = view.read_with(cx, |view, _| view.workspace);
+
+    open_workspace(&view, cx, &path);
+    let second = view.read_with(cx, |view, _| view.workspace);
+    assert_ne!(second, first, "the folder chosen was not the one open");
+
+    // The folder this window was opened on, chosen again from inside it.
+    let already = view.read_with(cx, |view, _| {
+        view.layout
+            .workspace(first)
+            .expect("the workspace this window opened on")
+            .path()
+            .to_owned()
+    });
+    open_workspace(&view, cx, &already);
+
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.layout.workspaces().len(),
+            2,
+            "a folder already open is not opened a second time"
+        );
+        assert_eq!(
+            view.shells.len(),
+            2,
+            "and no second shell was started in it"
+        );
+        assert_eq!(view.workspace, first, "it is shown instead");
+        assert_eq!(
+            view.focused.workspace, first,
+            "with focus back in the shell it was left in"
+        );
+    });
+}
+
+#[gpui::test]
+fn closing_a_workspace_takes_its_shells_with_it(cx: &mut TestAppContext) {
+    let (view, cx) = opened(cx);
+    let (_folder, path) = folder();
+    let first = view.read_with(cx, |view, _| view.workspace);
+
+    open_workspace(&view, cx, &path);
+    // A second shell in it, so that what is closed is a workspace with an
+    // arrangement in it rather than a single shell wearing a workspace's name.
+    cx.simulate_keystrokes(keys().split_right);
+    assert_eq!(view.read_with(cx, |view, _| view.shells.len()), 3);
+
+    cx.dispatch_action(CloseWorkspace);
+    cx.run_until_parked();
+
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.layout.workspaces().len(), 1, "the workspace is gone");
+        assert_eq!(
+            view.shells.len(),
+            1,
+            "and both processes that were running in it with it"
+        );
+        assert_eq!(view.workspace, first, "what is left is what is on screen");
+        assert_eq!(
+            view.focused.workspace, first,
+            "with focus in one of its shells"
+        );
+    });
+    assert!(
+        !cx.windows().is_empty(),
+        "closing one workspace of two is not a way out of the application"
+    );
+}
+
+#[gpui::test]
+fn the_last_workspace_cannot_be_closed(cx: &mut TestAppContext) {
+    let (view, cx) = opened(cx);
+
+    cx.dispatch_action(CloseWorkspace);
+    cx.run_until_parked();
+
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.layout.workspaces().len(),
+            1,
+            "emptying the application is not something it offers"
+        );
+        assert_eq!(view.shells.len(), 1, "and its shell is still running");
+    });
+    assert!(!cx.windows().is_empty(), "nor is it a way out of it");
+}
+
+#[gpui::test]
+fn closing_the_last_shell_of_a_workspace_closes_the_workspace(cx: &mut TestAppContext) {
+    let (view, cx) = opened(cx);
+    let (_folder, path) = folder();
+    let first = view.read_with(cx, |view, _| view.workspace);
+
+    open_workspace(&view, cx, &path);
+    cx.simulate_keystrokes(keys().close);
+    cx.run_until_parked();
+
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.layout.workspaces().len(),
+            1,
+            "a workspace with nothing open in it is not something to look at"
+        );
+        assert_eq!(view.workspace, first);
+        assert_eq!(view.shells.len(), 1);
+    });
+    assert!(!cx.windows().is_empty());
+}
+
 #[gpui::test]
 fn a_menu_item_does_what_its_chord_does(cx: &mut TestAppContext) {
     let script = both_ways();
     for binding in crate::keymap::bindings() {
         let action = binding.action();
         assert!(
-            action.partial_eq(&crate::keymap::Quit)
+            unwalkable().iter().any(|out| out.partial_eq(action))
                 || script.iter().any(|(named, _)| named.partial_eq(action)),
             "`{}` can be chosen or pressed, and nothing here does both",
             action.name()

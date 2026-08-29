@@ -99,6 +99,13 @@ const APPROXIMATE: &str = "~";
 /// What a shell with no name of its own is called.
 const UNNAMED: &str = "shell";
 
+/// What the row that opens another workspace is marked with, which is what the
+/// tab bar marks the one that opens another tab with.
+const NEW: &str = "+";
+
+/// And what that row says.
+const OPEN: &str = "open workspace\u{2026}";
+
 /// What the heading over the flat list of agents says.
 const AGENTS: &str = "agents";
 
@@ -160,6 +167,13 @@ impl Folded {
             self.tabs.insert((workspace, tab));
         }
     }
+
+    /// Forgets what was folded in a workspace that has been closed, along with
+    /// its tabs.
+    pub fn forget(&mut self, workspace: WorkspaceId) {
+        self.workspaces.remove(&workspace);
+        self.tabs.retain(|(open, _)| *open != workspace);
+    }
 }
 
 /// What pressing a row in the sidebar asks the window for.
@@ -178,6 +192,8 @@ pub enum Picked {
     FoldWorkspace(WorkspaceId),
     /// Fold this tab's shells away, or unfold them.
     FoldTab(WorkspaceId, TabId),
+    /// Ask for a folder, and open a workspace on it.
+    OpenWorkspace,
 }
 
 /// Everything the sidebar shows, and nothing about how it looks.
@@ -367,6 +383,10 @@ impl Sidebar {
                 }
             }
         }
+        // Under the tree rather than over it, because it is the one row here
+        // that is not something already open: everything above it is, and a
+        // list of what is open reads from the top.
+        rows.push(open_row(cx));
 
         div()
             .id("sidebar")
@@ -399,6 +419,22 @@ impl Sidebar {
             })
             .into_any_element()
     }
+}
+
+/// The row that opens another workspace.
+///
+/// The same `+` the tab bar offers a tab from, at the same level as the
+/// workspaces it adds to, so that the way to a second folder is where somebody
+/// looking at the first one is already looking.
+fn open_row(cx: &mut Context<TerminalView>) -> AnyElement {
+    line("sidebar-open-workspace".into(), 0, cx)
+        .text_color(cx.theme().muted_foreground)
+        .child(div().flex_shrink_0().w(px(10.0)).child(NEW))
+        .child(name(SharedString::from(OPEN)))
+        .on_click(cx.listener(|view, _: &ClickEvent, window, cx| {
+            view.picked(Picked::OpenWorkspace, window, cx);
+        }))
+        .into_any_element()
 }
 
 /// One workspace's row: what it is called, what it is checked out on, and what

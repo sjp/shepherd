@@ -36,6 +36,10 @@ use gpui::{App, KeyBinding, actions};
 actions!(
     shepherd,
     [
+        /// Opens a workspace on a folder, or shows the one already open on it.
+        OpenWorkspace,
+        /// Closes the workspace on screen, and every shell open in it.
+        CloseWorkspace,
         /// Opens a tab, with a shell in it.
         NewTab,
         /// Shows the next tab along, coming back round at the last.
@@ -74,6 +78,7 @@ pub const CONTEXT: &str = "Shell";
 /// Which keys each action answers to.
 #[derive(Debug, Clone, Copy)]
 pub struct Keys {
+    pub open_workspace: &'static str,
     pub new_tab: &'static str,
     pub next_tab: &'static str,
     pub previous_tab: &'static str,
@@ -95,6 +100,7 @@ pub struct Keys {
 /// shift for a shell below it. Stepping between tabs is the bracket pair every
 /// application on the platform steps between things with.
 const MAC: Keys = Keys {
+    open_workspace: "cmd-shift-o",
     new_tab: "cmd-t",
     next_tab: "cmd-shift-]",
     previous_tab: "cmd-shift-[",
@@ -120,6 +126,12 @@ const MAC: Keys = Keys {
 /// the difference between a keyboard people navigate by and one they reach for
 /// the mouse instead of.
 const ELSEWHERE: Keys = Keys {
+    // Opening a folder is what this platform's terminals put on control, shift
+    // and N — they call it another window, and another window on another folder
+    // is the nearest thing this has to one. The letter the Mac uses for it is
+    // spoken for here: control, shift and O is where these terminals put a
+    // shell below this one, and the table above follows them.
+    open_workspace: "ctrl-shift-n",
     new_tab: "ctrl-shift-t",
     next_tab: "ctrl-shift-pagedown",
     previous_tab: "ctrl-shift-pageup",
@@ -162,10 +174,15 @@ pub fn bindings() -> Vec<KeyBinding> {
     bindings
 }
 
-/// The bindings that act on the shell being typed in, which is all of them bar
+/// The bindings the shell being typed in answers to, which is all of them bar
 /// one.
+///
+/// Not every one of them acts on that shell — opening a tab, or a workspace,
+/// does not — but every one of them is delivered to it, which is what scoping
+/// them to it means.
 fn in_a_shell(keys: Keys) -> Vec<KeyBinding> {
     vec![
+        KeyBinding::new(keys.open_workspace, OpenWorkspace, Some(CONTEXT)),
         KeyBinding::new(keys.new_tab, NewTab, Some(CONTEXT)),
         KeyBinding::new(keys.next_tab, NextTab, Some(CONTEXT)),
         KeyBinding::new(keys.previous_tab, PreviousTab, Some(CONTEXT)),
@@ -193,8 +210,9 @@ mod tests {
     impl Keys {
         /// Every key in this table, so a test can say something about all of
         /// them without listing them again.
-        fn all(self) -> [&'static str; 11] {
+        fn all(self) -> [&'static str; 12] {
             [
+                self.open_workspace,
                 self.new_tab,
                 self.next_tab,
                 self.previous_tab,

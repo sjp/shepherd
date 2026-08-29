@@ -1,4 +1,5 @@
-//! What the menu bar offers, and the two items on it that are not a shell's.
+//! What the menu bar offers, and the two items on it the application answers
+//! for itself.
 //!
 //! Everything this application does to a shell it does because an action was
 //! dispatched, and one module over is the table of chords those actions are
@@ -8,6 +9,11 @@
 //! action its chord names, so the two ways in cannot come to mean different
 //! things, and the chord drawn beside each item is looked up by the platform in
 //! that same keymap rather than spelt out again here.
+//!
+//! Two items go the other way and answer to no keys, so that a menu is the only
+//! way to reach them: saying what this application is, which no platform has a
+//! chord for; and closing a workspace, which takes every shell in one away at
+//! once and is better reached deliberately than by a slip of the fingers.
 //!
 //! # Two of them are the application's own
 //!
@@ -30,8 +36,8 @@ use gpui::{App, Menu, MenuItem, ParentElement as _, Window};
 use gpui_component::WindowExt as _;
 
 use crate::keymap::{
-    About, Close, FocusDown, FocusLeft, FocusRight, FocusUp, NewTab, NextTab, PreviousTab, Quit,
-    SplitDown, SplitRight,
+    About, Close, CloseWorkspace, FocusDown, FocusLeft, FocusRight, FocusUp, NewTab, NextTab,
+    OpenWorkspace, PreviousTab, Quit, SplitDown, SplitRight,
 };
 
 /// What this application is called, wherever it says so.
@@ -53,7 +59,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The second menu holds more than opening and closing: moving between tabs and
 /// moving focus around an arrangement are on it too, because a chord that
 /// appears in no menu is a chord that has to be read about somewhere else, and
-/// there is nowhere else.
+/// there is nowhere else. It begins with the workspaces, which are the folders
+/// everything below them is opened inside of, and works inwards from there.
 fn menus() -> Vec<Menu> {
     vec![
         Menu {
@@ -67,6 +74,9 @@ fn menus() -> Vec<Menu> {
         Menu {
             name: "File".into(),
             items: vec![
+                MenuItem::action("Open Workspace\u{2026}", OpenWorkspace),
+                MenuItem::action("Close Workspace", CloseWorkspace),
+                MenuItem::separator(),
                 MenuItem::action("New Tab", NewTab),
                 MenuItem::action("Next Tab", NextTab),
                 MenuItem::action("Previous Tab", PreviousTab),
@@ -155,6 +165,18 @@ mod tests {
         actions
     }
 
+    /// The two items that deliberately answer to no keys.
+    ///
+    /// Saying what this application is, because a chord for it would be one
+    /// this application had invented and no platform asks for; and closing a
+    /// workspace, because it takes every shell in one away at once and the
+    /// obvious chord for it is a shift away from the one that closes a single
+    /// shell. Both are reachable by name on a menu, which is the right amount
+    /// of reachable for something done rarely and regretted immediately.
+    fn unbound() -> Vec<Box<dyn Action>> {
+        vec![About.boxed_clone(), CloseWorkspace.boxed_clone()]
+    }
+
     /// A window with nothing in it but the layer a panel is shown on.
     struct Empty;
 
@@ -178,10 +200,13 @@ mod tests {
     }
 
     #[test]
-    fn every_menu_item_but_the_about_shows_a_chord() {
+    fn every_menu_item_shows_a_chord_but_the_two_that_answer_to_none() {
         let bound = keymap::bindings();
         for action in actions() {
-            if action.partial_eq(&About) {
+            if unbound()
+                .iter()
+                .any(|none| none.partial_eq(action.as_ref()))
+            {
                 continue;
             }
             assert!(
@@ -195,13 +220,17 @@ mod tests {
     }
 
     #[test]
-    fn the_about_is_the_only_item_with_no_chord() {
-        assert!(
-            !keymap::bindings()
-                .iter()
-                .any(|binding| binding.action().partial_eq(&About)),
-            "an About with a chord would be a chord this application had invented"
-        );
+    fn the_items_meant_to_have_no_chord_have_none() {
+        let bound = keymap::bindings();
+        for action in unbound() {
+            assert!(
+                !bound
+                    .iter()
+                    .any(|binding| binding.action().partial_eq(action.as_ref())),
+                "`{}` is bound to keys, and the reason it is on no keymap is written above",
+                action.name()
+            );
+        }
     }
 
     #[gpui::test]

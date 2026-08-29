@@ -1,7 +1,8 @@
 //! The Shepherd binary.
 //!
-//! One window on one folder, with shells in it, and the event bus read behind
-//! them. That is deliberately less than a terminal multiplexer: what it is for
+//! One window on the folder it was launched in — and on any other opened from
+//! inside it — with shells in them, and the event bus read behind them. That is
+//! deliberately less than a terminal multiplexer: what it is for
 //! is the seam between the two halves this repository builds — live processes
 //! feeding terminal grids, those grids reaching pixels and a keyboard, and an
 //! agent started in one of those shells being recognised as having been started
@@ -18,8 +19,8 @@
 //!
 //! # What is on screen
 //!
-//! Down the left, everything that is open — the workspace, its tabs, the shells
-//! in each of them — with a badge on every row saying what the bus knows about
+//! Down the left, everything that is open — the workspaces, their tabs, the
+//! shells in each of them — with a badge on every row saying what the bus knows about
 //! what is running there, and beneath that one flat list of every agent it is
 //! reporting, including the ones running somewhere this application cannot
 //! claim. The rest of the window is the tabs and the arrangement of shells
@@ -47,7 +48,7 @@ use gpui::{
     size as window_size,
 };
 use gpui_component::Root;
-use shepherd_core::{Layout, Program, Shell, ShellAddress, ShellOptions};
+use shepherd_core::{Layout, Program, ShellOptions};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -66,9 +67,6 @@ const WIDTH: f32 = 1024.0;
 
 /// How tall the window is when nothing has said otherwise.
 const HEIGHT: f32 = 700.0;
-
-/// What the one tab is called, for the one shell it holds.
-const TAB: &str = "shell";
 
 /// The `shepherd` command line.
 #[derive(Debug, Parser)]
@@ -112,29 +110,22 @@ fn main() -> ExitCode {
 fn open(command: &[String]) -> Result<()> {
     let directory = std::env::current_dir().context("cannot tell which directory this is")?;
 
-    // One workspace, one tab, one shell. The model is the full one rather than a
-    // pair of numbers, because it is what the bus's sessions are placed against
-    // and that placement is the thing being proved.
-    let mut layout = Layout::new();
-    let workspace = layout.open(directory.clone());
-    let address = {
-        let open = layout
-            .workspace_mut(workspace)
-            .expect("the workspace just opened");
-        let tab = open.open_tab(TAB);
-        let shell = open.tab(tab).expect("the tab just opened").focused();
-        ShellAddress::new(workspace, shell)
-    };
-
-    // Shells opened later run the login shell in the same folder: what was
-    // asked for on the command line was asked for once, the way it is of a
-    // terminal started to run one thing.
-    let options = ShellOptions::new().directory(&directory);
+    // Shells opened later run the login shell, in the folder of whichever
+    // workspace they are opened in: what was asked for on the command line was
+    // asked for once, the way it is of a terminal started to run one thing.
+    let options = ShellOptions::new();
     let mut first = options.clone();
     if let Some((program, arguments)) = command.split_first() {
         first = first.program(Program::new(program).with_args(arguments.to_vec()));
     }
-    let shell = Shell::spawn(address, &first).context("cannot start a shell")?;
+
+    // One workspace, one tab, one shell — opened by the same code that opens
+    // every workspace after it. The model is the full one rather than a pair of
+    // numbers, because it is what the bus's sessions are placed against and
+    // that placement is the thing being proved.
+    let mut layout = Layout::new();
+    let shell =
+        terminal::open_on(&mut layout, &directory, &first).context("cannot start a shell")?;
     info!(
         correlation = shell.correlation(),
         directory = %directory.display(),

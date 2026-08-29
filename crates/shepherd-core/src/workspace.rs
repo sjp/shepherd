@@ -478,6 +478,22 @@ impl Layout {
             .find(|workspace| workspace.id == id)
     }
 
+    /// The workspace open on `path`, where there is one.
+    ///
+    /// A workspace is its folder, so this is how something opening a folder
+    /// asks whether it is already open rather than opening a second workspace
+    /// on it. It is the same identity the file a layout is saved in relies on:
+    /// a path is what names a workspace there.
+    ///
+    /// The first of them, in the unlikely event that [`Layout::open`] was used
+    /// to make two.
+    pub fn on(&self, path: impl AsRef<Path>) -> Option<&Workspace> {
+        let path = path.as_ref();
+        self.workspaces
+            .iter()
+            .find(|workspace| workspace.path == path)
+    }
+
     /// Adds a workspace for `path`, with no tabs open in it yet.
     ///
     /// The same folder may be opened twice: they are two workspaces with two
@@ -854,6 +870,29 @@ mod tests {
         assert_eq!(layout.workspaces().len(), 1);
         assert!(layout.close(second));
         assert!(layout.is_empty());
+    }
+
+    #[test]
+    fn a_folder_that_is_already_open_is_found_by_its_path() {
+        let mut layout = Layout::new();
+        let thing = layout.open("/home/someone/projects/thing");
+        layout.open("/home/someone/projects/other");
+
+        assert_eq!(
+            layout.on("/home/someone/projects/thing").map(Workspace::id),
+            Some(thing),
+            "a folder somebody opens twice is the workspace they already have"
+        );
+        assert!(
+            layout.on("/home/someone/projects/elsewhere").is_none(),
+            "a folder nobody has opened is not open"
+        );
+
+        assert!(layout.close(thing));
+        assert!(
+            layout.on("/home/someone/projects/thing").is_none(),
+            "and a folder closed is a folder that can be opened afresh"
+        );
     }
 
     #[test]

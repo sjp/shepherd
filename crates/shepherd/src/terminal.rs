@@ -1,10 +1,19 @@
 //! The shells, on screen.
 //!
-//! A window over one workspace: a bar of the tabs open in it, the arrangement
-//! of shells belonging to whichever of them is showing, each drawn as a grid of
-//! cells in its own rectangle with a divider on every edge two of them share,
-//! and a line above all of it saying which shell is being typed in and what the
-//! bus thinks is running in it.
+//! A window over one workspace at a time: a bar of the tabs open in it, the
+//! arrangement of shells belonging to whichever of them is showing, each drawn
+//! as a grid of cells in its own rectangle with a divider on every edge two of
+//! them share, and a line above all of it saying which shell is being typed in
+//! and what the bus thinks is running in it.
+//!
+//! # Several workspaces, one of them on screen
+//!
+//! Every folder somebody has opened is in the model, is listed in the sidebar
+//! and has its shells running here; what the tab bar and the arrangement draw
+//! is whichever of them was last typed in. So arriving at a workspace and
+//! putting focus in one of its shells are the same act, and coming back to one
+//! puts focus where it was left. Tabs and shells are numbered within their own
+//! workspace, which is why everything held here is keyed by both.
 //!
 //! # The arrangement is the model's, at the window's scale
 //!
@@ -61,27 +70,31 @@
 #[cfg(test)]
 mod tests;
 
+use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, FocusHandle, InteractiveElement,
     IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Render, SharedString, Size, StatefulInteractiveElement as _, Styled,
-    Subscription, Task, Window, canvas, div, prelude::FluentBuilder as _, px, relative,
+    ParentElement, PathPromptOptions, Pixels, Render, SharedString, Size,
+    StatefulInteractiveElement as _, Styled, Subscription, Task, Window, canvas, div,
+    prelude::FluentBuilder as _, px, relative,
 };
 use gpui_component::ActiveTheme;
 use gpui_component::tab::{Tab as TabButton, TabBar};
 use shepherd_core::{
     Axis, Branches, Closed, Direction, Divider, Layout, PlacedDivider, PlacedShell, Rect, Shell,
-    ShellAddress, ShellId, ShellOptions, ShellSize, SplitTree, TabId, Workspace, WorkspaceId,
+    ShellAddress, ShellId, ShellOptions, ShellSize, SpawnError, SplitTree, TabId, Workspace,
+    WorkspaceId,
 };
 use tracing::{debug, info, warn};
 
 use crate::frames::Frames;
 use crate::grid::{Metrics, painting};
 use crate::keymap::{
-    self, Close, FocusDown, FocusLeft, FocusRight, FocusUp, NewTab, NextTab, PreviousTab,
-    SplitDown, SplitRight,
+    self, Close, CloseWorkspace, FocusDown, FocusLeft, FocusRight, FocusUp, NewTab, NextTab,
+    OpenWorkspace, PreviousTab, SplitDown, SplitRight,
 };
 use crate::keys;
 use crate::live::{Live, described};
@@ -118,6 +131,9 @@ const CLOSE: &str = "\u{00d7}";
 
 /// What opens another one, at the end of the bar.
 const NEW: &str = "+";
+
+/// What the folder picker's own button says.
+const OPEN: &str = "Open";
 
 /// The families a monospaced font is looked for under, in order.
 ///
@@ -161,9 +177,11 @@ pub struct TerminalView {
     /// The model the bus's sessions are placed against, and the tab bar and
     /// the sidebar are both drawn from.
     layout: Layout,
-    /// The workspace this window is open on. There is one.
+    /// The workspace on screen. There are as many open as somebody has
+    /// opened; this is the one being looked at.
     workspace: WorkspaceId,
-    /// How a shell opened from the keyboard is started.
+    /// How a shell is started, before the workspace it belongs to says which
+    /// folder it starts in.
     options: ShellOptions,
     shells: Vec<Held>,
     /// The tab on screen.
@@ -177,7 +195,14 @@ pub struct TerminalView {
     active: TabId,
     /// Which shell the toolkit last said has focus. Written in one place only,
     /// from the toolkit's own notification. See [`TerminalView::took_focus`].
-    focused: ShellId,
+    focused: ShellAddress,
+    /// Which shell each workspace was last being typed in.
+    ///
+    /// Written where focus is recorded and nowhere else. Coming back to a
+    /// workspace puts focus back where it was left, and the tab that shows is
+    /// then the one holding that shell — so there is no second record of where
+    /// a workspace was left for this one to disagree with.
+    left_in: BTreeMap<WorkspaceId, ShellId>,
     /// Where the arrangement of shells is in the window, as of the last frame.
     ///
     /// The tab bar and the line above it take what room they take, so this is
@@ -258,7 +283,8 @@ impl TerminalView {
             options,
             shells: Vec::new(),
             active,
-            focused: address.shell,
+            focused: address,
+            left_in: BTreeMap::from([(address.workspace, address.shell)]),
             area: Bounds::default(),
             dragging: None,
             live: Live::new(),
@@ -271,7 +297,7 @@ impl TerminalView {
             _quitting: quitting,
         };
         view.hold(first, window, cx);
-        view.focus(address.shell, window);
+        view.focus(address, window);
         view
     }
 
@@ -279,9 +305,11 @@ impl TerminalView {
     /// the focus that says keystrokes are meant for it, and the standing
     /// arrangement by which the toolkit says focus arrived there.
     fn hold(&mut self, shell: Shell, window: &mut Window, cx: &mut Context<Self>) {
-        let id = shell.address().shell;
+        let address = shell.address();
         let focus = cx.focus_handle();
-        let focusing = cx.on_focus_in(&focus, window, move |view, _, cx| view.took_focus(id, cx));
+        let focusing = cx.on_focus_in(&focus, window, move |view, _, cx| {
+            view.took_focus(address, cx)
+        });
         self.shells.push(Held {
             shell,
             focus,
@@ -299,25 +327,184 @@ impl TerminalView {
     /// own record of which of its shells was last typed in is what gets saved
     /// between runs, so it has to be kept — but it is a copy of the toolkit's
     /// answer, not a second opinion.
-    fn took_focus(&mut self, shell: ShellId, cx: &mut Context<Self>) {
-        self.focused = shell;
-        if let Some(tab) = self.open().tab_of(shell) {
-            self.active = tab;
-            if let Some(open) = self.open_mut().tab_mut(tab) {
-                open.focus(shell);
+    fn took_focus(&mut self, address: ShellAddress, cx: &mut Context<Self>) {
+        self.focused = address;
+        self.left_in.insert(address.workspace, address.shell);
+        // Focus arriving in another workspace's shell is how somebody moves
+        // between workspaces: there is no separate act of choosing one.
+        self.showing_workspace(address.workspace);
+        if let Some(open) = self.layout.workspace_mut(address.workspace) {
+            if let Some(tab) = open.tab_of(address.shell) {
+                self.active = tab;
+                if let Some(tab) = open.tab_mut(tab) {
+                    tab.focus(address.shell);
+                }
             }
         }
         cx.notify();
+    }
+
+    /// Records that `workspace` is the one being looked at now.
+    ///
+    /// The one place that writes it, so that no workspace can come to be on
+    /// screen without what its folder is checked out on being read again — a
+    /// question worth going to the filesystem for exactly when somebody
+    /// arrives at the workspace it is about, and never while a frame is being
+    /// drawn.
+    fn showing_workspace(&mut self, workspace: WorkspaceId) {
+        if self.workspace == workspace {
+            return;
+        }
+        self.workspace = workspace;
+        if let Some(open) = self.layout.workspace(workspace) {
+            self.branches.focused(open);
+        }
     }
 
     /// Asks the toolkit to put focus in `shell`.
     ///
     /// Nothing is recorded here. The arrangement made when the shell was first
     /// held is what records it, once the toolkit has actually done it.
-    fn focus(&self, shell: ShellId, window: &mut Window) {
-        if let Some(held) = self.held(shell) {
+    fn focus(&self, address: ShellAddress, window: &mut Window) {
+        if let Some(held) = self.held(address) {
             window.focus(&held.focus);
         }
+    }
+
+    /// Asks for a folder, and opens a workspace on whichever one is chosen.
+    ///
+    /// The platform's own picker rather than one drawn here: it is the chooser
+    /// somebody already knows, with their own places and their own recent
+    /// folders in it, and nothing drawn here would be a better one.
+    fn ask_for_a_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let chosen = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(OPEN.into()),
+        });
+        cx.spawn_in(window, async move |view, cx| {
+            // Anything but one folder is nothing having been asked for: the
+            // picker was cancelled, the platform could not show one, or the
+            // window it was shown over has gone.
+            let Ok(Ok(Some(chosen))) = chosen.await else {
+                return;
+            };
+            let Some(folder) = chosen.into_iter().next() else {
+                return;
+            };
+            let _ = view.update_in(cx, |view, window, cx| {
+                view.open_workspace(&folder, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Opens a workspace on `folder`, or shows the one already open on it.
+    ///
+    /// The same folder twice is the same workspace rather than two of them: a
+    /// workspace is its folder, which is also how the file this arrangement is
+    /// saved in names them.
+    pub(crate) fn open_workspace(
+        &mut self,
+        folder: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(open) = self.layout.on(folder).map(Workspace::id) {
+            self.show_workspace(open, window, cx);
+            return;
+        }
+        match open_on(&mut self.layout, folder, &self.options) {
+            Ok(shell) => {
+                info!(
+                    correlation = shell.correlation(),
+                    directory = %folder.display(),
+                    "opened a workspace"
+                );
+                let workspace = shell.address().workspace;
+                self.hold(shell, window, cx);
+                self.show_workspace(workspace, window, cx);
+            }
+            Err(error) => {
+                warn!(%error, directory = %folder.display(), "cannot open a workspace");
+            }
+        }
+    }
+
+    /// Shows `workspace`, and puts focus back in whichever of its shells was
+    /// last being typed in.
+    fn show_workspace(
+        &mut self,
+        workspace: WorkspaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(open) = self.layout.workspace(workspace) else {
+            return;
+        };
+        // Where it was left, or the start of it — which is the case for a
+        // workspace just opened, and for one whose remembered shell has since
+        // been closed.
+        let Some(shell) = self
+            .left_in
+            .get(&workspace)
+            .copied()
+            .filter(|shell| open.tab_of(*shell).is_some())
+            .or_else(|| open.tabs().first().map(shepherd_core::Tab::focused))
+        else {
+            return;
+        };
+        let Some(tab) = open.tab_of(shell) else {
+            return;
+        };
+        self.showing_workspace(workspace);
+        self.active = tab;
+        self.focus(ShellAddress::new(workspace, shell), window);
+        cx.notify();
+    }
+
+    /// Closes a workspace and every shell open in it. Answers whether it did.
+    ///
+    /// Refused when it is the only one open, because what would be left is a
+    /// window with nothing in it: the way out of this application is closing
+    /// the window, not emptying it.
+    fn close_workspace(
+        &mut self,
+        workspace: WorkspaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let open = self.layout.workspaces();
+        if open.len() < 2 {
+            return false;
+        }
+        let Some(was) = open.iter().position(|open| open.id() == workspace) else {
+            return false;
+        };
+        // Dropping them is what ends the processes and waits for them.
+        self.shells
+            .retain(|held| held.shell.address().workspace != workspace);
+        self.layout.close(workspace);
+        // Everything else remembered about a workspace, forgotten with it.
+        // Ids are never handed out twice, so what is left behind would never
+        // be asked about again — but it would be carried around for as long as
+        // the window is open.
+        self.branches.forget(workspace);
+        self.folded.forget(workspace);
+        self.left_in.remove(&workspace);
+
+        if self.workspace == workspace {
+            // Whatever took its place, or the last one where what closed was
+            // the last of them — the same choice closing a tab makes.
+            let next = self.layout.workspaces()[was.min(self.layout.workspaces().len() - 1)].id();
+            // Which one is on screen is settled first, because until it is,
+            // the one recorded is the one that has just been closed.
+            self.showing_workspace(next);
+            self.show_workspace(next, window, cx);
+        }
+        cx.notify();
+        true
     }
 
     /// Opens a tab with one shell in it, and focuses that shell.
@@ -326,14 +513,14 @@ impl TerminalView {
         let Some(shell) = self.open().tab(tab).map(|tab| tab.focused()) else {
             return;
         };
-        self.started(tab, shell, window, cx);
+        self.started(self.at(shell), tab, window, cx);
     }
 
     /// Shows the tab at `index` in the bar.
     fn show_tab_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let tab = self.open().tabs().get(index).map(shepherd_core::Tab::id);
         if let Some(tab) = tab {
-            self.show(tab, window, cx);
+            self.show(self.workspace, tab, window, cx);
         }
     }
 
@@ -354,7 +541,7 @@ impl TerminalView {
             })
         };
         if let Some(tab) = next {
-            self.show(tab, window, cx);
+            self.show(self.workspace, tab, window, cx);
         }
     }
 
@@ -364,12 +551,24 @@ impl TerminalView {
     /// Which tab is showing is set before focus is asked for, because the
     /// toolkit will not put focus in something it has not drawn — and it is set
     /// again, from the toolkit's own notification, once it has.
-    fn show(&mut self, tab: TabId, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(shell) = self.open().tab(tab).map(shepherd_core::Tab::focused) else {
+    fn show(
+        &mut self,
+        workspace: WorkspaceId,
+        tab: TabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(shell) = self
+            .layout
+            .workspace(workspace)
+            .and_then(|open| open.tab(tab))
+            .map(shepherd_core::Tab::focused)
+        else {
             return;
         };
+        self.showing_workspace(workspace);
         self.active = tab;
-        self.focus(shell, window);
+        self.focus(ShellAddress::new(workspace, shell), window);
         cx.notify();
     }
 
@@ -382,11 +581,14 @@ impl TerminalView {
     /// the window with it — is settled by the same code that answers closing a
     /// shell from the keyboard.
     fn close_tab(&mut self, tab: TabId, window: &mut Window, cx: &mut Context<Self>) {
-        let closing = self
+        let closing: Vec<ShellAddress> = self
             .open()
             .tab(tab)
             .map(shepherd_core::Tab::shells)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .map(|shell| self.at(shell))
+            .collect();
         if tab == self.active {
             for shell in closing {
                 self.close(shell, window, cx);
@@ -396,25 +598,28 @@ impl TerminalView {
         self.open_mut().close_tab(tab);
         // Dropping them is what ends the processes and waits for them.
         self.shells
-            .retain(|held| !closing.contains(&held.shell.address().shell));
+            .retain(|held| !closing.contains(&held.shell.address()));
         cx.notify();
     }
 
     /// Puts a new shell beside `from` on the given side, and focuses it.
     fn split(
         &mut self,
-        from: ShellId,
+        from: ShellAddress,
         direction: Direction,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(tab) = self.open().tab_of(from) else {
+        let Some(open) = self.layout.workspace_mut(from.workspace) else {
             return;
         };
-        let Some(fresh) = self.open_mut().split(tab, from, direction) else {
+        let Some(tab) = open.tab_of(from.shell) else {
             return;
         };
-        self.started(tab, fresh, window, cx);
+        let Some(fresh) = open.split(tab, from.shell, direction) else {
+            return;
+        };
+        self.started(ShellAddress::new(from.workspace, fresh), tab, window, cx);
     }
 
     /// Starts the process for a shell the model has just made room for.
@@ -423,58 +628,95 @@ impl TerminalView {
     /// no process in it draws as a rectangle nothing can ever appear in, and
     /// there is nothing to be done with one but take it away again — so the
     /// failure is said out loud and the arrangement goes back to what it was.
-    fn started(&mut self, tab: TabId, shell: ShellId, window: &mut Window, cx: &mut Context<Self>) {
-        let address = ShellAddress::new(self.workspace, shell);
-        match Shell::spawn(address, &self.options) {
+    fn started(
+        &mut self,
+        address: ShellAddress,
+        tab: TabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(options) = self.options_for(address.workspace) else {
+            return;
+        };
+        match Shell::spawn(address, &options) {
             Ok(started) => {
                 info!(correlation = started.correlation(), "started a shell");
                 self.hold(started, window, cx);
                 // Before focus is asked for, because a shell in a tab that is
                 // not the one on screen is not drawn, and the toolkit will not
                 // put focus in something it has not drawn.
+                self.showing_workspace(address.workspace);
                 self.active = tab;
-                self.focus(shell, window);
+                self.focus(address, window);
             }
             Err(error) => {
                 warn!(%error, "cannot start a shell");
-                self.open_mut().close_shell(tab, shell);
+                if let Some(open) = self.layout.workspace_mut(address.workspace) {
+                    open.close_shell(tab, address.shell);
+                }
             }
         }
         cx.notify();
     }
 
+    /// How a shell of `workspace` is started: what this window was given, in
+    /// that workspace's own folder.
+    ///
+    /// The folder is the workspace's rather than the window's, which is the
+    /// whole of what a second workspace needs from here: everything else about
+    /// starting a shell is the same wherever it is started.
+    fn options_for(&self, workspace: WorkspaceId) -> Option<ShellOptions> {
+        let folder = self.layout.workspace(workspace)?.path();
+        Some(self.options.clone().directory(folder))
+    }
+
     /// Closes `shell`, and the tab it was in if it was the last one there.
     ///
-    /// Closing the last shell of the last tab leaves nothing to show, so the
-    /// window goes with it — which is also how this application is quit.
-    fn close(&mut self, shell: ShellId, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.open().tab_of(shell) else {
+    /// Closing the last shell of the last tab of a workspace closes the
+    /// workspace, since a workspace with nothing open in it is not something
+    /// to look at; and closing the last shell of the last workspace leaves
+    /// nothing to show at all, so the window goes with it — which is also how
+    /// this application is quit.
+    fn close(&mut self, address: ShellAddress, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(open) = self.layout.workspace_mut(address.workspace) else {
             return;
         };
-        let was = self.open().tabs().iter().position(|open| open.id() == tab);
-        let closed = self.open_mut().close_shell(tab, shell);
+        let Some(tab) = open.tab_of(address.shell) else {
+            return;
+        };
+        let was = open.tabs().iter().position(|open| open.id() == tab);
+        let closed = open.close_shell(tab, address.shell);
         // Dropping it is what ends the process and waits for it.
-        self.shells
-            .retain(|held| held.shell.address().shell != shell);
+        self.shells.retain(|held| held.shell.address() != address);
 
         match closed {
-            Closed::Removed { successor } => self.focus(successor, window),
+            Closed::Removed { successor } => {
+                self.focus(ShellAddress::new(address.workspace, successor), window);
+            }
             Closed::Emptied => {
                 // The tab that was there is gone, so what shows is whatever
                 // took its place — or the last tab, where what closed was the
                 // right-hand one.
-                let next = {
-                    let tabs = self.open().tabs();
+                let next = self.layout.workspace(address.workspace).and_then(|open| {
+                    let tabs = open.tabs();
                     was.filter(|_| !tabs.is_empty())
                         .map(|was| was.min(tabs.len() - 1))
                         .map(|next| (tabs[next].id(), tabs[next].focused()))
-                };
+                });
                 match next {
                     Some((tab, shell)) => {
+                        self.showing_workspace(address.workspace);
                         self.active = tab;
-                        self.focus(shell, window);
+                        self.focus(ShellAddress::new(address.workspace, shell), window);
                     }
-                    None => window.remove_window(),
+                    // Nothing left open in that workspace, so it goes too —
+                    // unless it was the only one, and then there is nothing
+                    // left to show and the window goes.
+                    None => {
+                        if !self.close_workspace(address.workspace, window, cx) {
+                            window.remove_window();
+                        }
+                    }
                 }
             }
             Closed::NotFound => {}
@@ -483,18 +725,18 @@ impl TerminalView {
     }
 
     /// Moves focus one shell in `direction` from `from`, if there is one there.
-    fn moved(&mut self, from: ShellId, direction: Direction, window: &mut Window) {
-        let Some(tab) = self.open().tab_of(from) else {
+    fn moved(&mut self, from: ShellAddress, direction: Direction, window: &mut Window) {
+        let Some(open) = self.layout.workspace(from.workspace) else {
             return;
         };
-        let Some(neighbour) = self
-            .open()
-            .tab(tab)
-            .and_then(|tab| tab.tree().neighbour(from, direction))
+        let Some(neighbour) = open
+            .tab_of(from.shell)
+            .and_then(|tab| open.tab(tab))
+            .and_then(|tab| tab.tree().neighbour(from.shell, direction))
         else {
             return;
         };
-        self.focus(neighbour, window);
+        self.focus(ShellAddress::new(from.workspace, neighbour), window);
     }
 
     /// Takes hold of a divider, which is what dragging one begins as.
@@ -565,8 +807,8 @@ impl TerminalView {
     ///
     /// The shell is the one whose rectangle the toolkit delivered the press to,
     /// which is the same rectangle an action would have been delivered to.
-    fn typed(&mut self, shell: ShellId, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        let Some(index) = self.index_of(shell) else {
+    fn typed(&mut self, address: ShellAddress, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let Some(index) = self.index_of(address) else {
             return;
         };
         // The lock the shell's reading thread needs, held for one copy of a
@@ -602,10 +844,14 @@ impl TerminalView {
     /// being read and will be drawn as it then is when its tab comes back, but
     /// nothing it prints in the meantime is a reason to draw a frame.
     fn printed(&self) -> bool {
-        let showing = self.showing();
+        let showing: Vec<ShellAddress> = self
+            .showing()
+            .into_iter()
+            .map(|shell| self.at(shell))
+            .collect();
         self.shells
             .iter()
-            .filter(|held| showing.contains(&held.shell.address().shell))
+            .filter(|held| showing.contains(&held.shell.address()))
             .any(|held| held.shell.revision() != held.drawn)
     }
 
@@ -615,8 +861,8 @@ impl TerminalView {
     /// full-screen program redraw itself at the new size. Nothing happens where
     /// the size works out the same, so a window being dragged one pixel at a
     /// time resizes a shell only when a whole row or column appears.
-    fn fitted(&mut self, shell: ShellId, room: Size<Pixels>, cx: &mut Context<Self>) {
-        let Some(index) = self.index_of(shell) else {
+    fn fitted(&mut self, address: ShellAddress, room: Size<Pixels>, cx: &mut Context<Self>) {
+        let Some(index) = self.index_of(address) else {
             return;
         };
         let fitted = ShellSize::new(
@@ -627,7 +873,7 @@ impl TerminalView {
         let held = &mut self.shells[index];
         if fitted != held.shell.size() {
             debug!(
-                %shell,
+                shell = %address.shell,
                 columns = fitted.columns(),
                 lines = fitted.lines(),
                 "a grid was given room for a different number of cells"
@@ -701,11 +947,10 @@ impl TerminalView {
             Showing {
                 workspace: self.workspace,
                 tab: self.active,
-                shell: self.focused,
+                shell: self.focused.shell,
             },
             |address| {
-                self.held(address.shell)
-                    .filter(|held| held.shell.address() == address)
+                self.held(address)
                     .and_then(|held| held.shell.name())
                     .map(ToOwned::to_owned)
             },
@@ -719,23 +964,26 @@ impl TerminalView {
     /// different things.
     pub(crate) fn picked(&mut self, picked: Picked, window: &mut Window, cx: &mut Context<Self>) {
         match picked {
-            // A shell in a workspace this window is not open on has nowhere
-            // here to be shown. There is one workspace, and the sidebar draws
-            // the model rather than only the part of it this window can reach.
-            Picked::Shell(address) if address.workspace != self.workspace => {}
             Picked::Shell(address) => {
-                // Before focus is asked for, because the toolkit will not put
-                // focus in something it has not drawn.
-                if let Some(tab) = self.open().tab_of(address.shell) {
+                let tab = self
+                    .layout
+                    .workspace(address.workspace)
+                    .and_then(|open| open.tab_of(address.shell));
+                if let Some(tab) = tab {
+                    // Both before focus is asked for, because the toolkit will
+                    // not put focus in something it has not drawn — and a
+                    // shell of another workspace is not drawn until that
+                    // workspace is the one on screen.
+                    self.showing_workspace(address.workspace);
                     self.active = tab;
+                    self.focus(address, window);
+                    cx.notify();
                 }
-                self.focus(address.shell, window);
-                cx.notify();
             }
-            Picked::Tab(workspace, tab) if workspace == self.workspace => {
-                self.show(tab, window, cx);
+            Picked::Tab(workspace, tab) => {
+                self.show(workspace, tab, window, cx);
             }
-            Picked::Tab(..) => {}
+            Picked::OpenWorkspace => self.ask_for_a_folder(window, cx),
             Picked::FoldWorkspace(workspace) => {
                 self.folded.fold_workspace(workspace);
                 cx.notify();
@@ -827,7 +1075,7 @@ impl TerminalView {
         let showing = self.showing();
         let shell = showing
             .iter()
-            .position(|shell| *shell == self.focused)
+            .position(|shell| *shell == self.focused.shell)
             .map_or(0, |index| index + 1);
         format!("shell {shell} of {}", showing.len())
     }
@@ -924,13 +1172,13 @@ impl TerminalView {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(index) = self.index_of(placed.shell) else {
+        let address = self.at(placed.shell);
+        let Some(index) = self.index_of(address) else {
             // A slot the model has and no process for. Nothing starts one from
             // here — whatever should have is elsewhere — so what is drawn is
             // the empty rectangle, rather than a rectangle that is not there.
             return div().into_any_element();
         };
-        let shell = placed.shell;
         let focus = self.shells[index].focus.clone();
         let focused = focus.is_focused(window);
         let metrics = self.metrics;
@@ -948,7 +1196,13 @@ impl TerminalView {
             .key_context(keymap::CONTEXT)
             .track_focus(&focus)
             .on_key_down(cx.listener(move |view, event: &KeyDownEvent, _, cx| {
-                view.typed(shell, event, cx);
+                view.typed(address, event, cx);
+            }))
+            .on_action(cx.listener(move |view, _: &OpenWorkspace, window, cx| {
+                view.ask_for_a_folder(window, cx);
+            }))
+            .on_action(cx.listener(move |view, _: &CloseWorkspace, window, cx| {
+                view.close_workspace(address.workspace, window, cx);
             }))
             .on_action(cx.listener(move |view, _: &NewTab, window, cx| view.new_tab(window, cx)))
             .on_action(cx.listener(move |view, _: &NextTab, window, cx| {
@@ -958,25 +1212,25 @@ impl TerminalView {
                 view.step(false, window, cx);
             }))
             .on_action(cx.listener(move |view, _: &SplitRight, window, cx| {
-                view.split(shell, Direction::Right, window, cx);
+                view.split(address, Direction::Right, window, cx);
             }))
             .on_action(cx.listener(move |view, _: &SplitDown, window, cx| {
-                view.split(shell, Direction::Down, window, cx);
+                view.split(address, Direction::Down, window, cx);
             }))
             .on_action(cx.listener(move |view, _: &Close, window, cx| {
-                view.close(shell, window, cx);
+                view.close(address, window, cx);
             }))
             .on_action(cx.listener(move |view, _: &FocusLeft, window, _| {
-                view.moved(shell, Direction::Left, window);
+                view.moved(address, Direction::Left, window);
             }))
             .on_action(cx.listener(move |view, _: &FocusRight, window, _| {
-                view.moved(shell, Direction::Right, window);
+                view.moved(address, Direction::Right, window);
             }))
             .on_action(cx.listener(move |view, _: &FocusUp, window, _| {
-                view.moved(shell, Direction::Up, window);
+                view.moved(address, Direction::Up, window);
             }))
             .on_action(cx.listener(move |view, _: &FocusDown, window, _| {
-                view.moved(shell, Direction::Down, window);
+                view.moved(address, Direction::Down, window);
             }))
             .border_1()
             .border_color(if focused {
@@ -994,7 +1248,7 @@ impl TerminalView {
                         // this element was actually given, rather than the
                         // window's size less a guess at everything drawn around
                         // it.
-                        measuring.update(cx, |view, cx| view.fitted(shell, bounds.size, cx));
+                        measuring.update(cx, |view, cx| view.fitted(address, bounds.size, cx));
                         painting(screen, metrics, &family, bounds, window)
                     },
                     |_, painting, window, cx| painting.paint(window, cx),
@@ -1030,15 +1284,27 @@ impl TerminalView {
     }
 
     /// One shell this window is holding.
-    fn held(&self, shell: ShellId) -> Option<&Held> {
-        self.index_of(shell).map(|index| &self.shells[index])
+    fn held(&self, address: ShellAddress) -> Option<&Held> {
+        self.index_of(address).map(|index| &self.shells[index])
     }
 
     /// Where in the list one shell is.
-    fn index_of(&self, shell: ShellId) -> Option<usize> {
+    ///
+    /// By address rather than by number: this window holds the shells of every
+    /// workspace that is open, and every workspace numbers its own from one.
+    fn index_of(&self, address: ShellAddress) -> Option<usize> {
         self.shells
             .iter()
-            .position(|held| held.shell.address().shell == shell)
+            .position(|held| held.shell.address() == address)
+    }
+
+    /// A shell of the workspace on screen, as an address.
+    ///
+    /// What the arrangement of the tab on screen deals in is numbers, and a
+    /// number names a shell only alongside the workspace whose arrangement it
+    /// is.
+    fn at(&self, shell: ShellId) -> ShellAddress {
+        ShellAddress::new(self.workspace, shell)
     }
 }
 
@@ -1080,6 +1346,38 @@ impl Render for TerminalView {
         self.frames.built(began.elapsed());
         screen
     }
+}
+
+/// Opens a workspace on `folder` in `layout`, with one tab and one shell in it,
+/// and starts that shell in the folder.
+///
+/// Both ways a workspace comes to exist go through here — the one this
+/// application was launched on, and every one opened from inside it after that
+/// — so a workspace opened later is the same kind of thing as the one it
+/// started with, down to what its first shell is and where that shell runs.
+/// Whatever a folder is set up to run its shells in, it is set up that way for
+/// both.
+///
+/// A shell that will not start leaves the layout as it found it, for the same
+/// reason [`TerminalView::started`] does: a workspace whose one shell is a
+/// rectangle nothing can ever appear in is worse than no workspace at all.
+pub(crate) fn open_on(
+    layout: &mut Layout,
+    folder: &Path,
+    options: &ShellOptions,
+) -> Result<Shell, SpawnError> {
+    let workspace = layout.open(folder);
+    let address = {
+        let open = layout
+            .workspace_mut(workspace)
+            .expect("the workspace just opened");
+        let tab = open.open_tab(TAB);
+        let shell = open.tab(tab).expect("the tab just opened").focused();
+        ShellAddress::new(workspace, shell)
+    };
+    Shell::spawn(address, &options.clone().directory(folder)).inspect_err(|_| {
+        layout.close(workspace);
+    })
 }
 
 /// The first monospaced family this machine has, of the ones worth asking for.
