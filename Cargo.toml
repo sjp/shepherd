@@ -28,7 +28,7 @@ alacritty_terminal = "0.26"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 gpui = "0.2"
-gpui-component = "0.5"
+gpui-component = "0.6"
 # Pinned exactly: its concrete-syntax-tree API is what lets a file somebody
 # maintains by hand be edited without reformatting the rest of it, and a
 # change in how that tree renders would change files on users' machines.
